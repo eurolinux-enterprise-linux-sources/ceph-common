@@ -22,7 +22,6 @@
 #include "include/rados/librados.hpp"
 #include "mon/MonClient.h"
 #include "msg/Dispatcher.h"
-#include "osd/OSDMap.h"
 
 #include "IoCtxImpl.h"
 
@@ -31,14 +30,13 @@ class CephContext;
 struct Connection;
 struct md_config_t;
 class Message;
-class MWatchNotify;
 class MLog;
-class SimpleMessenger;
+class Messenger;
 
 class librados::RadosClient : public Dispatcher
 {
 public:
-  CephContext *cct;
+  using Dispatcher::cct;
   md_config_t *conf;
 private:
   enum {
@@ -47,9 +45,8 @@ private:
     CONNECTED,
   } state;
 
-  OSDMap osdmap;
   MonClient monclient;
-  SimpleMessenger *messenger;
+  Messenger *messenger;
 
   uint64_t instance_id;
 
@@ -63,13 +60,7 @@ private:
 
   Objecter *objecter;
 
-  map<string, int64_t> pool_cache;
-
-  epoch_t osdmap_epoch;
-  epoch_t pool_cache_epoch;
-
   Mutex lock;
-  RWLock pool_cache_rwl;
   Cond cond;
   SafeTimer timer;
   int refcnt;
@@ -90,38 +81,42 @@ public:
   int connect();
   void shutdown();
 
+  int watch_flush();
+
   uint64_t get_instance_id();
 
   int wait_for_latest_osdmap();
 
   int create_ioctx(const char *name, IoCtxImpl **io);
+  int create_ioctx(int64_t, IoCtxImpl **io);
 
   int get_fsid(std::string *s);
   int64_t lookup_pool(const char *name);
-  const char *get_pool_name(int64_t pool_id);
   bool pool_requires_alignment(int64_t pool_id);
   uint64_t pool_required_alignment(int64_t pool_id);
   int pool_get_auid(uint64_t pool_id, unsigned long long *auid);
   int pool_get_name(uint64_t pool_id, std::string *auid);
 
-  int pool_list(std::list<string>& ls);
+  int pool_list(std::list<std::pair<int64_t, string> >& ls);
   int get_pool_stats(std::list<string>& ls, map<string,::pool_stat_t>& result);
   int get_fs_stats(ceph_statfs& result);
 
-  int pool_create(string& name, unsigned long long auid=0, __u8 crush_rule=0);
+  /*
+  -1 was set as the default value and monitor will pickup the right crush rule with below order:
+    a) osd pool default crush replicated ruleset
+    b) the first ruleset in crush ruleset
+    c) error out if no value find
+  */
+  int pool_create(string& name, unsigned long long auid=0, int16_t crush_rule=-1);
   int pool_create_async(string& name, PoolAsyncCompletionImpl *c, unsigned long long auid=0,
-			__u8 crush_rule=0);
+			int16_t crush_rule=-1);
+  int pool_get_base_tier(int64_t pool_id, int64_t* base_tier);
   int pool_delete(const char *name);
 
   int pool_delete_async(const char *name, PoolAsyncCompletionImpl *c);
 
-  // watch/notify
-  uint64_t max_watch_cookie;
-  map<uint64_t, librados::WatchContext *> watchers;
+  int blacklist_add(const string& client_address, uint32_t expire_seconds);
 
-  void register_watcher(librados::WatchContext *wc, uint64_t *cookie);
-  void unregister_watcher(uint64_t cookie);
-  void watch_notify(MWatchNotify *m);
   int mon_command(const vector<string>& cmd, const bufferlist &inbl,
 	          bufferlist *outbl, string *outs);
   int mon_command(int rank,

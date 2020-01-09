@@ -42,7 +42,7 @@ private:
     Align hd_align;
     Align col_align;
 
-    TextTableColumn() {};
+    TextTableColumn() {}
     TextTableColumn(std::string h, int w, Align ha, Align ca) :
 		    heading(h), width(w), hd_align(ha), col_align(ca) { }
     ~TextTableColumn() {}
@@ -118,7 +118,6 @@ public:
     }
 
     // now store the rendered item with its proper width
-    oss << std::setw(width) << item;
     row[currow][curcol] = oss.str();
 
     curcol++;

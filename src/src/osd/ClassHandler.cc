@@ -1,8 +1,11 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*- 
+// vim: ts=8 sw=2 smarttab
 
 #include "include/types.h"
 #include "msg/Message.h"
 #include "osd/OSD.h"
 #include "ClassHandler.h"
+#include "common/errno.h"
 
 #include <dlfcn.h>
 
@@ -105,17 +108,21 @@ int ClassHandler::_load_class(ClassData *cls)
 	     cls->name.c_str());
     dout(10) << "_load_class " << cls->name << " from " << fname << dendl;
 
-    struct stat st;
-    int r = ::stat(fname, &st);
-    if (r < 0)
-      return -errno;
-
     cls->handle = dlopen(fname, RTLD_NOW);
     if (!cls->handle) {
-      dout(0) << "_load_class could not open class " << fname
-	      << " (dlopen failed): " << dlerror() << dendl;
+      struct stat st;
+      int r = ::stat(fname, &st);
+      if (r < 0) {
+        r = -errno;
+        dout(0) << __func__ << " could not stat class " << fname
+                << ": " << cpp_strerror(r) << dendl;
+      } else {
+	dout(0) << "_load_class could not open class " << fname
+      	        << " (dlopen failed): " << dlerror() << dendl;
+      	r = -EIO;
+      }
       cls->status = ClassData::CLASS_MISSING;
-      return -EIO;
+      return r;
     }
 
     cls_deps_t *(*cls_deps)();

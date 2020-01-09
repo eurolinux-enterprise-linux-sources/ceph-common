@@ -97,12 +97,12 @@ void RGWFormatter_Plain::close_section()
 
 void RGWFormatter_Plain::dump_unsigned(const char *name, uint64_t u)
 {
-  dump_value_int(name, "%"PRIu64, u);
+  dump_value_int(name, "%" PRIu64, u);
 }
 
 void RGWFormatter_Plain::dump_int(const char *name, int64_t u)
 {
-  dump_value_int(name, "%"PRId64, u);
+  dump_value_int(name, "%" PRId64, u);
 }
 
 void RGWFormatter_Plain::dump_float(const char *name, double d)
@@ -110,7 +110,7 @@ void RGWFormatter_Plain::dump_float(const char *name, double d)
   dump_value_int(name, "%f", d);
 }
 
-void RGWFormatter_Plain::dump_string(const char *name, std::string s)
+void RGWFormatter_Plain::dump_string(const char *name, const std::string& s)
 {
   dump_format(name, "%s", s.c_str());
 }
@@ -121,10 +121,9 @@ std::ostream& RGWFormatter_Plain::dump_stream(const char *name)
   assert(0);
 }
 
-void RGWFormatter_Plain::dump_format(const char *name, const char *fmt, ...)
+void RGWFormatter_Plain::dump_format_va(const char *name, const char *ns, bool quoted, const char *fmt, va_list ap)
 {
   char buf[LARGE_SIZE];
-  va_list ap;
   const char *format;
 
   struct plain_stack_entry& entry = stack.back();
@@ -139,9 +138,7 @@ void RGWFormatter_Plain::dump_format(const char *name, const char *fmt, ...)
   if (!should_print)
     return;
 
-  va_start(ap, fmt);
   vsnprintf(buf, LARGE_SIZE, fmt, ap);
-  va_end(ap);
   if (len)
     format = "\n%s";
   else
@@ -200,16 +197,23 @@ done:
   if (!buf) {
     max_len = max(LARGE_ENOUGH_BUF, size);
     buf = (char *)malloc(max_len);
+    if (!buf) {
+      cerr << "ERROR: RGWFormatter_Plain::write_data: failed allocating " << max_len << " bytes" << std::endl;
+      goto done_free;
+    }
   }
 
   if (len + size > max_len) {
     max_len = len + size + LARGE_ENOUGH_BUF;
-    buf = (char *)realloc(buf, max_len);
+    void *_realloc = NULL;
+    if ((_realloc = realloc(buf, max_len)) == NULL) {
+      cerr << "ERROR: RGWFormatter_Plain::write_data: failed allocating " << max_len << " bytes" << std::endl;
+      goto done_free;
+    } else {
+      buf = (char *)_realloc;
+    }
   }
-  if (!buf) {
-    cerr << "ERROR: RGWFormatter_Plain::write_data: failed allocating " << max_len << " bytes" << std::endl;
-    goto done_free;
-  }
+
   pos = len;
   if (len)
     pos--; // squash null termination

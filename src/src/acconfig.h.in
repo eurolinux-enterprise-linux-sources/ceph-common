@@ -27,11 +27,23 @@
 /* Define to 1 if you have the <arpa/nameser_compat.h> header file. */
 #undef HAVE_ARPA_NAMESER_COMPAT_H
 
+/* Define to 1 if you have the <babeltrace/babeltrace.h> header file. */
+#undef HAVE_BABELTRACE_BABELTRACE_H
+
+/* Define to 1 if you have the <babeltrace/ctf/events.h> header file. */
+#undef HAVE_BABELTRACE_CTF_EVENTS_H
+
+/* yasm can also build the isa-l */
+#undef HAVE_BETTER_YASM_ELF64
+
 /* have boost::random::discrete_distribution */
 #undef HAVE_BOOST_RANDOM_DISCRETE_DISTRIBUTION
 
 /* Define if have curl_multi_wait() */
 #undef HAVE_CURL_MULTI_WAIT
+
+/* define if the compiler supports basic C++11 syntax */
+#undef HAVE_CXX11
 
 /* Define to 1 if you have the declaration of `strerror_r', and to 0 if you
    don't. */
@@ -59,6 +71,15 @@
 /* we have a recent yasm and are x86_64 */
 #undef HAVE_GOOD_YASM_ELF64
 
+/* Define to 1 if you have the <gperftools/heap-profiler.h> header file. */
+#undef HAVE_GPERFTOOLS_HEAP_PROFILER_H
+
+/* Define to 1 if you have the <gperftools/malloc_extension.h> header file. */
+#undef HAVE_GPERFTOOLS_MALLOC_EXTENSION_H
+
+/* Define to 1 if you have the <gperftools/profiler.h> header file. */
+#undef HAVE_GPERFTOOLS_PROFILER_H
+
 /* Define to 1 if the system has the type `int16_t'. */
 #undef HAVE_INT16_T
 
@@ -74,6 +95,9 @@
 /* Define to 1 if you have the <inttypes.h> header file. */
 #undef HAVE_INTTYPES_H
 
+/* Defined if you have kinetic enabled */
+#undef HAVE_KINETIC
+
 /* Defined if LevelDB supports bloom filters */
 #undef HAVE_LEVELDB_FILTER_POLICY
 
@@ -87,6 +111,9 @@
 /* Define to 1 if you have the `boost_program_options-mt' library
    (-lboost_program_options-mt). */
 #undef HAVE_LIBBOOST_PROGRAM_OPTIONS_MT
+
+/* Define to 1 if you have the `boost_regex' library (-lboost_regex). */
+#undef HAVE_LIBBOOST_REGEX
 
 /* Define to 1 if you have the `boost_system' library (-lboost_system). */
 #undef HAVE_LIBBOOST_SYSTEM
@@ -105,14 +132,32 @@
 /* Define if you have fuse */
 #undef HAVE_LIBFUSE
 
+/* Define to 1 if you have the `ibverbs' library (-libverbs). */
+#undef HAVE_LIBIBVERBS
+
+/* Define if you have jemalloc */
+#undef HAVE_LIBJEMALLOC
+
 /* Define to 1 if you have the `profiler' library (-lprofiler). */
 #undef HAVE_LIBPROFILER
+
+/* Define to 1 if you have the `rdmacm' library (-lrdmacm). */
+#undef HAVE_LIBRDMACM
+
+/* Defined if you have librocksdb enabled */
+#undef HAVE_LIBROCKSDB
 
 /* Define if you have tcmalloc */
 #undef HAVE_LIBTCMALLOC
 
+/* Define if you have tcmalloc */
+#undef HAVE_LIBTCMALLOC_MINIMAL
+
 /* Define to 1 if you have libxfs */
 #undef HAVE_LIBXFS
+
+/* Define to 1 if you have the `xio' library (-lxio). */
+#undef HAVE_LIBXIO
 
 /* Defined if you have libzfs enabled */
 #undef HAVE_LIBZFS
@@ -128,6 +173,9 @@
 
 /* Define to 1 if you have the <ndir.h> header file, and it defines `DIR'. */
 #undef HAVE_NDIR_H
+
+/* Support NEON instructions */
+#undef HAVE_NEON
 
 /* Define to 1 if you have the <netdb.h> header file. */
 #undef HAVE_NETDB_H
@@ -161,6 +209,9 @@
 
 /* Define if you have pthread_spin_init */
 #undef HAVE_PTHREAD_SPINLOCK
+
+/* Define to 1 if you have sched.h. */
+#undef HAVE_SCHED
 
 /* Support SSE (Streaming SIMD Extensions) instructions */
 #undef HAVE_SSE
@@ -281,6 +332,12 @@
 /* Define to 1 if you have the <utime.h> header file. */
 #undef HAVE_UTIME_H
 
+/* Define to 1 if you have the <valgrind/helgrind.h> header file. */
+#undef HAVE_VALGRIND_HELGRIND_H
+
+/* Accelio conditional compilation */
+#undef HAVE_XIO
+
 /* Define to 1 if the system has the type `__be16'. */
 #undef HAVE___BE16
 
@@ -330,9 +387,6 @@
 /* Defined if you do not have atomic_ops */
 #undef NO_ATOMIC_OPS
 
-/* Define to 1 if your C compiler doesn't accept -c and -o together. */
-#undef NO_MINUS_C_MINUS_O
-
 /* Name of package */
 #undef PACKAGE
 
@@ -379,5 +433,14 @@
 /* Version number of package */
 #undef VERSION
 
+/* Define if you want to use Babeltrace */
+#undef WITH_BABELTRACE
+
+/* Define if you want to use LTTng */
+#undef WITH_LTTNG
+
 /* define if radosgw enabled */
 #undef WITH_RADOSGW
+
+/* LTTng is disabled, so define this macro to be nothing. */
+#undef tracepoint

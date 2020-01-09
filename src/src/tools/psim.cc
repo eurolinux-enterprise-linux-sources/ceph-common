@@ -1,9 +1,7 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// vim: ts=8 sw=2 smarttab
 
-#include <iostream>
-
-#include "crush/CrushWrapper.h"
 #include "osd/OSDMap.h"
-#include "common/config.h"
 #include "include/buffer.h"
 
 int main(int argc, char **argv)
@@ -19,7 +17,13 @@ int main(int argc, char **argv)
     return 1;
   }
   OSDMap osdmap;
-  osdmap.decode(bl);
+
+  try {
+    osdmap.decode(bl);
+  } catch (ceph::buffer::end_of_buffer &eob) {
+    cout << "Exception (end_of_buffer) in decode(), exit." << std::endl;
+    exit(1);
+  }
 
   //osdmap.set_primary_affinity(0, 0x8000);
   //osdmap.set_primary_affinity(3, 0);

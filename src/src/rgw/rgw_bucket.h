@@ -1,3 +1,6 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// vim: ts=8 sw=2 smarttab
+
 #ifndef CEPH_RGW_BUCKET_H
 #define CEPH_RGW_BUCKET_H
 
@@ -28,6 +31,8 @@ extern int rgw_bucket_store_info(RGWRados *store, const string& bucket_name, buf
 extern int rgw_bucket_instance_store_info(RGWRados *store, string& oid, bufferlist& bl, bool exclusive,
                                  map<string, bufferlist> *pattrs, RGWObjVersionTracker *objv_tracker,
                                  time_t mtime);
+
+extern int rgw_bucket_parse_bucket_instance(const string& bucket_instance, string *target_bucket_instance, int *shard_id);
 
 extern int rgw_bucket_instance_remove_entry(RGWRados *store, string& entry, RGWObjVersionTracker *objv_tracker);
 
@@ -105,7 +110,7 @@ extern int rgw_read_user_buckets(RGWRados *store, string user_id, RGWUserBuckets
 extern int rgw_link_bucket(RGWRados *store, string user_id, rgw_bucket& bucket, time_t creation_time, bool update_entrypoint = true);
 extern int rgw_unlink_bucket(RGWRados *store, string user_id, const string& bucket_name, bool update_entrypoint = true);
 
-extern int rgw_remove_object(RGWRados *store, const string& bucket_owner, rgw_bucket& bucket, std::string& object);
+extern int rgw_remove_object(RGWRados *store, RGWBucketInfo& bucket_info, rgw_bucket& bucket, rgw_obj_key& key);
 extern int rgw_remove_bucket(RGWRados *store, const string& bucket_owner, rgw_bucket& bucket, bool delete_children);
 
 extern int rgw_bucket_set_attrs(RGWRados *store, RGWBucketInfo& bucket_info,
@@ -147,24 +152,29 @@ struct RGWBucketAdminOpState {
     object_name = object_str;
   }
 
-  std::string& get_user_id() { return uid; };
-  std::string& get_user_display_name() { return display_name; };
-  std::string& get_bucket_name() { return bucket_name; };
-  std::string& get_object_name() { return object_name; };
+  std::string& get_user_id() { return uid; }
+  std::string& get_user_display_name() { return display_name; }
+  std::string& get_bucket_name() { return bucket_name; }
+  std::string& get_object_name() { return object_name; }
 
-  rgw_bucket& get_bucket() { return bucket; };
+  rgw_bucket& get_bucket() { return bucket; }
   void set_bucket(rgw_bucket& _bucket) {
     bucket = _bucket; 
     bucket_stored = true;
   }
 
-  bool will_fetch_stats() { return stat_buckets; };
-  bool will_fix_index() { return fix_index; };
-  bool will_delete_children() { return delete_child_objects; };
-  bool will_check_objects() { return check_objects; };
-  bool is_user_op() { return !uid.empty(); };
-  bool is_system_op() { return uid.empty(); }; 
-  bool has_bucket_stored() { return bucket_stored; };
+  void set_bucket_id(const string& bi) {
+    bucket_id = bi;
+  }
+  const string& get_bucket_id() { return bucket_id; }
+
+  bool will_fetch_stats() { return stat_buckets; }
+  bool will_fix_index() { return fix_index; }
+  bool will_delete_children() { return delete_child_objects; }
+  bool will_check_objects() { return check_objects; }
+  bool is_user_op() { return !uid.empty(); }
+  bool is_system_op() { return uid.empty(); }
+  bool has_bucket_stored() { return bucket_stored; }
 
   RGWBucketAdminOpState() : list_buckets(false), stat_buckets(false), check_objects(false), 
                             fix_index(false), delete_child_objects(false),
@@ -195,7 +205,7 @@ public:
   int init(RGWRados *storage, RGWBucketAdminOpState& op_state);
 
   int check_bad_index_multipart(RGWBucketAdminOpState& op_state,
-          list<std::string>& objs_to_unlink, std::string *err_msg = NULL);
+          list<rgw_obj_key>& objs_to_unlink, std::string *err_msg = NULL);
 
   int check_object_index(RGWBucketAdminOpState& op_state,
           map<string, RGWObjEnt> result, std::string *err_msg = NULL);
@@ -213,7 +223,7 @@ public:
   int policy_bl_to_stream(bufferlist& bl, ostream& o);
   int get_policy(RGWBucketAdminOpState& op_state, ostream& o);
 
-  void clear_failure() { failure = false; };
+  void clear_failure() { failure = false; }
 };
 
 class RGWBucketAdminOp
@@ -226,7 +236,7 @@ public:
 
 
   static int unlink(RGWRados *store, RGWBucketAdminOpState& op_state);
-  static int link(RGWRados *store, RGWBucketAdminOpState& op_state);
+  static int link(RGWRados *store, RGWBucketAdminOpState& op_state, string *err_msg = NULL);
 
   static int check_index(RGWRados *store, RGWBucketAdminOpState& op_state,
                   RGWFormatterFlusher& flusher);
@@ -306,13 +316,13 @@ class RGWDataChangesLog {
 
   typedef ceph::shared_ptr<ChangeStatus> ChangeStatusPtr;
 
-  lru_map<string, ChangeStatusPtr> changes;
+  lru_map<rgw_bucket_shard, ChangeStatusPtr> changes;
 
-  map<string, rgw_bucket> cur_cycle;
+  map<rgw_bucket_shard, bool> cur_cycle;
 
-  void _get_change(string& bucket_name, ChangeStatusPtr& status);
-  void register_renew(rgw_bucket& bucket);
-  void update_renewed(string& bucket_name, utime_t& expiration);
+  void _get_change(const rgw_bucket_shard& bs, ChangeStatusPtr& status);
+  void register_renew(rgw_bucket_shard& bs);
+  void update_renewed(rgw_bucket_shard& bs, utime_t& expiration);
 
   class ChangesRenewThread : public Thread {
     CephContext *cct;
@@ -354,8 +364,8 @@ public:
 
   ~RGWDataChangesLog();
 
-  int choose_oid(rgw_bucket& bucket);
-  int add_entry(rgw_bucket& bucket);
+  int choose_oid(const rgw_bucket_shard& bs);
+  int add_entry(rgw_bucket& bucket, int shard_id);
   int renew_entries();
   int list_entries(int shard, utime_t& start_time, utime_t& end_time, int max_entries,
 		   list<rgw_data_change>& entries,

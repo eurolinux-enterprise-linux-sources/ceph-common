@@ -14,6 +14,7 @@
 #include <limits.h>
 
 #include <string>
+#include <set>
 #include <map>
 
 #include "rgw_common.h"
@@ -28,6 +29,38 @@ using namespace std;
 
 struct req_state;
 class RGWHandler;
+
+enum RGWOpType {
+  RGW_OP_UNKNOWN = 0,
+  RGW_OP_GET_OBJ,
+  RGW_OP_LIST_BUCKETS,
+  RGW_OP_STAT_ACCOUNT,
+  RGW_OP_LIST_BUCKET,
+  RGW_OP_GET_BUCKET_LOGGING,
+  RGW_OP_GET_BUCKET_VERSIONING,
+  RGW_OP_SET_BUCKET_VERSIONING,
+  RGW_OP_STAT_BUCKET,
+  RGW_OP_CREATE_BUCKET,
+  RGW_OP_DELETE_BUCKET,
+  RGW_OP_PUT_OBJ,
+  RGW_OP_POST_OBJ,
+  RGW_OP_PUT_METADATA,
+  RGW_OP_SET_TEMPURL,
+  RGW_OP_DELETE_OBJ,
+  RGW_OP_COPY_OBJ,
+  RGW_OP_GET_ACLS,
+  RGW_OP_PUT_ACLS,
+  RGW_OP_GET_CORS,
+  RGW_OP_PUT_CORS,
+  RGW_OP_DELETE_CORS,
+  RGW_OP_OPTIONS_CORS,
+  RGW_OP_INIT_MULTIPART,
+  RGW_OP_COMPLETE_MULTIPART,
+  RGW_OP_ABORT_MULTIPART,
+  RGW_OP_LIST_MULTIPART,
+  RGW_OP_LIST_BUCKET_MULTIPARTS,
+  RGW_OP_DELETE_MULTI_OBJ,
+};
 
 /**
  * Provide the base class for all ops.
@@ -74,6 +107,7 @@ public:
     send_response();
   }
   virtual const string name() = 0;
+  virtual RGWOpType get_type() { return RGW_OP_UNKNOWN; }
 
   virtual uint32_t op_mask() { return 0; }
 };
@@ -123,7 +157,7 @@ public:
     ret = 0;
  }
 
-  virtual bool prefetch_data() { return true; }
+  virtual bool prefetch_data() { return get_data; }
 
   void set_get_data(bool get_data) {
     this->get_data = get_data;
@@ -140,6 +174,7 @@ public:
   virtual int send_response_data(bufferlist& bl, off_t ofs, off_t len) = 0;
 
   virtual const string name() { return "get_obj"; }
+  virtual RGWOpType get_type() { return RGW_OP_GET_OBJ; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_READ; }
 };
 
@@ -170,6 +205,7 @@ public:
   virtual bool should_get_stats() { return false; }
 
   virtual const string name() { return "list_buckets"; }
+  virtual RGWOpType get_type() { return RGW_OP_LIST_BUCKETS; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_READ; }
 };
 
@@ -195,16 +231,19 @@ public:
 
   virtual void send_response() = 0;
   virtual const string name() { return "stat_account"; }
+  virtual RGWOpType get_type() { return RGW_OP_STAT_ACCOUNT; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_READ; }
 };
 
 class RGWListBucket : public RGWOp {
 protected:
+  RGWBucketEnt bucket;
   string prefix;
-  string marker; 
-  string next_marker; 
+  rgw_obj_key marker; 
+  rgw_obj_key next_marker; 
   string max_keys;
   string delimiter;
+  bool list_versions;
   int max;
   int ret;
   vector<RGWObjEnt> objs;
@@ -216,12 +255,8 @@ protected:
   int parse_max_keys();
 
 public:
-  RGWListBucket() {
-    max = 0;
-    ret = 0;
-    default_max = 0;
-    is_truncated = false;
-  }
+  RGWListBucket() : list_versions(false), max(0), ret(0),
+                    default_max(0), is_truncated(false) {}
   int verify_permission();
   void pre_exec();
   void execute();
@@ -229,7 +264,9 @@ public:
   virtual int get_params() = 0;
   virtual void send_response() = 0;
   virtual const string name() { return "list_bucket"; }
+  virtual RGWOpType get_type() { return RGW_OP_LIST_BUCKET; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_READ; }
+  virtual bool need_container_stats() { return false; }
 };
 
 class RGWGetBucketLogging : public RGWOp {
@@ -240,7 +277,56 @@ public:
 
   virtual void send_response() = 0;
   virtual const string name() { return "get_bucket_logging"; }
+  virtual RGWOpType get_type() { return RGW_OP_GET_BUCKET_LOGGING; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_READ; }
+};
+
+class RGWGetBucketLocation : public RGWOp {
+public:
+  RGWGetBucketLocation() {}
+  ~RGWGetBucketLocation() {}
+  int verify_permission();
+  void execute() {}
+
+  virtual void send_response() = 0;
+  virtual const string name() { return "get_bucket_location"; }
+  virtual uint32_t op_mask() { return RGW_OP_TYPE_READ; }
+};
+
+class RGWGetBucketVersioning : public RGWOp {
+protected:
+  bool versioned;
+  bool versioning_enabled;
+public:
+  RGWGetBucketVersioning() : versioned(false), versioning_enabled(false) {}
+
+  int verify_permission();
+  void pre_exec();
+  void execute();
+
+  virtual void send_response() = 0;
+  virtual const string name() { return "get_bucket_versioning"; }
+  virtual RGWOpType get_type() { return RGW_OP_GET_BUCKET_VERSIONING; }
+  virtual uint32_t op_mask() { return RGW_OP_TYPE_READ; }
+};
+
+class RGWSetBucketVersioning : public RGWOp {
+protected:
+  bool enable_versioning;
+  int ret;
+public:
+  RGWSetBucketVersioning() : enable_versioning(false), ret(0) {}
+
+  int verify_permission();
+  void pre_exec();
+  void execute();
+
+  virtual int get_params() { return 0; }
+
+  virtual void send_response() = 0;
+  virtual const string name() { return "set_bucket_versioning"; }
+  virtual RGWOpType get_type() { return RGW_OP_SET_BUCKET_VERSIONING; }
+  virtual uint32_t op_mask() { return RGW_OP_TYPE_WRITE; }
 };
 
 class RGWStatBucket : public RGWOp {
@@ -258,6 +344,7 @@ public:
 
   virtual void send_response() = 0;
   virtual const string name() { return "stat_bucket"; }
+  virtual RGWOpType get_type() { return RGW_OP_STAT_BUCKET; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_READ; }
 };
 
@@ -287,6 +374,7 @@ public:
   virtual int get_params() { return 0; }
   virtual void send_response() = 0;
   virtual const string name() { return "create_bucket"; }
+  virtual RGWOpType get_type() { return RGW_OP_CREATE_BUCKET; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_WRITE; }
 };
 
@@ -305,6 +393,7 @@ public:
 
   virtual void send_response() = 0;
   virtual const string name() { return "delete_bucket"; }
+  virtual RGWOpType get_type() { return RGW_OP_DELETE_BUCKET; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_DELETE; }
 };
 
@@ -317,6 +406,8 @@ protected:
   off_t ofs;
   const char *supplied_md5_b64;
   const char *supplied_etag;
+  const char *if_match;
+  const char *if_nomatch;
   string etag;
   bool chunked_upload;
   RGWAccessControlPolicy policy;
@@ -325,16 +416,22 @@ protected:
 
   MD5 *user_manifest_parts_hash;
 
+  uint64_t olh_epoch;
+  string version_id;
+
 public:
   RGWPutObj() {
     ret = 0;
     ofs = 0;
     supplied_md5_b64 = NULL;
     supplied_etag = NULL;
+    if_match = NULL;
+    if_nomatch = NULL;
     chunked_upload = false;
     obj_manifest = NULL;
     mtime = 0;
     user_manifest_parts_hash = NULL;
+    olh_epoch = 0;
   }
 
   virtual void init(RGWRados *store, struct req_state *s, RGWHandler *h) {
@@ -342,10 +439,8 @@ public:
     policy.set_ctx(s->cct);
   }
 
-  RGWPutObjProcessor *select_processor(bool *is_multipart);
+  RGWPutObjProcessor *select_processor(RGWObjectCtx& obj_ctx, bool *is_multipart);
   void dispose_processor(RGWPutObjProcessor *processor);
-
-  int user_manifest_iterate_cb(rgw_bucket& bucket, RGWObjEnt& ent, RGWAccessControlPolicy *bucket_policy, off_t start_ofs, off_t end_ofs);
 
   int verify_permission();
   void pre_exec();
@@ -355,6 +450,7 @@ public:
   virtual int get_data(bufferlist& bl) = 0;
   virtual void send_response() = 0;
   virtual const string name() { return "put_obj"; }
+  virtual RGWOpType get_type() { return RGW_OP_PUT_OBJ; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_WRITE; }
 };
 
@@ -391,23 +487,25 @@ public:
   void pre_exec();
   void execute();
 
-  RGWPutObjProcessor *select_processor();
+  RGWPutObjProcessor *select_processor(RGWObjectCtx& obj_ctx);
   void dispose_processor(RGWPutObjProcessor *processor);
 
   virtual int get_params() = 0;
   virtual int get_data(bufferlist& bl) = 0;
   virtual void send_response() = 0;
   virtual const string name() { return "post_obj"; }
+  virtual RGWOpType get_type() { return RGW_OP_POST_OBJ; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_WRITE; }
 };
 
 class RGWPutMetadata : public RGWOp {
 protected:
   int ret;
-  map<string, bufferlist> attrs;
+  set<string> rmattr_names;
   bool has_policy, has_cors;
   RGWAccessControlPolicy policy;
   RGWCORSConfiguration cors_config;
+  string placement_rule;
 
 public:
   RGWPutMetadata() {
@@ -427,6 +525,7 @@ public:
   virtual int get_params() = 0;
   virtual void send_response() = 0;
   virtual const string name() { return "put_obj_metadata"; }
+  virtual RGWOpType get_type() { return RGW_OP_PUT_METADATA; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_WRITE; }
 };
 
@@ -443,14 +542,17 @@ public:
   virtual int get_params() = 0;
   virtual void send_response() = 0;
   virtual const string name() { return "set_temp_url"; }
+  virtual RGWOpType get_type() { return RGW_OP_SET_TEMPURL; }
 };
 
 class RGWDeleteObj : public RGWOp {
 protected:
   int ret;
+  bool delete_marker;
+  string version_id;
 
 public:
-  RGWDeleteObj() : ret(0) {}
+  RGWDeleteObj() : ret(0), delete_marker(false) {}
 
   int verify_permission();
   void pre_exec();
@@ -458,6 +560,7 @@ public:
 
   virtual void send_response() = 0;
   virtual const string name() { return "delete_obj"; }
+  virtual RGWOpType get_type() { return RGW_OP_DELETE_OBJ; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_DELETE; }
 };
 
@@ -479,19 +582,24 @@ protected:
   map<string, bufferlist> attrs;
   string src_bucket_name;
   rgw_bucket src_bucket;
-  string src_object;
+  rgw_obj_key src_object;
   string dest_bucket_name;
   rgw_bucket dest_bucket;
   string dest_object;
+  time_t src_mtime;
   time_t mtime;
-  bool replace_attrs;
+  RGWRados::AttrsMod attrs_mod;
   RGWBucketInfo src_bucket_info;
   RGWBucketInfo dest_bucket_info;
   string source_zone;
   string client_id;
   string op_id;
+  string etag;
 
   off_t last_ofs;
+
+  string version_id;
+  uint64_t olh_epoch;
 
 
   int init_common();
@@ -510,12 +618,14 @@ public:
     mod_ptr = NULL;
     unmod_ptr = NULL;
     ret = 0;
+    src_mtime = 0;
     mtime = 0;
-    replace_attrs = false;
+    attrs_mod = RGWRados::ATTRSMOD_NONE;
     last_ofs = 0;
+    olh_epoch = 0;
   }
 
-  static bool parse_copy_location(const char *src, string& bucket_name, string& object);
+  static bool parse_copy_location(const string& src, string& bucket_name, rgw_obj_key& object);
 
   virtual void init(RGWRados *store, struct req_state *s, RGWHandler *h) {
     RGWOp::init(store, s, h);
@@ -531,6 +641,7 @@ public:
   virtual void send_partial_response(off_t ofs) {}
   virtual void send_response() = 0;
   virtual const string name() { return "copy_obj"; }
+  virtual RGWOpType get_type() { return RGW_OP_COPY_OBJ; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_WRITE; }
 };
 
@@ -548,6 +659,7 @@ public:
 
   virtual void send_response() = 0;
   virtual const string name() { return "get_acls"; }
+  virtual RGWOpType get_type() { return RGW_OP_GET_ACLS; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_READ; }
 };
 
@@ -556,6 +668,7 @@ protected:
   int ret;
   size_t len;
   char *data;
+  ACLOwner owner;
 
 public:
   RGWPutACLs() {
@@ -575,6 +688,7 @@ public:
   virtual int get_params() = 0;
   virtual void send_response() = 0;
   virtual const string name() { return "put_acls"; }
+  virtual RGWOpType get_type() { return RGW_OP_PUT_ACLS; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_WRITE; }
 };
 
@@ -590,6 +704,7 @@ public:
 
   virtual void send_response() = 0;
   virtual const string name() { return "get_cors"; }
+  virtual RGWOpType get_type() { return RGW_OP_GET_CORS; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_READ; }
 };
 
@@ -610,6 +725,7 @@ public:
   virtual int get_params() = 0;
   virtual void send_response() = 0;
   virtual const string name() { return "put_cors"; }
+  virtual RGWOpType get_type() { return RGW_OP_PUT_CORS; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_WRITE; }
 };
 
@@ -625,6 +741,7 @@ public:
 
   virtual void send_response() = 0;
   virtual const string name() { return "delete_cors"; }
+  virtual RGWOpType get_type() { return RGW_OP_DELETE_CORS; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_WRITE; }
 };
 
@@ -645,6 +762,7 @@ public:
   void get_response_params(string& allowed_hdrs, string& exp_hdrs, unsigned *max_age);
   virtual void send_response() = 0;
   virtual const string name() { return "options_cors"; }
+  virtual RGWOpType get_type() { return RGW_OP_OPTIONS_CORS; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_READ; }
 };
 
@@ -670,6 +788,7 @@ public:
   virtual int get_params() = 0;
   virtual void send_response() = 0;
   virtual const string name() { return "init_multipart"; }
+  virtual RGWOpType get_type() { return RGW_OP_INIT_MULTIPART; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_WRITE; }
 };
 
@@ -698,6 +817,7 @@ public:
   virtual int get_params() = 0;
   virtual void send_response() = 0;
   virtual const string name() { return "complete_multipart"; }
+  virtual RGWOpType get_type() { return RGW_OP_COMPLETE_MULTIPART; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_WRITE; }
 };
 
@@ -714,6 +834,7 @@ public:
 
   virtual void send_response() = 0;
   virtual const string name() { return "abort_multipart"; }
+  virtual RGWOpType get_type() { return RGW_OP_ABORT_MULTIPART; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_DELETE; }
 };
 
@@ -746,6 +867,7 @@ public:
   virtual int get_params() = 0;
   virtual void send_response() = 0;
   virtual const string name() { return "list_multipart"; }
+  virtual RGWOpType get_type() { return RGW_OP_LIST_MULTIPART; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_READ; }
 };
 
@@ -853,6 +975,7 @@ public:
   virtual int get_params() = 0;
   virtual void send_response() = 0;
   virtual const string name() { return "list_bucket_multiparts"; }
+  virtual RGWOpType get_type() { return RGW_OP_LIST_BUCKET_MULTIPARTS; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_READ; }
 };
 
@@ -866,7 +989,6 @@ protected:
   rgw_bucket bucket;
   bool quiet;
   bool status_dumped;
-
 
 public:
   RGWDeleteMultiObj() {
@@ -884,9 +1006,11 @@ public:
   virtual int get_params() = 0;
   virtual void send_status() = 0;
   virtual void begin_response() = 0;
-  virtual void send_partial_response(pair<string,int>& result) = 0;
+  virtual void send_partial_response(rgw_obj_key& key, bool delete_marker,
+                                     const string& marker_version_id, int ret) = 0;
   virtual void end_response() = 0;
   virtual const string name() { return "multi_object_delete"; }
+  virtual RGWOpType get_type() { return RGW_OP_DELETE_MULTI_OBJ; }
   virtual uint32_t op_mask() { return RGW_OP_TYPE_DELETE; }
 };
 

@@ -41,13 +41,6 @@ using namespace std;
 
 #include "include/uuid.h"
 
-enum kvstore_types {
-    KV_TYPE_NONE = 0,
-    KV_TYPE_LEVELDB,
-    KV_TYPE_OTHER
-};
-
-
 static uint64_t default_strip_size = 1024;
 
 class StripObjectMap: public GenericObjectMap {
@@ -73,10 +66,10 @@ class StripObjectMap: public GenericObjectMap {
                    // also block read operation which not should be permitted.
     coll_t cid;
     ghobject_t oid;
+    bool updated;
     bool deleted;
-    map<pair<string, string>, bufferlist> buffers;  // pair(prefix, key)
 
-    StripObjectHeader(): strip_size(default_strip_size), max_size(0), deleted(false) {}
+    StripObjectHeader(): strip_size(default_strip_size), max_size(0), updated(false), deleted(false) {}
 
     void encode(bufferlist &bl) const {
       ENCODE_START(1, 1, bl);
@@ -144,12 +137,55 @@ class StripObjectMap: public GenericObjectMap {
 };
 
 
+class KVSuperblock {
+public:
+  CompatSet compat_features;
+  string backend;
+
+  KVSuperblock() { }
+
+  void encode(bufferlist &bl) const;
+  void decode(bufferlist::iterator &bl);
+  void dump(Formatter *f) const;
+  static void generate_test_instances(list<KVSuperblock*>& o);
+};
+WRITE_CLASS_ENCODER(KVSuperblock)
+
+
+inline ostream& operator<<(ostream& out, const KVSuperblock& sb)
+{
+  return out << "sb(" << sb.compat_features << " " << sb.backend << ")";
+}
+
+
 class KeyValueStore : public ObjectStore,
                       public md_config_obs_t {
  public:
+  struct KVPerfTracker {
+    PerfCounters::avg_tracker<uint64_t> os_commit_latency;
+    PerfCounters::avg_tracker<uint64_t> os_apply_latency;
+
+    objectstore_perf_stat_t get_cur_stats() const {
+      objectstore_perf_stat_t ret;
+      ret.filestore_commit_latency = os_commit_latency.avg();
+      ret.filestore_apply_latency = os_apply_latency.avg();
+      return ret;
+    }
+
+    void update_from_perfcounters(PerfCounters &logger) {
+      os_commit_latency.consume_next(
+        logger.get_tavg_ms(
+          l_os_commit_lat));
+      os_apply_latency.consume_next(
+        logger.get_tavg_ms(
+          l_os_apply_lat));
+    }
+
+  } perf_tracker;
+
   objectstore_perf_stat_t get_cur_stats() {
-    objectstore_perf_stat_t ret;
-    return ret;
+    perf_tracker.update_from_perfcounters(*perf_logger);
+    return perf_tracker.get_cur_stats();
   }
 
   static const uint32_t target_version = 1;
@@ -158,12 +194,9 @@ class KeyValueStore : public ObjectStore,
   string internal_name; // internal name, used to name the perfcounter instance
   string basedir;
   std::string current_fn;
-  std::string current_op_seq_fn;
   uuid_d fsid;
 
   int fsid_fd, current_fd;
-
-  enum kvstore_types kv_type;
 
   deque<uint64_t> snaps;
 
@@ -214,6 +247,8 @@ class KeyValueStore : public ObjectStore,
 
     //Dirty records
     StripHeaderMap strip_headers;
+    map< uniq_id, map<pair<string, string>, bufferlist> > buffers;  // pair(prefix, key),to buffer updated data in one transaction
+
     list<Context*> finishes;
 
     KeyValueStore *store;
@@ -434,7 +469,7 @@ class KeyValueStore : public ObjectStore,
   void op_queue_release_throttle(Op *o);
   void _finish_op(OpSequencer *osr);
 
-  PerfCounters *logger;
+  PerfCounters *perf_logger;
 
  public:
 
@@ -443,13 +478,13 @@ class KeyValueStore : public ObjectStore,
                 bool update_to=false);
   ~KeyValueStore();
 
-  int _detect_backend() { kv_type = KV_TYPE_LEVELDB; return 0; }
   bool test_mount_in_use();
   int version_stamp_is_valid(uint32_t *version);
   int update_version_stamp();
   uint32_t get_target_version() {
     return target_version;
   }
+  bool need_journal() { return false; };
   int peek_journal_fsid(uuid_d *id) {
     *id = fsid;
     return 0;
@@ -458,7 +493,12 @@ class KeyValueStore : public ObjectStore,
   int write_version_stamp();
   int mount();
   int umount();
-  int get_max_object_name_length();
+  unsigned get_max_object_name_length() {
+    return 4096;  // no real limit for leveldb
+  }
+  unsigned get_max_attr_name_length() {
+    return 256;  // arbitrary; there is no real limit internally
+  }
   int mkfs();
   int mkjournal() {return 0;}
 
@@ -501,19 +541,19 @@ class KeyValueStore : public ObjectStore,
                     bool allow_eio = false, BufferTransaction *bt = 0);
   int _generic_write(StripObjectMap::StripObjectHeaderRef header,
                      uint64_t offset, size_t len, const bufferlist& bl,
-                     BufferTransaction &t, bool replica = false);
+                     BufferTransaction &t, uint32_t fadvise_flags = 0);
 
   bool exists(coll_t cid, const ghobject_t& oid);
   int stat(coll_t cid, const ghobject_t& oid, struct stat *st,
            bool allow_eio = false);
   int read(coll_t cid, const ghobject_t& oid, uint64_t offset, size_t len,
-           bufferlist& bl, bool allow_eio = false);
+           bufferlist& bl, uint32_t op_flags = 0, bool allow_eio = false);
   int fiemap(coll_t cid, const ghobject_t& oid, uint64_t offset, size_t len,
              bufferlist& bl);
 
   int _touch(coll_t cid, const ghobject_t& oid, BufferTransaction &t);
   int _write(coll_t cid, const ghobject_t& oid, uint64_t offset, size_t len,
-             const bufferlist& bl, BufferTransaction &t, bool replica = false);
+             const bufferlist& bl, BufferTransaction &t, uint32_t fadvise_flags = 0);
   int _zero(coll_t cid, const ghobject_t& oid, uint64_t offset, size_t len,
             BufferTransaction &t);
   int _truncate(coll_t cid, const ghobject_t& oid, uint64_t size,
@@ -524,7 +564,10 @@ class KeyValueStore : public ObjectStore,
                    const ghobject_t& newoid, uint64_t srcoff,
                    uint64_t len, uint64_t dstoff, BufferTransaction &t);
   int _remove(coll_t cid, const ghobject_t& oid, BufferTransaction &t);
-
+  int _set_alloc_hint(coll_t cid, const ghobject_t& oid,
+                      uint64_t expected_object_size,
+                      uint64_t expected_write_size,
+                      BufferTransaction &t);
 
   void start_sync() {}
   void sync() {}
@@ -537,8 +580,7 @@ class KeyValueStore : public ObjectStore,
   // attrs
   int getattr(coll_t cid, const ghobject_t& oid, const char *name,
               bufferptr &bp);
-  int getattrs(coll_t cid, const ghobject_t& oid, map<string,bufferptr>& aset,
-               bool user_only = false);
+  int getattrs(coll_t cid, const ghobject_t& oid, map<string,bufferptr>& aset);
 
   int _setattrs(coll_t cid, const ghobject_t& oid,
                 map<string, bufferptr>& aset, BufferTransaction &t);
@@ -557,6 +599,8 @@ class KeyValueStore : public ObjectStore,
                            BufferTransaction &t);
 
   // collections
+  int _collection_hint_expected_num_objs(coll_t cid, uint32_t pg_num,
+      uint64_t num_objs) const { return 0; }
   int _create_collection(coll_t c, BufferTransaction &t);
   int _destroy_collection(coll_t c, BufferTransaction &t);
   int _collection_add(coll_t c, coll_t ocid, const ghobject_t& oid,
@@ -566,8 +610,6 @@ class KeyValueStore : public ObjectStore,
                               BufferTransaction &t);
   int _collection_remove_recursive(const coll_t &cid,
                                    BufferTransaction &t);
-  int _collection_rename(const coll_t &cid, const coll_t &ncid,
-                         BufferTransaction &t);
   int list_collections(vector<coll_t>& ls);
   bool collection_exists(coll_t c);
   bool collection_empty(coll_t c);
@@ -628,9 +670,9 @@ class KeyValueStore : public ObjectStore,
   std::string m_osd_rollback_to_cluster_snap;
   int m_keyvaluestore_queue_max_ops;
   int m_keyvaluestore_queue_max_bytes;
-
+  int m_keyvaluestore_strip_size;
+  uint64_t m_keyvaluestore_max_expected_write_size;
   int do_update;
-
 
   static const string OBJECT_STRIP_PREFIX;
   static const string OBJECT_XATTR;
@@ -640,6 +682,25 @@ class KeyValueStore : public ObjectStore,
   static const string COLLECTION;
   static const string COLLECTION_ATTR;
   static const uint32_t COLLECTION_VERSION = 1;
+
+  KVSuperblock superblock;
+  /**
+   * write_superblock()
+   *
+   * Write superblock to persisent storage
+   *
+   * return value: 0 on success, otherwise negative errno
+   */
+  int write_superblock();
+
+  /**
+   * read_superblock()
+   *
+   * Fill in KeyValueStore::superblock by reading persistent storage
+   *
+   * return value: 0 on success, otherwise negative errno
+   */
+  int read_superblock();
 };
 
 WRITE_CLASS_ENCODER(StripObjectMap::StripObjectHeader)

@@ -14,16 +14,31 @@
 
 #include "MDS.h"
 #include "MDCache.h"
+#include "Mutation.h"
 #include "SessionMap.h"
 #include "osdc/Filer.h"
 
 #include "common/config.h"
 #include "common/errno.h"
 #include "include/assert.h"
+#include "include/stringify.h"
 
 #define dout_subsys ceph_subsys_mds
 #undef dout_prefix
-#define dout_prefix *_dout << "mds." << mds->get_nodeid() << ".sessionmap "
+#define dout_prefix *_dout << "mds." << rank << ".sessionmap "
+
+
+class SessionMapIOContext : public MDSIOContextBase
+{
+  protected:
+    SessionMap *sessionmap;
+    MDS *get_mds() {return sessionmap->mds;}
+  public:
+    SessionMapIOContext(SessionMap *sessionmap_) : sessionmap(sessionmap_) {
+      assert(sessionmap != NULL);
+    }
+};
+
 
 
 void SessionMap::dump()
@@ -48,31 +63,31 @@ void SessionMap::dump()
 object_t SessionMap::get_object_name()
 {
   char s[30];
-  snprintf(s, sizeof(s), "mds%d_sessionmap", mds->whoami);
+  snprintf(s, sizeof(s), "mds%d_sessionmap", int(mds->whoami));
   return object_t(s);
 }
 
-class C_SM_Load : public Context {
-  SessionMap *sessionmap;
+class C_IO_SM_Load : public SessionMapIOContext {
 public:
   bufferlist bl;
-  C_SM_Load(SessionMap *cm) : sessionmap(cm) {}
+  C_IO_SM_Load(SessionMap *cm) : SessionMapIOContext(cm) {}
   void finish(int r) {
     sessionmap->_load_finish(r, bl);
   }
 };
 
-void SessionMap::load(Context *onload)
+void SessionMap::load(MDSInternalContextBase *onload)
 {
   dout(10) << "load" << dendl;
 
   if (onload)
     waiting_for_load.push_back(onload);
   
-  C_SM_Load *c = new C_SM_Load(this);
+  C_IO_SM_Load *c = new C_IO_SM_Load(this);
   object_t oid = get_object_name();
   object_locator_t oloc(mds->mdsmap->get_metadata_pool());
-  mds->objecter->read_full(oid, oloc, CEPH_NOSNAP, &c->bl, 0, c);
+  mds->objecter->read_full(oid, oloc, CEPH_NOSNAP, &c->bl, 0,
+			   new C_OnFinisher(c, &mds->finisher));
 }
 
 void SessionMap::_load_finish(int r, bufferlist &bl)
@@ -97,18 +112,17 @@ void SessionMap::_load_finish(int r, bufferlist &bl)
 // ----------------
 // SAVE
 
-class C_SM_Save : public Context {
-  SessionMap *sessionmap;
+class C_IO_SM_Save : public SessionMapIOContext {
   version_t version;
 public:
-  C_SM_Save(SessionMap *cm, version_t v) : sessionmap(cm), version(v) {}
+  C_IO_SM_Save(SessionMap *cm, version_t v) : SessionMapIOContext(cm), version(v) {}
   void finish(int r) {
     assert(r == 0);
     sessionmap->_save_finish(version);
   }
 };
 
-void SessionMap::save(Context *onsave, version_t needv)
+void SessionMap::save(MDSInternalContextBase *onsave, version_t needv)
 {
   dout(10) << "save needv " << needv << ", v " << version << dendl;
  
@@ -131,7 +145,9 @@ void SessionMap::save(Context *onsave, version_t needv)
   mds->objecter->write_full(oid, oloc,
 			    snapc,
 			    bl, ceph_clock_now(g_ceph_context), 0,
-			    NULL, new C_SM_Save(this, version));
+			    NULL,
+			    new C_OnFinisher(new C_IO_SM_Save(this, version),
+					     &mds->finisher));
 }
 
 void SessionMap::_save_finish(version_t v)
@@ -146,7 +162,7 @@ void SessionMap::_save_finish(version_t v)
 
 // -------------------
 
-void SessionMap::encode(bufferlist& bl) const
+void SessionMapStore::encode(bufferlist& bl) const
 {
   uint64_t pre = -1;     // for 0.19 compatibility; we forgot an encoding prefix.
   ::encode(pre, bl);
@@ -168,7 +184,35 @@ void SessionMap::encode(bufferlist& bl) const
   ENCODE_FINISH(bl);
 }
 
-void SessionMap::decode(bufferlist::iterator& p)
+/**
+ * Deserialize sessions, and update by_state index
+ */
+void SessionMap::decode(bufferlist::iterator &p)
+{
+  // Populate `sessions`
+  SessionMapStore::decode(p);
+
+  // Update `by_state`
+  for (ceph::unordered_map<entity_name_t, Session*>::iterator i = session_map.begin();
+       i != session_map.end(); ++i) {
+    Session *s = i->second;
+    if (by_state.count(s->get_state()) == 0)
+      by_state[s->get_state()] = new xlist<Session*>;
+    by_state[s->get_state()]->push_back(&s->item_session_list);
+  }
+}
+
+uint64_t SessionMap::set_state(Session *session, int s) {
+  if (session->state != s) {
+    session->set_state(s);
+    if (by_state.count(s) == 0)
+      by_state[s] = new xlist<Session*>;
+    by_state[s]->push_back(&session->item_session_list);
+  }
+  return session->get_state_seq();
+}
+
+void SessionMapStore::decode(bufferlist::iterator& p)
 {
   utime_t now = ceph_clock_now(g_ceph_context);
   uint64_t pre;
@@ -184,8 +228,8 @@ void SessionMap::decode(bufferlist::iterator& p)
       ::decode(inst.name, p);
       Session *s = get_or_add_session(inst);
       if (s->is_closed())
-	set_state(s, Session::STATE_OPEN);
-      s->info.decode(p);
+        s->set_state(Session::STATE_OPEN);
+      s->decode(p);
     }
 
     DECODE_FINISH(p);
@@ -212,13 +256,13 @@ void SessionMap::decode(bufferlist::iterator& p)
       } else {
 	session_map[s->info.inst.name] = s;
       }
-      set_state(s, Session::STATE_OPEN);
+      s->set_state(Session::STATE_OPEN);
       s->last_cap_renew = now;
     }
   }
 }
 
-void SessionMap::dump(Formatter *f) const
+void SessionMapStore::dump(Formatter *f) const
 {
   f->open_array_section("Sessions");
   for (ceph::unordered_map<entity_name_t,Session*>::const_iterator p = session_map.begin();
@@ -228,6 +272,7 @@ void SessionMap::dump(Formatter *f) const
     f->open_object_section("entity name");
     p->first.dump(f);
     f->close_section(); // entity name
+    f->dump_string("state", p->second->get_state_name());
     f->open_object_section("Session info");
     p->second->info.dump(f);
     f->close_section(); // Session info
@@ -236,10 +281,10 @@ void SessionMap::dump(Formatter *f) const
   f->close_section(); // Sessions
 }
 
-void SessionMap::generate_test_instances(list<SessionMap*>& ls)
+void SessionMapStore::generate_test_instances(list<SessionMapStore*>& ls)
 {
   // pretty boring for now
-  ls.push_back(new SessionMap(NULL));
+  ls.push_back(new SessionMapStore());
 }
 
 void SessionMap::wipe()
@@ -267,3 +312,140 @@ void SessionMap::wipe_ino_prealloc()
   }
   projected = ++version;
 }
+
+/**
+ * Calculate the length of the `requests` member list,
+ * because elist does not have a size() method.
+ *
+ * O(N) runtime.  This would be const, but elist doesn't
+ * have const iterators.
+ */
+size_t Session::get_request_count()
+{
+  size_t result = 0;
+
+  elist<MDRequestImpl*>::iterator p = requests.begin(
+      member_offset(MDRequestImpl, item_session_request));
+  while (!p.end()) {
+    ++result;
+    ++p;
+  }
+
+  return result;
+}
+
+void SessionMap::add_session(Session *s)
+{
+  dout(10) << __func__ << " s=" << s << " name=" << s->info.inst.name << dendl;
+
+  assert(session_map.count(s->info.inst.name) == 0);
+  session_map[s->info.inst.name] = s;
+  if (by_state.count(s->state) == 0)
+    by_state[s->state] = new xlist<Session*>;
+  by_state[s->state]->push_back(&s->item_session_list);
+  s->get();
+}
+
+void SessionMap::remove_session(Session *s)
+{
+  dout(10) << __func__ << " s=" << s << " name=" << s->info.inst.name << dendl;
+
+  s->trim_completed_requests(0);
+  s->item_session_list.remove_myself();
+  session_map.erase(s->info.inst.name);
+  s->put();
+}
+
+void SessionMap::touch_session(Session *session)
+{
+  dout(10) << __func__ << " s=" << session << " name=" << session->info.inst.name << dendl;
+
+  // Move to the back of the session list for this state (should
+  // already be on a list courtesy of add_session and set_state)
+  assert(session->item_session_list.is_on_list());
+  if (by_state.count(session->state) == 0)
+    by_state[session->state] = new xlist<Session*>;
+  by_state[session->state]->push_back(&session->item_session_list);
+
+  session->last_cap_renew = ceph_clock_now(g_ceph_context);
+}
+
+/**
+ * Capped in response to a CEPH_MSG_CLIENT_CAPRELEASE message,
+ * with n_caps equal to the number of caps that were released
+ * in the message.  Used to update state about how many caps a
+ * client has released since it was last instructed to RECALL_STATE.
+ */
+void Session::notify_cap_release(size_t n_caps)
+{
+  if (!recalled_at.is_zero()) {
+    recall_release_count += n_caps;
+    if (recall_release_count >= recall_count) {
+      recalled_at = utime_t();
+      recall_count = 0;
+      recall_release_count = 0;
+    }
+  }
+}
+
+/**
+ * Called when a CEPH_MSG_CLIENT_SESSION->CEPH_SESSION_RECALL_STATE
+ * message is sent to the client.  Update our recall-related state
+ * in order to generate health metrics if the session doesn't see
+ * a commensurate number of calls to ::notify_cap_release
+ */
+void Session::notify_recall_sent(int const new_limit)
+{
+  if (recalled_at.is_zero()) {
+    // Entering recall phase, set up counters so we can later
+    // judge whether the client has respected the recall request
+    recalled_at = ceph_clock_now(g_ceph_context);
+    assert (new_limit < caps.size());  // Behaviour of Server::recall_client_state
+    recall_count = caps.size() - new_limit;
+    recall_release_count = 0;
+  }
+}
+
+void Session::set_client_metadata(map<string, string> const &meta)
+{
+  info.client_metadata = meta;
+
+  _update_human_name();
+}
+
+/**
+ * Use client metadata to generate a somewhat-friendlier
+ * name for the client than its session ID.
+ *
+ * This is *not* guaranteed to be unique, and any machine
+ * consumers of session-related output should always use
+ * the session ID as a primary capacity and use this only
+ * as a presentation hint.
+ */
+void Session::_update_human_name()
+{
+  if (info.client_metadata.count("hostname")) {
+    // Happy path, refer to clients by hostname
+    human_name = info.client_metadata["hostname"];
+    if (info.client_metadata.count("entity_id")) {
+      EntityName entity;
+      entity.set_id(info.client_metadata["entity_id"]);
+      if (!entity.has_default_id()) {
+        // When a non-default entity ID is set by the user, assume they
+        // would like to see it in references to the client
+        human_name += std::string(":") + entity.get_id();
+      }
+    }
+  } else {
+    // Fallback, refer to clients by ID e.g. client.4567
+    human_name = stringify(info.inst.name.num());
+  }
+}
+
+void Session::decode(bufferlist::iterator &p)
+{
+  info.decode(p);
+
+  _update_human_name();
+}
+

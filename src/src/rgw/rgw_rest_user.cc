@@ -1,3 +1,6 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// vim: ts=8 sw=2 smarttab
+
 #include "common/ceph_json.h"
 
 #include "rgw_op.h"
@@ -27,10 +30,13 @@ void RGWOp_User_Info::execute()
   RGWUserAdminOpState op_state;
 
   std::string uid;
+  bool fetch_stats;
 
   RESTArgs::get_string(s, "uid", uid, &uid);
+  RESTArgs::get_bool(s, "stats", false, &fetch_stats);
 
   op_state.set_user_id(uid);
+  op_state.set_fetch_stats(fetch_stats);
 
   http_ret = RGWUserAdminOp_User::info(store, op_state, flusher);
 }
@@ -62,9 +68,10 @@ void RGWOp_User_Create::execute()
   bool gen_key;
   bool suspended;
   bool system;
+  bool exclusive;
 
   uint32_t max_buckets;
-  int32_t key_type = KEY_TYPE_UNDEFINED;
+  uint32_t default_max_buckets = s->cct->_conf->rgw_user_max_buckets;
 
   RGWUserAdminOpState op_state;
 
@@ -77,8 +84,9 @@ void RGWOp_User_Create::execute()
   RESTArgs::get_string(s, "user-caps", caps, &caps);
   RESTArgs::get_bool(s, "generate-key", true, &gen_key);
   RESTArgs::get_bool(s, "suspended", false, &suspended);
-  RESTArgs::get_uint32(s, "max-buckets", RGW_DEFAULT_MAX_BUCKETS, &max_buckets);
+  RESTArgs::get_uint32(s, "max-buckets", default_max_buckets, &max_buckets);
   RESTArgs::get_bool(s, "system", false, &system);
+  RESTArgs::get_bool(s, "exclusive", false, &exclusive);
 
   if (!s->user.system && system) {
     ldout(s->cct, 0) << "cannot set system flag by non-system user" << dendl;
@@ -106,6 +114,7 @@ void RGWOp_User_Create::execute()
     op_state.set_secret_key(secret_key);
 
   if (!key_type_str.empty()) {
+    int32_t key_type = KEY_TYPE_UNDEFINED;
     if (key_type_str.compare("swift") == 0)
       key_type = KEY_TYPE_SWIFT;
     else if (key_type_str.compare("s3") == 0)
@@ -114,7 +123,7 @@ void RGWOp_User_Create::execute()
     op_state.set_key_type(key_type);
   }
 
-  if (max_buckets != RGW_DEFAULT_MAX_BUCKETS)
+  if (max_buckets != default_max_buckets)
     op_state.set_max_buckets(max_buckets);
 
   if (s->info.args.exists("suspended"))
@@ -122,6 +131,9 @@ void RGWOp_User_Create::execute()
 
   if (s->info.args.exists("system"))
     op_state.set_system(system);
+
+  if (s->info.args.exists("exclusive"))
+    op_state.set_exclusive(exclusive);
 
   if (gen_key)
     op_state.set_generate_key();
@@ -158,7 +170,6 @@ void RGWOp_User_Modify::execute()
   bool system;
 
   uint32_t max_buckets;
-  int32_t key_type = KEY_TYPE_UNDEFINED;
 
   RGWUserAdminOpState op_state;
 
@@ -206,6 +217,7 @@ void RGWOp_User_Modify::execute()
     op_state.set_generate_key();
 
   if (!key_type_str.empty()) {
+    int32_t key_type = KEY_TYPE_UNDEFINED;
     if (key_type_str.compare("swift") == 0)
       key_type = KEY_TYPE_SWIFT;
     else if (key_type_str.compare("s3") == 0)
@@ -451,7 +463,6 @@ void RGWOp_Key_Create::execute()
   std::string secret_key;
   std::string key_type_str;
 
-  int32_t key_type = KEY_TYPE_UNDEFINED;
   bool gen_key;
 
   RGWUserAdminOpState op_state;
@@ -480,6 +491,7 @@ void RGWOp_Key_Create::execute()
     op_state.set_generate_key();
 
   if (!key_type_str.empty()) {
+    int32_t key_type = KEY_TYPE_UNDEFINED;
     if (key_type_str.compare("swift") == 0)
       key_type = KEY_TYPE_SWIFT;
     else if (key_type_str.compare("s3") == 0)
@@ -512,8 +524,6 @@ void RGWOp_Key_Remove::execute()
   std::string access_key;
   std::string key_type_str;
 
-  int32_t key_type = KEY_TYPE_UNDEFINED;
-
   RGWUserAdminOpState op_state;
 
   RESTArgs::get_string(s, "uid", uid, &uid);
@@ -532,6 +542,7 @@ void RGWOp_Key_Remove::execute()
     op_state.set_access_key(access_key);
 
   if (!key_type_str.empty()) {
+    int32_t key_type = KEY_TYPE_UNDEFINED;
     if (key_type_str.compare("swift") == 0)
       key_type = KEY_TYPE_SWIFT;
     else if (key_type_str.compare("s3") == 0)
@@ -683,6 +694,7 @@ void RGWOp_Quota_Info::execute()
   if (http_ret < 0)
     return;
 
+  flusher.start(0);
   if (show_all) {
     UserQuotas quotas(info);
     encode_json("quota", quotas, s->formatter);
@@ -874,7 +886,7 @@ RGWOp *RGWHandler_User::op_get()
     return new RGWOp_Quota_Info;
 
   return new RGWOp_User_Info;
-};
+}
 
 RGWOp *RGWHandler_User::op_put()
 {
@@ -891,7 +903,7 @@ RGWOp *RGWHandler_User::op_put()
     return new RGWOp_Quota_Set;
 
   return new RGWOp_User_Create;
-};
+}
 
 RGWOp *RGWHandler_User::op_post()
 {
@@ -899,7 +911,7 @@ RGWOp *RGWHandler_User::op_post()
     return new RGWOp_Subuser_Modify;
 
   return new RGWOp_User_Modify;
-};
+}
 
 RGWOp *RGWHandler_User::op_delete()
 {
@@ -913,5 +925,5 @@ RGWOp *RGWHandler_User::op_delete()
     return new RGWOp_Caps_Remove;
 
   return new RGWOp_User_Remove;
-};
+}
 

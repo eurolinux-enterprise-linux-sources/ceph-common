@@ -19,10 +19,14 @@
 #include "common/safe_io.h"
 #include "common/simple_spin.h"
 #include "common/strtol.h"
+#include "common/likely.h"
 #include "include/atomic.h"
 #include "common/Mutex.h"
 #include "include/types.h"
 #include "include/compat.h"
+#if defined(HAVE_XIO)
+#include "msg/xio/XioMsg.h"
+#endif
 
 #include <errno.h>
 #include <fstream>
@@ -33,7 +37,7 @@
 namespace ceph {
 
 #ifdef BUFFER_DEBUG
-static uint32_t simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZER;
+static simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZER;
 # define bdout { simple_spin_lock(&buffer_debug_lock); std::cout
 # define bendl std::endl; simple_spin_unlock(&buffer_debug_lock); }
 #else
@@ -134,7 +138,7 @@ static uint32_t simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZE
       : data(c), len(l), nref(0),
 	crc_lock("buffer::raw::crc_lock", false, false)
     { }
-    virtual ~raw() {};
+    virtual ~raw() {}
 
     // no copying.
     raw(const raw &other);
@@ -160,6 +164,12 @@ static uint32_t simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZE
     }
     bool is_n_page_sized() {
       return (len & ~CEPH_PAGE_MASK) == 0;
+    }
+    virtual bool is_shareable() {
+      // true if safe to reference/share the existing buffer copy
+      // false if it is not safe to share the buffer, e.g., due to special
+      // and/or registered memory that is scarce
+      return true;
     }
     bool get_crc(const pair<size_t, size_t> &fromto,
 		 pair<uint32_t, uint32_t> *crc) const {
@@ -230,20 +240,23 @@ static uint32_t simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZE
   };
 
   class buffer::raw_posix_aligned : public buffer::raw {
+    unsigned align;
   public:
-    raw_posix_aligned(unsigned l) : raw(l) {
+    raw_posix_aligned(unsigned l, unsigned _align) : raw(l) {
+      align = _align;
+      assert((align >= sizeof(void *)) && (align & (align - 1)) == 0);
 #ifdef DARWIN
       data = (char *) valloc (len);
 #else
       data = 0;
-      int r = ::posix_memalign((void**)(void*)&data, CEPH_PAGE_SIZE, len);
+      int r = ::posix_memalign((void**)(void*)&data, align, len);
       if (r)
 	throw bad_alloc();
 #endif /* DARWIN */
       if (!data)
 	throw bad_alloc();
       inc_total_alloc(len);
-      bdout << "raw_posix_aligned " << this << " alloc " << (void *)data << " " << l << " " << buffer::get_total_alloc() << bendl;
+      bdout << "raw_posix_aligned " << this << " alloc " << (void *)data << " l=" << l << ", align=" << align << " total_alloc=" << buffer::get_total_alloc() << bendl;
     }
     ~raw_posix_aligned() {
       ::free((void*)data);
@@ -251,34 +264,36 @@ static uint32_t simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZE
       bdout << "raw_posix_aligned " << this << " free " << (void *)data << " " << buffer::get_total_alloc() << bendl;
     }
     raw* clone_empty() {
-      return new raw_posix_aligned(len);
+      return new raw_posix_aligned(len, align);
     }
   };
 #endif
 
 #ifdef __CYGWIN__
   class buffer::raw_hack_aligned : public buffer::raw {
+    unsigned align;
     char *realdata;
   public:
-    raw_hack_aligned(unsigned l) : raw(l) {
-      realdata = new char[len+CEPH_PAGE_SIZE-1];
-      unsigned off = ((unsigned)realdata) & ~CEPH_PAGE_MASK;
+    raw_hack_aligned(unsigned l, unsigned _align) : raw(l) {
+      align = _align;
+      realdata = new char[len+align-1];
+      unsigned off = ((unsigned)realdata) & (align-1);
       if (off)
-	data = realdata + CEPH_PAGE_SIZE - off;
+	data = realdata + align - off;
       else
 	data = realdata;
-      inc_total_alloc(len+CEPH_PAGE_SIZE-1);
+      inc_total_alloc(len+align-1);
       //cout << "hack aligned " << (unsigned)data
       //<< " in raw " << (unsigned)realdata
       //<< " off " << off << std::endl;
-      assert(((unsigned)data & (CEPH_PAGE_SIZE-1)) == 0);
+      assert(((unsigned)data & (align-1)) == 0);
     }
     ~raw_hack_aligned() {
       delete[] realdata;
-      dec_total_alloc(len+CEPH_PAGE_SIZE-1);
+      dec_total_alloc(len+align-1);
     }
     raw* clone_empty() {
-      return new raw_hack_aligned(len);
+      return new raw_hack_aligned(len, align);
     }
   };
 #endif
@@ -323,7 +338,7 @@ static uint32_t simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZE
 
     ~raw_pipe() {
       if (data)
-	delete data;
+	free(data);
       close_pipe(pipefds);
       dec_total_alloc(len);
       bdout << "raw_pipe " << this << " free " << (void *)data << " "
@@ -332,10 +347,6 @@ static uint32_t simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZE
 
     bool can_zero_copy() const {
       return true;
-    }
-
-    bool is_page_aligned() {
-      return false;
     }
 
     int set_source(int fd, loff_t *off) {
@@ -491,6 +502,27 @@ static uint32_t simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZE
     }
   };
 
+  class buffer::raw_unshareable : public buffer::raw {
+  public:
+    raw_unshareable(unsigned l) : raw(l) {
+      if (len)
+	data = new char[len];
+      else
+	data = 0;
+    }
+    raw_unshareable(unsigned l, char *b) : raw(b, l) {
+    }
+    raw* clone_empty() {
+      return new raw_char(len);
+    }
+    bool is_shareable() {
+      return false; // !shareable, will force make_shareable()
+    }
+    ~raw_unshareable() {
+      delete[] data;
+    }
+  };
+
   class buffer::raw_static : public buffer::raw {
   public:
     raw_static(const char *d, unsigned l) : raw((char*)d, l) { }
@@ -499,6 +531,59 @@ static uint32_t simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZE
       return new buffer::raw_char(len);
     }
   };
+
+#if defined(HAVE_XIO)
+  class buffer::xio_msg_buffer : public buffer::raw {
+  private:
+    XioDispatchHook* m_hook;
+  public:
+    xio_msg_buffer(XioDispatchHook* _m_hook, const char *d,
+	unsigned l) :
+      raw((char*)d, l), m_hook(_m_hook->get()) {}
+
+    bool is_shareable() { return false; }
+    static void operator delete(void *p)
+    {
+      xio_msg_buffer *buf = static_cast<xio_msg_buffer*>(p);
+      // return hook ref (counts against pool);  it appears illegal
+      // to do this in our dtor, because this fires after that
+      buf->m_hook->put();
+    }
+    raw* clone_empty() {
+      return new buffer::raw_char(len);
+    }
+  };
+
+  class buffer::xio_mempool : public buffer::raw {
+  public:
+    struct xio_mempool_obj *mp;
+    xio_mempool(struct xio_mempool_obj *_mp, unsigned l) :
+      raw((char*)mp->addr, l), mp(_mp)
+    { }
+    ~xio_mempool() {}
+    raw* clone_empty() {
+      return new buffer::raw_char(len);
+    }
+  };
+
+  struct xio_mempool_obj* get_xio_mp(const buffer::ptr& bp)
+  {
+    buffer::xio_mempool *mb = dynamic_cast<buffer::xio_mempool*>(bp.get_raw());
+    if (mb) {
+      return mb->mp;
+    }
+    return NULL;
+  }
+
+  buffer::raw* buffer::create_msg(
+      unsigned len, char *buf, XioDispatchHook* m_hook) {
+    XioPool& pool = m_hook->get_pool();
+    buffer::raw* bp =
+      static_cast<buffer::raw*>(pool.alloc(sizeof(xio_msg_buffer)));
+    new (bp) xio_msg_buffer(m_hook, buf, len);
+    return bp;
+  }
+#endif /* HAVE_XIO */
 
   buffer::raw* buffer::copy(const char *c, unsigned len) {
     raw* r = new raw_char(len);
@@ -520,13 +605,16 @@ static uint32_t simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZE
   buffer::raw* buffer::create_static(unsigned len, char *buf) {
     return new raw_static(buf, len);
   }
-  buffer::raw* buffer::create_page_aligned(unsigned len) {
+  buffer::raw* buffer::create_aligned(unsigned len, unsigned align) {
 #ifndef __CYGWIN__
     //return new raw_mmap_pages(len);
-    return new raw_posix_aligned(len);
+    return new raw_posix_aligned(len, align);
 #else
-    return new raw_hack_aligned(len);
+    return new raw_hack_aligned(len, align);
 #endif
+  }
+  buffer::raw* buffer::create_page_aligned(unsigned len) {
+    return create_aligned(len, CEPH_PAGE_SIZE);
   }
 
   buffer::raw* buffer::create_zero_copy(unsigned len, int fd, int64_t *offset) {
@@ -541,6 +629,10 @@ static uint32_t simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZE
 #else
     throw error_code(-ENOTSUP);
 #endif
+  }
+
+  buffer::raw* buffer::create_unshareable(unsigned len) {
+    return new raw_unshareable(len);
   }
 
   buffer::ptr::ptr(raw *r) : _raw(r), _off(0), _len(r->len)   // no lock needed; this is an unref raw.
@@ -596,6 +688,18 @@ static uint32_t simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZE
   buffer::raw *buffer::ptr::clone()
   {
     return _raw->clone();
+  }
+
+  buffer::ptr& buffer::ptr::make_shareable() {
+    if (_raw && !_raw->is_shareable()) {
+      buffer::raw *tr = _raw;
+      _raw = tr->clone();
+      _raw->nref.set(1);
+      if (unlikely(tr->nref.dec() == 0)) {
+        delete tr;
+      }
+    }
+    return *this;
   }
 
   void buffer::ptr::swap(ptr& other)
@@ -951,6 +1055,7 @@ static uint32_t simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZE
   void buffer::list::swap(list& other)
   {
     std::swap(_len, other._len);
+    std::swap(_memcopy_count, other._memcopy_count);
     _buffers.swap(other._buffers);
     append_buffer.swap(other.append_buffer);
     //last_p.swap(other.last_p);
@@ -1013,22 +1118,22 @@ static uint32_t simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZE
     return true;
   }
 
-  bool buffer::list::is_page_aligned() const
+  bool buffer::list::is_aligned(unsigned align) const
   {
     for (std::list<ptr>::const_iterator it = _buffers.begin();
 	 it != _buffers.end();
 	 ++it) 
-      if (!it->is_page_aligned())
+      if (!it->is_aligned(align))
 	return false;
     return true;
   }
 
-  bool buffer::list::is_n_page_sized() const
+  bool buffer::list::is_n_align_sized(unsigned align) const
   {
     for (std::list<ptr>::const_iterator it = _buffers.begin();
 	 it != _buffers.end();
 	 ++it) 
-      if (!it->is_n_page_sized())
+      if (!it->is_n_align_sized(align))
 	return false;
     return true;
   }
@@ -1060,12 +1165,23 @@ static uint32_t simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZE
 	 it != _buffers.end();
 	 ++it) {
       if (p + it->length() > o) {
-	if (p >= o && p+it->length() <= o+l)
-	  it->zero();                         // all
-	else if (p >= o) 
-	  it->zero(0, o+l-p);                 // head
-	else
-	  it->zero(o-p, it->length()-(o-p));  // tail
+        if (p >= o && p+it->length() <= o+l) {
+          // 'o'------------- l -----------|
+          //      'p'-- it->length() --|
+	  it->zero();
+        } else if (p >= o) {
+          // 'o'------------- l -----------|
+          //    'p'------- it->length() -------|
+	  it->zero(0, o+l-p);
+        } else if (p + it->length() <= o+l) {
+          //     'o'------------- l -----------|
+          // 'p'------- it->length() -------|
+	  it->zero(o-p, it->length()-(o-p));
+        } else {
+          //       'o'----------- l -----------|
+          // 'p'---------- it->length() ----------|
+          it->zero(o-p, l);
+        }
       }
       p += it->length();
       if (o+l <= p)
@@ -1078,8 +1194,22 @@ static uint32_t simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZE
     return &(*_buffers.begin()) == &(*_buffers.rbegin());
   }
 
+  bool buffer::list::is_n_page_sized() const
+  {
+    return is_n_align_sized(CEPH_PAGE_SIZE);
+  }
+
+  bool buffer::list::is_page_aligned() const
+  {
+    return is_aligned(CEPH_PAGE_SIZE);
+  }
+
   void buffer::list::rebuild()
   {
+    if (_len == 0) {
+      _buffers.clear();
+      return;
+    }
     ptr nb;
     if ((_len & ~CEPH_PAGE_MASK) == 0)
       nb = buffer::create_page_aligned(_len);
@@ -1097,70 +1227,90 @@ static uint32_t simple_spinlock_t buffer_debug_lock = SIMPLE_SPINLOCK_INITIALIZE
       nb.copy_in(pos, it->length(), it->c_str());
       pos += it->length();
     }
+    _memcopy_count += pos;
     _buffers.clear();
-    _buffers.push_back(nb);
+    if (nb.length())
+      _buffers.push_back(nb);
   }
 
-void buffer::list::rebuild_page_aligned()
-{
-  std::list<ptr>::iterator p = _buffers.begin();
-  while (p != _buffers.end()) {
-    // keep anything that's already page sized+aligned
-    if (p->is_page_aligned() && p->is_n_page_sized()) {
-      /*cout << " segment " << (void*)p->c_str()
-	     << " offset " << ((unsigned long)p->c_str() & ~CEPH_PAGE_MASK)
-	     << " length " << p->length()
-	     << " " << (p->length() & ~CEPH_PAGE_MASK) << " ok" << std::endl;
-      */
-      ++p;
-      continue;
-    }
-    
-    // consolidate unaligned items, until we get something that is sized+aligned
-    list unaligned;
-    unsigned offset = 0;
-    do {
-      /*cout << " segment " << (void*)p->c_str()
-	     << " offset " << ((unsigned long)p->c_str() & ~CEPH_PAGE_MASK)
-	     << " length " << p->length() << " " << (p->length() & ~CEPH_PAGE_MASK)
-	     << " overall offset " << offset << " " << (offset & ~CEPH_PAGE_MASK)
-	     << " not ok" << std::endl;
-      */
-      offset += p->length();
-      unaligned.push_back(*p);
-      _buffers.erase(p++);
-    } while (p != _buffers.end() &&
-	     (!p->is_page_aligned() ||
-	      !p->is_n_page_sized() ||
-	      (offset & ~CEPH_PAGE_MASK)));
-    ptr nb(buffer::create_page_aligned(unaligned._len));
-    unaligned.rebuild(nb);
-    _buffers.insert(p, unaligned._buffers.front());
+  void buffer::list::rebuild_aligned(unsigned align)
+  {
+    rebuild_aligned_size_and_memory(align, align);
   }
-}
+  
+  void buffer::list::rebuild_aligned_size_and_memory(unsigned align_size,
+  						   unsigned align_memory)
+  {
+    std::list<ptr>::iterator p = _buffers.begin();
+    while (p != _buffers.end()) {
+      // keep anything that's already align and sized aligned
+      if (p->is_aligned(align_memory) && p->is_n_align_sized(align_size)) {
+        /*cout << " segment " << (void*)p->c_str()
+  	     << " offset " << ((unsigned long)p->c_str() & (align - 1))
+  	     << " length " << p->length()
+  	     << " " << (p->length() & (align - 1)) << " ok" << std::endl;
+        */
+        ++p;
+        continue;
+      }
+      
+      // consolidate unaligned items, until we get something that is sized+aligned
+      list unaligned;
+      unsigned offset = 0;
+      do {
+        /*cout << " segment " << (void*)p->c_str()
+               << " offset " << ((unsigned long)p->c_str() & (align - 1))
+               << " length " << p->length() << " " << (p->length() & (align - 1))
+               << " overall offset " << offset << " " << (offset & (align - 1))
+  	     << " not ok" << std::endl;
+        */
+        offset += p->length();
+        unaligned.push_back(*p);
+        _buffers.erase(p++);
+      } while (p != _buffers.end() &&
+  	     (!p->is_aligned(align_memory) ||
+  	      !p->is_n_align_sized(align_size) ||
+  	      (offset % align_size)));
+      if (!(unaligned.is_contiguous() && unaligned._buffers.front().is_aligned(align_memory))) {
+        ptr nb(buffer::create_aligned(unaligned._len, align_memory));
+        unaligned.rebuild(nb);
+        _memcopy_count += unaligned._len;
+      }
+      _buffers.insert(p, unaligned._buffers.front());
+    }
+  }
+  
+  void buffer::list::rebuild_page_aligned()
+  {
+    rebuild_aligned(CEPH_PAGE_SIZE);
+  }
 
   // sort-of-like-assignment-op
-  void buffer::list::claim(list& bl)
+  void buffer::list::claim(list& bl, unsigned int flags)
   {
     // free my buffers
     clear();
-    claim_append(bl);
+    claim_append(bl, flags);
   }
 
-  void buffer::list::claim_append(list& bl)
+  void buffer::list::claim_append(list& bl, unsigned int flags)
   {
     // steal the other guy's buffers
     _len += bl._len;
-    _buffers.splice( _buffers.end(), bl._buffers );
+    if (!(flags & CLAIM_ALLOW_NONSHAREABLE))
+      bl.make_shareable();
+    _buffers.splice(_buffers.end(), bl._buffers );
     bl._len = 0;
     bl.last_p = bl.begin();
   }
 
-  void buffer::list::claim_prepend(list& bl)
+  void buffer::list::claim_prepend(list& bl, unsigned int flags)
   {
     // steal the other guy's buffers
     _len += bl._len;
-    _buffers.splice( _buffers.begin(), bl._buffers );
+    if (!(flags & CLAIM_ALLOW_NONSHAREABLE))
+      bl.make_shareable();
+    _buffers.splice(_buffers.begin(), bl._buffers );
     bl._len = 0;
     bl.last_p = bl.begin();
   }
@@ -1332,13 +1482,38 @@ void buffer::list::rebuild_page_aligned()
     return _buffers.front().c_str();  // good, we're already contiguous.
   }
 
+  char *buffer::list::get_contiguous(unsigned orig_off, unsigned len)
+  {
+    if (orig_off + len > length())
+      throw end_of_buffer();
+
+    if (len == 0) {
+      return 0;
+    }
+
+    unsigned off = orig_off;
+    std::list<ptr>::iterator curbuf = _buffers.begin();
+    while (off > 0 && off >= curbuf->length()) {
+      off -= curbuf->length();
+      ++curbuf;
+    }
+
+    if (off + len > curbuf->length()) {
+      // FIXME we'll just rebuild the whole list for now.
+      rebuild();
+      return c_str() + orig_off;
+    }
+
+    return curbuf->c_str() + off;
+  }
+
   void buffer::list::substr_of(const list& other, unsigned off, unsigned len)
   {
     if (off + len > other.length())
       throw end_of_buffer();
 
     clear();
-      
+
     // skip off
     std::list<ptr>::const_iterator curbuf = other._buffers.begin();
     while (off > 0 &&
@@ -1433,7 +1608,7 @@ void buffer::list::rebuild_page_aligned()
     // splice in *replace (implement me later?)
     
     last_p = begin();  // just in case we were in the removed region.
-  };
+  }
 
   void buffer::list::write(int off, int len, std::ostream& out) const
   {
@@ -1539,9 +1714,9 @@ int buffer::list::read_fd_zero_copy(int fd, size_t len)
   try {
     bufferptr bp = buffer::create_zero_copy(len, fd, NULL);
     append(bp);
-  } catch (buffer::error_code e) {
+  } catch (buffer::error_code &e) {
     return e.code;
-  } catch (buffer::malformed_input) {
+  } catch (buffer::malformed_input &e) {
     return -EIO;
   }
   return 0;
@@ -1691,6 +1866,20 @@ __u32 buffer::list::crc32c(__u32 crc) const
   }
   return crc;
 }
+
+
+/**
+ * Binary write all contents to a C++ stream
+ */
+void buffer::list::write_stream(std::ostream &out) const
+{
+  for (std::list<ptr>::const_iterator p = _buffers.begin(); p != _buffers.end(); ++p) {
+    if (p->length() > 0) {
+      out.write(p->c_str(), p->length());
+    }
+  }
+}
+
 
 void buffer::list::hexdump(std::ostream &out) const
 {

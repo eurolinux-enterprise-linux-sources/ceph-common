@@ -1,3 +1,5 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// vim: ts=8 sw=2 smarttab
 
 #include "rgw_common.h"
 #include "rgw_rados.h"
@@ -30,6 +32,16 @@ void encode_json(const char *name, const RGWUserCaps& val, Formatter *f)
   val.dump(f, name);
 }
 
+
+void RGWOLHInfo::dump(Formatter *f) const
+{
+  encode_json("target", target, f);
+}
+
+void RGWOLHPendingInfo::dump(Formatter *f) const
+{
+  encode_json("time", time, f);
+}
 
 void RGWObjManifestPart::dump(Formatter *f) const
 {
@@ -78,7 +90,9 @@ void rgw_log_entry::dump(Formatter *f) const
   f->dump_stream("time") << time;
   f->dump_string("remote_addr", remote_addr);
   f->dump_string("user", user);
-  f->dump_string("obj", obj);
+  stringstream s;
+  s << obj;
+  f->dump_string("obj", s.str());
   f->dump_string("op", op);
   f->dump_string("uri", uri);
   f->dump_string("http_status", http_status);
@@ -91,16 +105,6 @@ void rgw_log_entry::dump(Formatter *f) const
   f->dump_string("referrer", referrer);
   f->dump_string("bucket_id", bucket_id);
 }
-
-void rgw_intent_log_entry::dump(Formatter *f) const
-{
-  f->open_object_section("obj");
-  obj.dump(f);
-  f->close_section();
-  f->dump_stream("op_time") << op_time;
-  f->dump_unsigned("intent", intent);
-}
-
 
 void ACLPermission::dump(Formatter *f) const
 {
@@ -429,7 +433,7 @@ static void decode_swift_keys(map<string, RGWAccessKey>& m, JSONObj *o)
 {
   RGWAccessKey k;
   k.decode_json(o, true);
-  m[k.subuser] = k;
+  m[k.id] = k;
 }
 
 static void decode_subusers(map<string, RGWSubUser>& m, JSONObj *o)
@@ -526,6 +530,13 @@ void RGWBucketEntryPoint::decode_json(JSONObj *obj) {
   }
 }
 
+void RGWStorageStats::dump(Formatter *f) const
+{
+  encode_json("num_kb", num_kb, f);
+  encode_json("num_kb_rounded", num_kb_rounded, f);
+  encode_json("num_objects", num_objects, f);
+}
+
 void RGWBucketInfo::dump(Formatter *f) const
 {
   encode_json("bucket", bucket, f);
@@ -536,6 +547,8 @@ void RGWBucketInfo::dump(Formatter *f) const
   encode_json("placement_rule", placement_rule, f);
   encode_json("has_instance_obj", has_instance_obj, f);
   encode_json("quota", quota, f);
+  encode_json("num_shards", num_shards, f);
+  encode_json("bi_shard_hash_type", (uint32_t)bucket_index_shard_hash_type, f);
 }
 
 void RGWBucketInfo::decode_json(JSONObj *obj) {
@@ -547,11 +560,16 @@ void RGWBucketInfo::decode_json(JSONObj *obj) {
   JSONDecoder::decode_json("placement_rule", placement_rule, obj);
   JSONDecoder::decode_json("has_instance_obj", has_instance_obj, obj);
   JSONDecoder::decode_json("quota", quota, obj);
+  JSONDecoder::decode_json("num_shards", num_shards, obj);
+  uint32_t hash_type;
+  JSONDecoder::decode_json("bi_shard_hash_type", hash_type, obj);
+  bucket_index_shard_hash_type = (uint8_t)hash_type;
 }
 
 void RGWObjEnt::dump(Formatter *f) const
 {
-  encode_json("name", name, f);
+  encode_json("name", key.name, f);
+  encode_json("instance", key.instance, f);
   encode_json("namespace", ns, f);
   encode_json("owner", owner, f);
   encode_json("owner_display_name", owner_display_name, f);
@@ -560,6 +578,7 @@ void RGWObjEnt::dump(Formatter *f) const
   encode_json("etag", etag, f);
   encode_json("content_type", content_type, f);
   encode_json("tag", tag, f);
+  encode_json("flags", flags, f);
 }
 
 void RGWBucketEnt::dump(Formatter *f) const
@@ -582,9 +601,10 @@ void RGWUploadPartInfo::dump(Formatter *f) const
 void rgw_obj::dump(Formatter *f) const
 {
   encode_json("bucket", bucket, f);
-  encode_json("key", key, f);
+  encode_json("key", loc, f);
   encode_json("ns", ns, f);
   encode_json("object", object, f);
+  encode_json("instance", instance, f);
 }
 
 void RGWZoneParams::dump(Formatter *f) const
@@ -649,6 +669,7 @@ void RGWZone::dump(Formatter *f) const
   encode_json("endpoints", endpoints, f);
   encode_json("log_meta", log_meta, f);
   encode_json("log_data", log_data, f);
+  encode_json("bucket_index_max_shards", bucket_index_max_shards, f);
 }
 
 void RGWZone::decode_json(JSONObj *obj)
@@ -657,6 +678,7 @@ void RGWZone::decode_json(JSONObj *obj)
   JSONDecoder::decode_json("endpoints", endpoints, obj);
   JSONDecoder::decode_json("log_meta", log_meta, obj);
   JSONDecoder::decode_json("log_data", log_data, obj);
+  JSONDecoder::decode_json("bucket_index_max_shards", bucket_index_max_shards, obj);
 }
 
 void RGWRegionPlacementTarget::dump(Formatter *f) const
@@ -677,6 +699,7 @@ void RGWRegion::dump(Formatter *f) const
   encode_json("api_name", api_name, f);
   encode_json("is_master", is_master, f);
   encode_json("endpoints", endpoints, f);
+  encode_json("hostnames", hostnames, f);
   encode_json("master_zone", master_zone, f);
   encode_json_map("zones", zones, f); /* more friendly representation */
   encode_json_map("placement_targets", placement_targets, f); /* more friendly representation */
@@ -704,6 +727,7 @@ void RGWRegion::decode_json(JSONObj *obj)
   JSONDecoder::decode_json("api_name", api_name, obj);
   JSONDecoder::decode_json("is_master", is_master, obj);
   JSONDecoder::decode_json("endpoints", endpoints, obj);
+  JSONDecoder::decode_json("hostnames", hostnames, obj);
   JSONDecoder::decode_json("master_zone", master_zone, obj);
   JSONDecoder::decode_json("zones", zones, decode_zones, obj);
   JSONDecoder::decode_json("placement_targets", placement_targets, decode_placement_targets, obj);

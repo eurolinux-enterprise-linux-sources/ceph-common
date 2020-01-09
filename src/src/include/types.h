@@ -123,6 +123,12 @@ inline ostream& operator<<(ostream& out, const list<A>& ilist) {
   return out;
 }
 
+template<class A, class B, class C>
+inline ostream& operator<<(ostream&out, const boost::tuple<A, B, C> &t) {
+  out << boost::get<0>(t) <<"," << boost::get<1>(t) << "," << boost::get<2>(t);
+  return out;
+}
+
 template<class A>
 inline ostream& operator<<(ostream& out, const set<A>& iset) {
   for (typename set<A>::const_iterator it = iset.begin();
@@ -443,7 +449,46 @@ inline ostream& operator<<(ostream &oss, health_status_t status) {
       break;
   }
   return oss;
-};
+}
 #endif
+
+struct weightf_t {
+  float v;
+  weightf_t(float _v) : v(_v) {}
+};
+
+inline ostream& operator<<(ostream& out, const weightf_t& w)
+{
+  if (w.v < -0.01) {
+    return out << "-";
+  } else if (w.v < 0.000001) {
+    return out << "0";
+  } else {
+    std::streamsize p = out.precision();
+    return out << std::fixed << std::setprecision(5) << w.v << std::setprecision(p);
+  }
+}
+
+struct shard_id_t {
+  uint8_t id;
+
+  shard_id_t() : id(0) {}
+  explicit shard_id_t(uint8_t _id) : id(_id) {}
+
+  operator uint8_t() const { return id; }
+
+  const static shard_id_t NO_SHARD;
+
+  void encode(bufferlist &bl) const {
+    ::encode(id, bl);
+  }
+  void decode(bufferlist::iterator &bl) {
+    ::decode(id, bl);
+  }
+};
+WRITE_CLASS_ENCODER(shard_id_t)
+WRITE_EQ_OPERATORS_1(shard_id_t, id)
+WRITE_CMP_OPERATORS_1(shard_id_t, id)
+ostream &operator<<(ostream &lhs, const shard_id_t &rhs);
 
 #endif

@@ -138,7 +138,6 @@ void parse_syn_options(vector<const char*>& args)
         syn_iargs.push_back( atoi(args[++i]) );
         syn_iargs.push_back( atoi(args[++i]) );
         syn_iargs.push_back( atoi(args[++i]) );
-
       } else if (strcmp(args[i],"makefiles") == 0) {
         syn_modes.push_back( SYNCLIENT_MODE_MAKEFILES );
         syn_iargs.push_back( atoi(args[++i]) );
@@ -158,7 +157,6 @@ void parse_syn_options(vector<const char*>& args)
         syn_modes.push_back( SYNCLIENT_MODE_OPENSHARED );
         syn_iargs.push_back( atoi(args[++i]) );
         syn_iargs.push_back( atoi(args[++i]) );
-
       } else if (strcmp(args[i],"createobjects") == 0) {
         syn_modes.push_back( SYNCLIENT_MODE_CREATEOBJECTS );
         syn_iargs.push_back( atoi(args[++i]) );
@@ -172,14 +170,12 @@ void parse_syn_options(vector<const char*>& args)
         syn_iargs.push_back( atoi(args[++i]) );
         syn_iargs.push_back( atoi(args[++i]) );
         syn_iargs.push_back( atoi(args[++i]) );
-
       } else if (strcmp(args[i],"walk") == 0) {
         syn_modes.push_back( SYNCLIENT_MODE_FULLWALK );
         //syn_sargs.push_back( atoi(args[++i]) );
       } else if (strcmp(args[i],"randomwalk") == 0) {
         syn_modes.push_back( SYNCLIENT_MODE_RANDOMWALK );
         syn_iargs.push_back( atoi(args[++i]) );       
-
       } else if (strcmp(args[i],"trace") == 0) {
         syn_modes.push_back( SYNCLIENT_MODE_TRACE );
         syn_sargs.push_back( args[++i] );
@@ -196,10 +192,8 @@ void parse_syn_options(vector<const char*>& args)
         syn_iargs.push_back( atoi(args[++i]) );
         syn_iargs.push_back( atoi(args[++i]) );
         syn_iargs.push_back( atoi(args[++i]) );
-
       } else if (strcmp(args[i],"foo") == 0) {
         syn_modes.push_back( SYNCLIENT_MODE_FOO );
-
       } else if (strcmp(args[i],"until") == 0) {
         syn_modes.push_back( SYNCLIENT_MODE_UNTIL );
         syn_iargs.push_back( atoi(args[++i]) );
@@ -213,21 +207,18 @@ void parse_syn_options(vector<const char*>& args)
         syn_modes.push_back( SYNCLIENT_MODE_ONLYRANGE );
         syn_iargs.push_back( atoi(args[++i]) );
         syn_iargs.push_back( atoi(args[++i]) );
-        
       } else if (strcmp(args[i],"sleep") == 0) { 
         syn_modes.push_back( SYNCLIENT_MODE_SLEEP );
         syn_iargs.push_back( atoi(args[++i]) );
       } else if (strcmp(args[i],"randomsleep") == 0) { 
         syn_modes.push_back( SYNCLIENT_MODE_RANDOMSLEEP );
         syn_iargs.push_back( atoi(args[++i]) );
-
       } else if (strcmp(args[i],"opentest") == 0) { 
         syn_modes.push_back( SYNCLIENT_MODE_OPENTEST );
         syn_iargs.push_back( atoi(args[++i]) );
       } else if (strcmp(args[i],"optest") == 0) {
 	syn_modes.push_back( SYNCLIENT_MODE_OPTEST );
         syn_iargs.push_back( atoi(args[++i]) );
-
       } else if (strcmp(args[i],"truncate") == 0) { 
         syn_modes.push_back( SYNCLIENT_MODE_TRUNCATE );
 	syn_sargs.push_back(args[++i]);
@@ -237,7 +228,6 @@ void parse_syn_options(vector<const char*>& args)
 	syn_sargs.push_back(args[++i]);
 	syn_sargs.push_back(args[++i]);
 	syn_iargs.push_back(atoi(args[++i]));
-
       } else if (strcmp(args[i], "lookuphash") == 0) {
 	syn_modes.push_back(SYNCLIENT_MODE_LOOKUPHASH);
 	syn_sargs.push_back(args[++i]);
@@ -246,7 +236,6 @@ void parse_syn_options(vector<const char*>& args)
       } else if (strcmp(args[i], "lookupino") == 0) {
 	syn_modes.push_back(SYNCLIENT_MODE_LOOKUPINO);
 	syn_sargs.push_back(args[++i]);
-
       } else if (strcmp(args[i], "chunkfile") == 0) {
 	syn_modes.push_back(SYNCLIENT_MODE_CHUNK);
 	syn_sargs.push_back(args[++i]);
@@ -1139,11 +1128,10 @@ int SyntheticClient::play_trace(Trace& t, string& prefix, bool metadata_only)
     } else if (strcmp(op, "getdir") == 0) {
       const char *a = t.get_string(buf, p);
       list<string> contents;
-      client->getdir(a, contents);
-    } else if (strcmp(op, "getdir") == 0) {
-      const char *a = t.get_string(buf, p);
-      list<string> contents;
-      client->getdir(a, contents);
+      int r = client->getdir(a, contents);
+      if (r < 0) {
+        dout(1) << "getdir on " << a << " returns " << r << dendl;
+      }
     } else if (strcmp(op, "opendir") == 0) {
       const char *a = t.get_string(buf, p);
       int64_t b = t.get_int();
@@ -1562,7 +1550,7 @@ int SyntheticClient::clean_dir(string& basedir)
   list<string> contents;
   int r = client->getdir(basedir.c_str(), contents);
   if (r < 0) {
-    dout(1) << "readdir on " << basedir << " returns " << r << dendl;
+    dout(1) << "getdir on " << basedir << " returns " << r << dendl;
     return r;
   }
 
@@ -1621,7 +1609,7 @@ int SyntheticClient::full_walk(string& basedir)
     list<string> contents;
     int r = client->getdir(dir.c_str(), contents);
     if (r < 0) {
-      dout(1) << "readdir on " << dir << " returns " << r << dendl;
+      dout(1) << "getdir on " << dir << " returns " << r << dendl;
       continue;
     }
     
@@ -1726,7 +1714,9 @@ int SyntheticClient::dump_placement(string& fn) {
   for (vector<ObjectExtent>::iterator i = extents.begin(); 
        i != extents.end(); ++i) {
     
-    int osd = client->osdmap->get_pg_acting_primary(client->osdmap->object_locator_to_pg(i->oid, i->oloc));
+    const OSDMap *osdmap = client->objecter->get_osdmap_read();
+    int osd = osdmap->get_pg_acting_primary(osdmap->object_locator_to_pg(i->oid, i->oloc));
+    client->objecter->put_osdmap_read();
 
     // run through all the buffer extents
     for (vector<pair<uint64_t, uint64_t> >::iterator j = i->buffer_extents.begin();
@@ -1814,7 +1804,7 @@ int SyntheticClient::read_dirs(const char *basedir, int dirs, int files, int dep
   utime_t e = ceph_clock_now(client->cct);
   e -= s;
   if (r < 0) {
-    dout(0) << "read_dirs couldn't readdir " << basedir << ", stopping" << dendl;
+    dout(0) << "getdir couldn't readdir " << basedir << ", stopping" << dendl;
     return -1;
   }
 
@@ -2003,11 +1993,15 @@ int SyntheticClient::overload_osd_0(int n, int size, int wrsize) {
 
 
 // See what the primary is for the first object in this file.
-int SyntheticClient::check_first_primary(int fh) {
+int SyntheticClient::check_first_primary(int fh)
+{
   vector<ObjectExtent> extents;
   client->enumerate_layout(fh, extents, 1, 0);  
-  return client->osdmap->get_pg_acting_primary(client->osdmap->object_locator_to_pg(extents.begin()->oid,
-									     extents.begin()->oloc));
+  const OSDMap *osdmap = client->objecter->get_osdmap_read();
+  int primary = osdmap->get_pg_acting_primary(osdmap->object_locator_to_pg(extents.begin()->oid,
+									   extents.begin()->oloc));
+  client->objecter->put_osdmap_read();
+  return primary;
 }
 
 int SyntheticClient::rm_file(string& fn)
@@ -2172,13 +2166,11 @@ int SyntheticClient::read_file(const std::string& fn, int size,
     // verify fingerprint
     int bad = 0;
     uint64_t *p = (uint64_t*)buf;
-    uint64_t readoff;
-    int64_t readclient;
     while ((char*)p + 32 < buf + rdsize) {
-      readoff = *p;
+      uint64_t readoff = *p;
       uint64_t wantoff = (uint64_t)i*(uint64_t)rdsize + (uint64_t)((char*)p - buf);
       p++;
-      readclient = *p;
+      int64_t readclient = *p;
       p++;
       if (readoff != wantoff ||
 	  readclient != client->get_nodeid()) {
@@ -2323,8 +2315,6 @@ int SyntheticClient::object_rw(int nobj, int osize, int wrpc,
   bufferlist bl;
   bl.push_back(bp);
 
-  bool do_sync = false;
-
   // start with odd number > nobj
   rjhash<uint32_t> h;
   unsigned prime = nobj + 1;             // this is the minimum!
@@ -2346,7 +2336,6 @@ int SyntheticClient::object_rw(int nobj, int osize, int wrpc,
   Cond cond;
 
   int unack = 0;
-  int unsafe = 0;
 
   while (1) {
     if (time_to_stop()) break;
@@ -2381,16 +2370,8 @@ int SyntheticClient::object_rw(int nobj, int osize, int wrpc,
       op.op.extent.length = osize;
       op.indata = bl;
       m.ops.push_back(op);
-      if (do_sync) {
-        OSDOp op;
-        op.op.op = CEPH_OSD_OP_STARTSYNC;
-	m.ops.push_back(op);
-      }
       client->objecter->mutate(oid, oloc, m, snapc, ceph_clock_now(client->cct), 0,
 			       NULL, new C_Ref(lock, cond, &unack));
-      /*client->objecter->write(oid, layout, 0, osize, snapc, bl, 0,
-			      new C_Ref(lock, cond, &unack),
-			      new C_Ref(lock, cond, &unsafe));*/
     } else {
       dout(10) << "read from " << oid << dendl;
       bufferlist inbl;
@@ -2416,13 +2397,6 @@ int SyntheticClient::object_rw(int nobj, int osize, int wrpc,
     }
   }
 
-
-  lock.Lock();
-  while (unsafe > 0) {
-    dout(10) << "waiting for " << unsafe << " unsafe" << dendl;
-    cond.Wait(lock);
-  }
-  lock.Unlock();
   return 0;
 }
 

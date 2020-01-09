@@ -94,8 +94,9 @@ public:
   void tinc(int idx, utime_t v);
   utime_t tget(int idx) const;
 
-  void dump_formatted(ceph::Formatter *f, bool schema);
-
+  void reset();
+  void dump_formatted(ceph::Formatter *f, bool schema,
+      const std::string &counter = "");
   pair<uint64_t, uint64_t> get_tavg_ms(int idx) const;
 
   const std::string& get_name() const;
@@ -111,14 +112,60 @@ private:
 
   /** Represents a PerfCounters data element. */
   struct perf_counter_data_any_d {
-    perf_counter_data_any_d();
+    perf_counter_data_any_d()
+      : name(NULL),
+	type(PERFCOUNTER_NONE),
+	u64(0),
+	avgcount(0),
+	avgcount2(0)
+    {}
+    perf_counter_data_any_d(const perf_counter_data_any_d& other)
+      : name(other.name),
+	type(other.type),
+	u64(other.u64.read()) {
+      pair<uint64_t,uint64_t> a = other.read_avg();
+      u64.set(a.first);
+      avgcount.set(a.second);
+      avgcount2.set(a.second);
+    }
+
     void write_schema_json(char *buf, size_t buf_sz) const;
     void  write_json(char *buf, size_t buf_sz) const;
 
     const char *name;
     enum perfcounter_type_d type;
-    uint64_t u64;
-    uint64_t avgcount;
+    atomic64_t u64;
+    atomic64_t avgcount;
+    atomic64_t avgcount2;
+
+    void reset()
+    {
+      if (type != PERFCOUNTER_U64) {
+	u64.set(0);
+	avgcount.set(0);
+	avgcount2.set(0);
+      }
+    }
+
+    perf_counter_data_any_d& operator=(const perf_counter_data_any_d& other) {
+      name = other.name;
+      type = other.type;
+      pair<uint64_t,uint64_t> a = other.read_avg();
+      u64.set(a.first);
+      avgcount.set(a.second);
+      avgcount2.set(a.second);
+      return *this;
+    }
+
+    /// read <sum, count> safely
+    pair<uint64_t,uint64_t> read_avg() const {
+      uint64_t sum, count;
+      do {
+	count = avgcount.read();
+	sum = u64.read();
+      } while (avgcount2.read() != count);
+      return make_pair(sum, count);
+    }
   };
   typedef std::vector<perf_counter_data_any_d> perf_counter_data_vec_t;
 
@@ -156,7 +203,12 @@ public:
   void add(class PerfCounters *l);
   void remove(class PerfCounters *l);
   void clear();
-  void dump_formatted(ceph::Formatter *f, bool schema);
+  bool reset(const std::string &name);
+  void dump_formatted(
+      ceph::Formatter *f,
+      bool schema,
+      const std::string &logger = "",
+      const std::string &counter = "");
 private:
   CephContext *m_cct;
 

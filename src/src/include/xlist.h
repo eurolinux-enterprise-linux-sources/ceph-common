@@ -16,6 +16,7 @@
 #define CEPH_XLIST_H
 
 #include "include/assert.h"
+#include <cstdlib>
 
 template<typename T>
 class xlist {
@@ -61,8 +62,11 @@ private:
   int _size;
 
 public:
-  xlist(const xlist& other);
-  const xlist& operator=(const xlist& other);
+  xlist(const xlist& other) {
+    _front = other._front;
+    _back = other._back;
+    _size = other._size;
+  }
 
   xlist() : _front(0), _back(0), _size(0) {}
   ~xlist() { 
@@ -133,7 +137,10 @@ public:
   }
 
   T front() { return static_cast<T>(_front->_item); }
+  const T front() const { return static_cast<const T>(_front->_item); }
+
   T back() { return static_cast<T>(_back->_item); }
+  const T back() const { return static_cast<const T>(_back->_item); }
 
   void pop_front() {
     assert(!empty());
@@ -161,6 +168,24 @@ public:
 
   iterator begin() { return iterator(_front); }
   iterator end() { return iterator(NULL); }
+
+  class const_iterator {
+  private:
+    item *cur;
+  public:
+    const_iterator(item *i = 0) : cur(i) {}
+    const T operator*() { return static_cast<const T>(cur->_item); }
+    const_iterator& operator++() {
+      assert(cur);
+      assert(cur->_list);
+      cur = cur->_next;
+      return *this;
+    }
+    bool end() const { return cur == 0; }
+  };
+
+  const_iterator begin() const { return const_iterator(_front); }
+  const_iterator end() const { return const_iterator(NULL); }
 };
 
 

@@ -1,6 +1,7 @@
 #!/bin/bash
 #
 # Copyright (C) 2013,2014 Cloudwatt <libre.licensing@cloudwatt.com>
+# Copyright (C) 2014 Red Hat <contact@redhat.com>
 #
 # Author: Loic Dachary <loic@dachary.org>
 #
@@ -14,15 +15,20 @@
 # MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
 # GNU Library Public License for more details.
 #
+source test/test_btrfs_common.sh
+
 function setup() {
     local dir=$1
     teardown $dir
-    mkdir $dir
+    mkdir -p $dir
 }
 
 function teardown() {
     local dir=$1
     kill_daemons $dir
+    if [ $(stat -f -c '%T' .) == "btrfs" ]; then
+        teardown_btrfs $dir
+    fi
     rm -fr $dir
 }
 
@@ -41,26 +47,31 @@ function run_mon() {
 
     ./ceph-mon \
         --id $id \
+        --mon-osd-full-ratio=.99 \
+        --mon-data-avail-crit=1 \
         --paxos-propose-interval=0.1 \
+        --osd-crush-chooseleaf-type=0 \
         --osd-pool-default-erasure-code-directory=.libs \
         --debug-mon 20 \
         --debug-ms 20 \
         --debug-paxos 20 \
-        --mon-advanced-debug-mode \
         --chdir= \
         --mon-data=$dir \
         --log-file=$dir/log \
         --mon-cluster-log-file=$dir/log \
         --run-dir=$dir \
-        --pid-file=$dir/pidfile \
+        --pid-file=$dir/\$name.pid \
         "$@"
 }
 
 function kill_daemons() {
     local dir=$1
-    for pidfile in $(find $dir | grep pidfile) ; do
+    for pidfile in $(find $dir | grep '\.pid') ; do
+        pid=$(cat $pidfile)
+        signal=9
         for try in 0 1 1 1 2 3 ; do
-            kill -9 $(cat $pidfile 2> /dev/null) 2> /dev/null || break
+            kill -$signal $pid 2> /dev/null || break
+            signal=0
             sleep $try
         done
     done
@@ -69,7 +80,7 @@ function kill_daemons() {
 function call_TEST_functions() {
     local dir=$1
     shift
-    local id=$2
+    local id=$1
     shift
 
     setup $dir || return 1
@@ -92,7 +103,7 @@ function call_TEST_functions() {
 }
 
 function main() {
-    local dir=$1
+    local dir=testdir/$1
 
     export PATH=:$PATH # make sure program from sources are prefered
 

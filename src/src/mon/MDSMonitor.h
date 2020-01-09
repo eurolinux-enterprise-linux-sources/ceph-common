@@ -36,6 +36,8 @@ class MMDSGetMap;
 class MMonCommand;
 class MMDSLoadTargets;
 
+#define MDS_HEALTH_PREFIX "mds_health"
+
 class MDSMonitor : public PaxosService {
  public:
   // mds maps
@@ -56,14 +58,16 @@ class MDSMonitor : public PaxosService {
     void finish(int r) {
       if (r >= 0)
 	mm->_updated(m);   // success
-      else if (r == -ECANCELED)
+      else if (r == -ECANCELED) {
+	mm->mon->no_reply(m);
 	m->put();
-      else
+      } else {
 	mm->dispatch((PaxosServiceMessage*)m);        // try again
+      }
     }
   };
 
-  void create_new_fs(MDSMap &m, int metadata_pool, int data_pool);
+  void create_new_fs(MDSMap &m, const std::string &name, int metadata_pool, int data_pool);
 
   version_t get_trim_to();
 
@@ -71,9 +75,9 @@ class MDSMonitor : public PaxosService {
   void create_initial();
   void update_from_paxos(bool *need_bootstrap);
   void create_pending(); 
-  void encode_pending(MonitorDBStore::Transaction *t);
+  void encode_pending(MonitorDBStore::TransactionRef t);
   // we don't require full versions; don't encode any.
-  virtual void encode_full(MonitorDBStore::Transaction *t) { }
+  virtual void encode_full(MonitorDBStore::TransactionRef t) { }
 
   void update_logger();
 
@@ -95,17 +99,27 @@ class MDSMonitor : public PaxosService {
   void get_health(list<pair<health_status_t,string> >& summary,
 		  list<pair<health_status_t,string> > *detail) const;
   int fail_mds(std::ostream &ss, const std::string &arg);
-  void fail_mds_gid(uint64_t gid);
+  void fail_mds_gid(mds_gid_t gid);
 
   bool preprocess_command(MMonCommand *m);
   bool prepare_command(MMonCommand *m);
+  int management_command(
+      MMonCommand *m,
+      std::string const &prefix,
+      map<string, cmd_vartype> &cmdmap,
+      std::stringstream &ss);
+  int filesystem_command(
+      MMonCommand *m,
+      std::string const &prefix,
+      map<string, cmd_vartype> &cmdmap,
+      std::stringstream &ss);
 
   // beacons
   struct beacon_info_t {
     utime_t stamp;
     uint64_t seq;
   };
-  map<uint64_t, beacon_info_t> last_beacon;
+  map<mds_gid_t, beacon_info_t> last_beacon;
 
   bool try_standby_replay(MDSMap::mds_info_t& finfo, MDSMap::mds_info_t& ainfo);
 
@@ -122,6 +136,12 @@ public:
   void check_subs();
   void check_sub(Subscription *sub);
 
+private:
+  // MDS daemon GID to latest health state from that GID
+  std::map<uint64_t, MDSHealth> pending_daemon_health;
+  std::set<uint64_t> pending_daemon_health_rm;
+
+  int _check_pool(const int64_t pool_id, std::stringstream *ss) const;
 };
 
 #endif

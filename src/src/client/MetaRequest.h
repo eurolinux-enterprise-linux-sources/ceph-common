@@ -9,6 +9,7 @@
 #include "msg/msg_types.h"
 #include "include/xlist.h"
 #include "include/filepath.h"
+#include "include/atomic.h"
 #include "mds/mdstypes.h"
 
 #include "common/Mutex.h"
@@ -16,7 +17,7 @@
 #include "messages/MClientRequest.h"
 
 class MClientReply;
-class Inode;
+struct Inode;
 class Dentry;
 
 struct MetaRequest {
@@ -27,6 +28,7 @@ private:
   Dentry *_old_dentry; //associated with path2
 public:
   uint64_t tid;
+  utime_t  op_stamp;
   ceph_mds_request_head head;
   filepath path, path2;
   bufferlist data;
@@ -41,16 +43,17 @@ public:
   int regetattr_mask;          // getattr mask if i need to re-stat after a traceless reply
  
   utime_t  sent_stamp;
-  int      mds;                // who i am asking
-  int      resend_mds;         // someone wants you to (re)send the request here
+  mds_rank_t mds;                // who i am asking
+  mds_rank_t resend_mds;         // someone wants you to (re)send the request here
   bool     send_to_auth;       // must send to auth mds
   __u32    sent_on_mseq;       // mseq at last submission of this request
   int      num_fwd;            // # of times i've been forwarded
   int      retry_attempt;
-  int      ref;
+  atomic_t ref;
   
   MClientReply *reply;         // the reply
   bool kick;
+  bool aborted;
   
   // readdir result
   frag_t readdir_frag;
@@ -75,7 +78,7 @@ public:
 
   Inode *target;
 
-  MetaRequest(int op) : 
+  MetaRequest(int op) :
     _inode(NULL), _old_inode(NULL), _other_inode(NULL),
     _dentry(NULL), _old_dentry(NULL),
     tid(0),
@@ -88,7 +91,7 @@ public:
     mds(-1), resend_mds(-1), send_to_auth(false), sent_on_mseq(0),
     num_fwd(0), retry_attempt(0),
     ref(1), reply(0), 
-    kick(false),
+    kick(false), aborted(false),
     readdir_offset(0), readdir_end(false), readdir_num(0),
     got_unsafe(false), item(this), unsafe_item(this),
     lock("MetaRequest lock"),
@@ -126,17 +129,14 @@ public:
   Dentry *old_dentry();
 
   MetaRequest* get() {
-    ++ref;
+    ref.inc();
     return this;
   }
 
   /// psuedo-private put method; use Client::put_request()
-  void _put() {
-    if (--ref == 0)
-      delete this;
-  }
-  int get_num_ref() {
-    return ref;
+  bool _put() {
+    int v = ref.dec();
+    return v == 0;
   }
 
   // normal fields

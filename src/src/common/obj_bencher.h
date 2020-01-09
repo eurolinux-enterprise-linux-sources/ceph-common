@@ -1,4 +1,5 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// vim: ts=8 sw=2 smarttab
 /*
  * Ceph - scalable distributed file system
  *
@@ -64,7 +65,7 @@ protected:
   int fetch_bench_metadata(const std::string& metadata_file, int* object_size, int* num_objects, int* prevPid);
 
   int write_bench(int secondsToRun, int maxObjects, int concurrentios, const string& run_name_meta);
-  int seq_read_bench(int secondsToRun, int concurrentios, int num_objects, int writePid);
+  int seq_read_bench(int secondsToRun, int num_objects, int concurrentios, int writePid);
   int rand_read_bench(int secondsToRun, int num_objects, int concurrentios, int writePid);
 
   int clean_up(int num_objects, int prevPid, int concurrentios);

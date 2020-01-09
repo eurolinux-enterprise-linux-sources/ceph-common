@@ -8,7 +8,7 @@ AC_PREREQ(2.59)
 # VERSION define is not used by the code.  It gets a version string
 # from 'git describe'; see src/ceph_ver.[ch]
 
-AC_INIT([ceph], [0.80.7], [ceph-devel@vger.kernel.org])
+AC_INIT([ceph], [0.94.5], [ceph-devel@vger.kernel.org])
 
 # Create release string.  Used with VERSION for RPMs.
 RPM_RELEASE=0
@@ -23,7 +23,7 @@ AC_MSG_NOTICE([RPM_RELEASE='$RPM_RELEASE'])
 
 AC_CONFIG_MACRO_DIR([m4])
 
-AC_CONFIG_SUBDIRS([src/gtest])
+AC_CONFIG_SUBDIRS([src/gmock])
 
 # Environment
 AC_CANONICAL_HOST
@@ -47,6 +47,7 @@ m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
 case "${target_os}" in
 darwin*)
 	AC_DEFINE([DARWIN], [1], [Define if darwin/osx])
+    darwin="yes"
 	;;
 linux*)
 	linux="yes"
@@ -57,6 +58,7 @@ freebsd*)
 esac
 AM_CONDITIONAL(LINUX, test x"$linux" = x"yes")
 AM_CONDITIONAL(FREEBSD, test x"$freebsd" = x"yes")
+AM_CONDITIONAL(DARWIN, test x"$darwin" = x"yes")
 
 # Checks for programs.
 AC_PROG_CXX
@@ -84,18 +86,141 @@ AC_PROG_LIBTOOL
 AC_SUBST(AM_CXXFLAGS)
 AM_CXXFLAGS="${AM_CXXFLAGS}"
 
+
+###### PATCH STARTS HERE ######
+# Find out what to build (default is all of these)
+
+# rados?
+AC_ARG_WITH([rados],
+	[AS_HELP_STRING([--with-rados], [build with librados support])],
+	[],
+	[with_rados=yes])
+AM_CONDITIONAL(WITH_RADOS, test "$with_rados" = "yes")
+#AS_IF([test "$with_rados" = "yes"], [AC_DEFINE([WITH_RADOS])])
+
+# rbd?
+# rbd requires rados
+AC_ARG_WITH([rbd],
+	[AS_HELP_STRING([--with-rbd], [build rbd files])],
+	[],
+	[with_rbd=yes])
+AM_CONDITIONAL(WITH_RBD, test "$with_rbd" = "yes")
+#AS_IF([test "$with_rbd" = "yes"], [AC_DEFINE([WITH_RADOS, WITH_RBD])])
+
+# cephfs?
+# cephfs requires rados
+AC_ARG_WITH([cephfs],
+	[AS_HELP_STRING([--with-cephfs], [build cephfs files])],
+	[],
+	[with_cephfs=yes])
+AM_CONDITIONAL(WITH_CEPHFS, test "$with_cephfs" = "yes")
+#AS_IF([test "$with_cephfs" = "yes"], [AC_DEFINE([WITH_RADOS, WITH_CEPHFS])])
+
+# radosgw?
+# radosgw requires rados
+AC_ARG_WITH([radosgw],
+            [AS_HELP_STRING([--with-radosgw], [build RADOS gateway])],
+            [],
+            [with_radosgw=check])
+# AM_CONDITIONAL is defined later -- we need to check whether we can enable radosgw if no option is present
+#AS_IF([test "$with_radosgw" = "yes"], [AC_DEFINE([WITH_RADOS, WITH_RADOSGW])])
+
+# radosstriper?
+AC_ARG_WITH([radosstriper],
+	[AS_HELP_STRING([--with-radosstriper], [build radosstriper files])],
+	[],
+	[with_radosstriper=yes])
+AM_CONDITIONAL(WITH_RADOSSTRIPER, test "$with_radosstriper" = "yes")
+#AS_IF([test "$with_radostriper" = "yes"], [AC_DEFINE([WITH_RADOS, WITH_RADOSSTRIPER])])
+
+# mon?
+AC_ARG_WITH([mon],
+	[AS_HELP_STRING([--with-mon], [build Ceph monitor software files])],
+	[],
+	[with_mon=yes])
+AM_CONDITIONAL(WITH_MON, test "$with_mon" = "yes")
+#AS_IF([test "$with_mon" = "yes"], [AC_DEFINE([WITH_MON])])
+
+# osd?
+AC_ARG_WITH([osd],
+	[AS_HELP_STRING([--with-osd], [build object store daemon files])],
+	[],
+	[with_osd=yes])
+AM_CONDITIONAL(WITH_OSD, test "$with_osd" = "yes")
+#AS_IF([test "$with_osd" = "yes"], [AC_DEFINE([WITH_OSD])])
+
+# mds?
+AC_ARG_WITH([mds],
+	[AS_HELP_STRING([--with-mds], [build mds files])],
+	[],
+	[with_mds=yes])
+AM_CONDITIONAL(WITH_MDS, test "$with_mds" = "yes")
+#AS_IF([test "$with_mds" = "yes"], [AC_DEFINE([WITH_MDS])])
+
+# client?
+AC_ARG_ENABLE([client],
+	[AS_HELP_STRING([--enable-client], [enable client-side build])],
+	[],
+	[enable_client=yes])
+AM_CONDITIONAL([ENABLE_CLIENT], test "$enable_client" = "yes")
+#AS_IF([test "$enable_client" = "yes"], [AC_DEFINE([WITH_RADOS, WITH_RBD, ENABLE_CLIENT])])
+
+# server?
+AC_ARG_ENABLE([server],
+	[AS_HELP_STRING([--enable-server], [enable server-side build ])],
+	[],
+	[enable_server=yes])
+AM_CONDITIONAL(ENABLE_SERVER, test "$enable_server" = "yes")
+#AS_IF([test "$enable_server" = "yes"], [AC_DEFINE([WITH_MON, WITH_OSD, WITH_MDS, ENABLE_SERVER])])
+
+# cond-check if snappy-devel is installed, needed by leveldb that is need by server parts of the project
+AS_IF([test "$enable_server" = "yes" -a \( "$with_osd" = "yes" -o "$with_mon" = "yes" \)],
+	[AC_CHECK_LIB([snappy], [snappy_compress], [true], [AC_MSG_FAILURE([libsnappy not found])])])
+
+# cond-check leveldb, necessary if server, osd or mon enabled
+AS_IF([test "$enable_server" = "yes" -a \( "$with_osd" = "yes" -o "$with_mon" = "yes" \)],
+	[AC_CHECK_LIB([leveldb], [leveldb_open], [true], [AC_MSG_FAILURE([libleveldb not found])], [-lsnappy -lpthread])])
+###### PATCH ENDS HERE ######
+
+
 # Check for yasm
-if yasm -f elf64 src/common/crc32c_intel_fast_asm.S -o /dev/null; then
-   echo 'we have a modern and working yasm'
-   if test `arch` = "x86_64"; then
-      echo 'we are x86_64'
-      AC_DEFINE([HAVE_GOOD_YASM_ELF64], [1], [we have a recent yasm and are x86_64])
-      with_good_yasm=yes
-   fi
-else
-   echo 'we do not have a modern/working yasm'
+AC_CHECK_PROG(YASM_CHECK, yasm, yes)
+if test x"$YASM_CHECK" = x"yes"; then
+  if yasm -f elf64 src/common/crc32c_intel_fast_asm.S -o /dev/null; then
+     echo 'we have a modern and working yasm'
+     if test `arch` = "x86_64" ; then
+        echo 'we are x86_64'
+        arch_x32=0
+        AC_COMPILE_IFELSE([AC_LANG_PROGRAM([], [[
+          #if defined(__x86_64__) && defined(__ILP32__)
+          #error x32
+          #endif]])], [], [arch_x32=1])
+        if test $arch_x32 -eq 0 ; then
+           echo 'we are not x32'
+           AC_DEFINE([HAVE_GOOD_YASM_ELF64], [1], [we have a recent yasm and are x86_64])
+           with_good_yasm=yes
+  
+           if yasm -f elf64 -i src/ceph/src/ceph/src/erasure-code/isa/isa-l/include/ src/erasure-code/isa/isa-l/erasure_code/gf_vect_dot_prod_avx2.asm.s -o /dev/null 2> /dev/null ; then
+              echo 'yasm can also build the isa-l stuff'
+              AC_DEFINE([HAVE_BETTER_YASM_ELF64], [1], [yasm can also build the isa-l])
+  	    with_better_yasm=yes
+           else
+              echo "yasm doesn't build the isa-l stuff"
+  	 fi
+        else
+           echo 'we are x32; no yasm for you'
+        fi
+     else
+        echo 'we are not x86_64 && !x32'
+     fi
+  else
+     echo 'we do not have a modern/working yasm'
+  fi
 fi
 AM_CONDITIONAL(WITH_GOOD_YASM_ELF64, test "$with_good_yasm" = "yes")
+AM_CONDITIONAL(WITH_BETTER_YASM_ELF64, test "$with_better_yasm" = "yes")
+
+# check for better yasm
 
 # Checks for compiler warning types
 
@@ -117,9 +242,7 @@ AC_DEFUN([AC_CHECK_CC_FLAG],
 
 AC_CHECK_CC_FLAG([-Wtype-limits], [WARN_TYPE_LIMITS])
 AC_CHECK_CC_FLAG([-Wignored-qualifiers], [WARN_IGNORED_QUALIFIERS])
-
-# Checks for architecture stuff
-AM_CONDITIONAL([ENABLE_FPU_NEON], [case $target_cpu in arm*) true;; *) false;; esac])
+AC_CHECK_CC_FLAG([-Werror=format-security], [WARN_ERROR_FORMAT_SECURITY])
 
 # Check for compiler VTA support
 AX_CHECK_COMPILE_FLAG([-fvar-tracking-assignments], [HAS_VTA_SUPPORT=1], [HAS_VTA_SUPPORT=0])
@@ -134,8 +257,19 @@ ACX_PTHREAD
 
 AC_CHECK_LIB([uuid], [uuid_parse], [true], AC_MSG_FAILURE([libuuid not found]))
 
-if test x"$linux" = x"yes"; then
-  AC_CHECK_LIB([blkid], [blkid_devno_to_wholedisk], [true], AC_MSG_FAILURE([libblkid not found]))
+# rbd {map,unmap,showmapped} dependencies, Linux only
+if test x"$linux" = x"yes" -a x"$with_rbd" = x"yes"; then
+  # libblkid
+  AC_CHECK_HEADER([blkid/blkid.h], [],
+    AC_MSG_ERROR([blkid/blkid.h not found (libblkid-dev, libblkid-devel)]))
+  AC_CHECK_LIB([blkid], [blkid_devno_to_wholedisk], [true],
+    AC_MSG_FAILURE([libblkid not found]))
+
+  # libudev
+  AC_CHECK_HEADER([libudev.h], [],
+    AC_MSG_ERROR([libudev.h not found (libudev-dev, libudev-devel)]))
+  AC_CHECK_LIB([udev], [udev_monitor_receive_device], [true],
+    AC_MSG_FAILURE([libudev not found]))
 fi
 
 #
@@ -175,7 +309,7 @@ dnl check for libkeyutils on linux
 KEYUTILS_LIB=""
 AS_IF([test x"$linux" = x"yes"], [
   AC_CHECK_LIB([keyutils], [add_key], [KEYUTILS_LIB="-lkeyutils"], [
-    AC_MSG_FAILURE([libkeyutils not found])])])
+    AC_MSG_FAILURE([libkeyutils not found (libkeyutils-dev, keyutils-libs-devel)])])])
 AC_SUBST(KEYUTILS_LIB)
 
 AC_CHECK_LIB([m], [pow], [true], AC_MSG_FAILURE([libm not found]))
@@ -243,6 +377,12 @@ else
     AC_MSG_FAILURE([no suitable crypto library found])
 fi
 
+AC_ARG_ENABLE([root-make-check],
+            [AS_HELP_STRING([--enable-root-make-check], [enable make check tests that require root privileges])],
+            [],
+            [enable_root_make_check=no])
+AM_CONDITIONAL(ENABLE_ROOT_MAKE_CHECK, test "x$enable_root_make_check" != xno)
+
 # profiler?
 AC_ARG_WITH([profiler],
             [AS_HELP_STRING([--with-profiler], [build extra profiler binaries])],
@@ -254,7 +394,13 @@ AC_ARG_WITH([profiler],
             [with_profiler=no])
 AS_IF([test "x$with_profiler" = xyes],
 	    [AC_CHECK_LIB([profiler], [ProfilerFlush], [],
-	        	  [AC_MSG_FAILURE([--with-profiler was given but libprofiler (libgoogle-perftools-dev on debian) not found])])],
+	        	  [AC_MSG_FAILURE([--with-profiler was given but libprofiler (libgoogle-perftools-dev on debian) not found])])
+             AC_LANG_PUSH([C++])
+             AC_CHECK_HEADERS([gperftools/heap-profiler.h \
+               gperftools/malloc_extension.h \
+               gperftools/profiler.h])
+             AC_LANG_POP([C++])
+            ],
 	    [])
 AM_CONDITIONAL(WITH_PROFILER, test "$with_profiler" = "yes")
 AS_IF([test "$with_profiler" = "yes"],
@@ -285,11 +431,7 @@ if test "x$enable_coverage" != xno; then
 fi
 AC_SUBST(GCOV_PREFIX_STRIP, `echo $(pwd)/src | tr -dc / | wc -c`)
 
-# radosgw?
-AC_ARG_WITH([radosgw],
-            [AS_HELP_STRING([--with-radosgw], [build RADOS gateway])],
-            [],
-            [with_radosgw=check])
+# is radosgw available?
 RADOSGW=0
 AS_IF([test "x$with_radosgw" != xno],
 	    [AC_CHECK_LIB([fcgi], [FCGX_Init],
@@ -341,11 +483,52 @@ AS_IF([test "x$with_fuse" != xno],
                    [no FUSE found (use --without-fuse to disable)])])])
 AM_CONDITIONAL(WITH_FUSE, [test "$HAVE_LIBFUSE" = "1"])
 
+# jemalloc?
+AC_ARG_WITH([jemalloc],
+	    [AS_HELP_STRING([--with-jemalloc], [enable jemalloc for memory allocations])],
+	    [],
+	    [with_jemalloc=no])
+JEMALLOC=
+AS_IF([test "x$with_jemalloc" = xyes],
+	    [AC_CHECK_LIB([jemalloc], [malloc],
+	     [AC_SUBST([LIBJEMALLOC], ["-ljemalloc"])
+	       AC_DEFINE([HAVE_LIBJEMALLOC], [1],
+                         [Define if you have jemalloc])
+	       HAVE_LIBJEMALLOC=1
+	     ],
+	    [AC_MSG_FAILURE(
+		  [no jemalloc found (do not use --with-jemalloc)])])])
+AM_CONDITIONAL(WITH_JEMALLOC, [test "$HAVE_LIBJEMALLOC" = "1"])
+
+# tcmalloc-minimal?
+AC_ARG_WITH([tcmalloc-minimal],
+	    [AS_HELP_STRING([--with-tcmalloc-minimal], [enable minimal tcmalloc support for memory allocations])],
+	    [],
+	    [with_tcmalloc_minimal=no])
+
+AS_IF([test "x$with_jemalloc" = "xyes"],[with_tcmalloc_minimal=no],[])
+
+TCMALLOC_MINIMAL=
+AS_IF([test "x$with_tcmalloc_minimal" != xno],
+        [AC_CHECK_LIB([tcmalloc_minimal], [malloc],
+         [AC_SUBST([LIBTCMALLOC], ["-ltcmalloc_minimal"])
+	       AC_DEFINE([HAVE_LIBTCMALLOC_MINIMAL], [1],
+	       		 [Define if you have tcmalloc])
+	       HAVE_LIBTCMALLOC_MINIMAL=1
+	     ],
+	    [AC_MSG_FAILURE(
+		  [no tcmalloc found (do not use --with-tcmalloc-minimal)])])])
+AM_CONDITIONAL(WITH_TCMALLOC_MINIMAL, [test "$HAVE_LIBTCMALLOC_MINIMAL" = "1"])
+
 # tcmalloc?
 AC_ARG_WITH([tcmalloc],
 	    [AS_HELP_STRING([--without-tcmalloc], [disable tcmalloc for memory allocations])],
 	    [],
 	    [with_tcmalloc=yes])
+
+AS_IF([test "x$with_jemalloc" = "xyes"],[with_tcmalloc=no],[])
+AS_IF([test "x$with_tcmalloc_minimal" = "xyes"],[with_tcmalloc=no],[])
+
 TCMALLOC=
 AS_IF([test "x$with_tcmalloc" != xno],
 	    [AC_CHECK_LIB([tcmalloc], [malloc],
@@ -357,6 +540,13 @@ AS_IF([test "x$with_tcmalloc" != xno],
 	    [AC_MSG_FAILURE(
 		  [no tcmalloc found (use --without-tcmalloc to disable)])])])
 AM_CONDITIONAL(WITH_TCMALLOC, [test "$HAVE_LIBTCMALLOC" = "1"])
+
+# error out if --with-jemalloc and ! --without-tcmalloc
+if test "x$with_jemalloc" = "xyes"; then
+	if test "x$with_tcmalloc" != "xno"; then
+		AC_MSG_FAILURE([--with-jemalloc called without --without-tcmalloc])
+	fi
+fi
 
 #set pg ref debugging?
 AC_ARG_ENABLE([pgrefdebugging],
@@ -450,9 +640,34 @@ fi
 AM_CONDITIONAL(HAVE_JUNIT4, [test "$have_junit4" = "1"])
 
 #
+# Accelio and OFED
+#
+AC_ARG_ENABLE(xio,
+    [AC_HELP_STRING([--enable-xio], [build Ceph Accelio transport])],
+    [], [enable_xio=no])
+
+AM_CONDITIONAL(ENABLE_XIO, [test "x$enable_xio" = "xyes"])
+
+if test "x$enable_xio" = x"yes"; then
+   AC_CHECK_HEADER([libxio.h], [], AC_MSG_ERROR([Cannot find header 'libxio.h'.]))
+   AC_CHECK_LIB([xio], [xio_init], [], AC_MSG_FAILURE([Accelio libxio not found]))
+   AC_CHECK_LIB([ibverbs], [ibv_query_device], [], AC_MSG_FAILURE([libibverbs not found]))
+   AC_CHECK_LIB([rdmacm], [rdma_connect], [], AC_MSG_FAILURE([librdmacm not found]))
+
+   # Also require boost-regex, used in address_helper
+   AC_CHECK_LIB(boost_regex, main, [],
+      AC_MSG_FAILURE(["Boost regex library not found."]))
+
+   AC_DEFINE([HAVE_XIO], [1], [Accelio conditional compilation])
+
+   XIO_LIBS="-lxio -libverbs -lrdmacm"
+   AC_SUBST(XIO_LIBS)
+fi
+
+#
 # FreeBSD has it in base.
 #
-if test x"$freebsd" != x"yes"; then
+if test x"$freebsd" != x"yes" -a x"$with_radosgw" = x"yes"; then
 PKG_CHECK_MODULES([LIBEDIT], [libedit >= 2.11],
                 [], AC_MSG_FAILURE([No usable version of libedit found.]))
 else
@@ -494,17 +709,72 @@ AC_ARG_WITH([ocf],
             [with_ocf=no])
 AM_CONDITIONAL(WITH_OCF, [ test "$with_ocf" = "yes" ])
 
-# check is snappy-devel is installed, needed by leveldb
-AC_CHECK_LIB([snappy], [snappy_compress], [true], [AC_MSG_FAILURE([libsnappy not found])])
-# use system leveldb
-AC_CHECK_LIB([leveldb], [leveldb_open], [true], [AC_MSG_FAILURE([libleveldb not found])], [-lsnappy -lpthread])
-# see if we can use bloom filters with leveldb
-AC_LANG_PUSH([C++])
-AC_CHECK_HEADER([leveldb/filter_policy.h], [AC_DEFINE([HAVE_LEVELDB_FILTER_POLICY], [1], [Defined if LevelDB supports bloom filters ])])
-AC_LANG_POP([C++])
+# cond-check snappy-devel and leveldb, necessary if server + osd or mon enabled
+if test "$enable_server" = "yes" -a \( "$with_osd" = "yes" -o "$with_mon" = "yes" \); then
+	AC_CHECK_LIB([snappy], [snappy_compress], [true], [AC_MSG_FAILURE([libsnappy not found])])
+	AC_CHECK_LIB([leveldb], [leveldb_open], [true], [AC_MSG_FAILURE([libleveldb not found])], [-lsnappy -lpthread])
 
-# Find supported SIMD / SSE extensions supported by the compiler
+	# see if we can use bloom filters with leveldb
+	AC_LANG_PUSH([C++])
+	AC_CHECK_HEADER([leveldb/filter_policy.h], [AC_DEFINE([HAVE_LEVELDB_FILTER_POLICY], [1], [Defined if LevelDB supports bloom filters ])])
+	AC_LANG_POP([C++])
+fi
+
+# Find supported SIMD / NEON / SSE extensions supported by the compiler
+AX_ARM_FEATURES()
+AM_CONDITIONAL(HAVE_NEON, [ test "x$ax_cv_support_neon_ext" = "xyes"])
 AX_INTEL_FEATURES()
+AM_CONDITIONAL(HAVE_SSSE3, [ test "x$ax_cv_support_ssse3_ext" = "xyes"])
+AM_CONDITIONAL(HAVE_SSE4_PCLMUL, [ test "x$ax_cv_support_pclmuldq_ext" = "xyes"])
+
+# kinetic osd backend?
+AC_ARG_WITH([kinetic],
+            [AS_HELP_STRING([--with-kinetic], [build kinetic support])],
+            [],
+            [with_kinetic=no])
+# no pkg-config support yet
+#AS_IF([test "x$with_kinetic" = "xyes"],
+#            [PKG_CHECK_MODULES([KINETIC], [kinetic_client], [], [true])])
+AS_IF([test "x$with_kinetic" = "xyes"],
+            [AC_DEFINE([HAVE_KINETIC], [1], [Defined if you have kinetic enabled])])
+AM_CONDITIONAL(WITH_KINETIC, [ test "$with_kinetic" = "yes" ])
+
+# check for c++11 (but do not enable it)
+old_cxxflags="$CXXFLAGS"
+AX_CXX_COMPILE_STDCXX_11([], [optional])
+CXXFLAGS="$old_cxxflags"
+
+# use rocksdb
+AC_ARG_WITH([librocksdb],
+            [AS_HELP_STRING([--with-librocksdb], [build rocksdb support])],
+            [],
+            [with_librocksdb=no])
+AS_IF([test "x$with_librocksdb" = "xyes"],
+            [PKG_CHECK_MODULES([LIBROCKSDB], [rocksdb], [], [true])])
+AS_IF([test "x$with_librocksdb" = "xyes"],
+            [AC_CHECK_LIB([rocksdb], [open], [], [AC_MSG_FAILURE([librocksdb not found])])])
+AM_CONDITIONAL(WITH_DLIBROCKSDB, [ test "$with_librocksdb" = "yes" ])
+
+AC_ARG_WITH([librocksdb-static],
+            [AS_HELP_STRING([--with-librocksdb-static], [build rocksdb support])],
+            [],
+            [with_librocksdb_static=no])
+AS_IF([test "x$with_librocksdb_static" = "xcheck" -a "x$HAVE_CXX11" = "x1" ],
+            [with_librocksdb_static="yes"])
+AS_IF([test "x$with_librocksdb_static" = "xyes"],
+            [AC_CONFIG_SUBDIRS([src/rocksdb])])
+AS_IF([test "x$with_librocksdb_static" = "xyes"],
+            [AC_DEFINE([HAVE_LIBROCKSDB], [1], [Defined if you have librocksdb enabled])])
+AM_CONDITIONAL(WITH_SLIBROCKSDB, [ test "x$with_librocksdb_static" = "xyes" ])
+AM_CONDITIONAL(WITH_LIBROCKSDB, [ test "x$with_librocksdb_static" = "xyes" -o "x$with_librocksdb" = "xyes" ])
+
+# error out if --with-jemalloc and --with-librocksdb_static as rocksdb uses tcmalloc
+if test "x$with_jemalloc" = "xyes"; then
+	if test "x$with_librocksdb_static" != "xno"; then
+		AC_MSG_FAILURE([--with-jemalloc called with --with-librocksdb_static, turn off
+			        --with-librocksdb-static or --with-jemalloc])
+	fi
+fi
 
 # use system libs3?
 AC_ARG_WITH([system-libs3],
@@ -603,9 +873,15 @@ AC_CHECK_LIB(boost_system-mt, main, [],
         AC_MSG_NOTICE(["Boost system library not found."]))])
 
 # Find the right boost_thread library.
+BOOST_THREAD_LIBS=""
+saved_LIBS="${LIBS}"
+LIBS=""
 AC_CHECK_LIB(boost_thread-mt, main, [],
     [AC_CHECK_LIB(boost_thread, main, [],
         AC_MSG_FAILURE(["Boost thread library not found."]))])
+BOOST_THREAD_LIBS="${LIBS}"
+LIBS="${saved_LIBS}"
+AC_SUBST(BOOST_THREAD_LIBS)
 
 #
 # Check for boost_program_options library (defines BOOST_PROGRAM_OPTIONS_LIBS).
@@ -711,6 +987,27 @@ AC_DEFINE([HAVE_FDATASYNC], 1, [Define to 1 if you have fdatasync.])
 AC_MSG_RESULT([no])
 ])
 
+AC_MSG_CHECKING([for sched.h])
++AC_LANG_PUSH([C++])
+AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[
+#define _GNU_SOURCE
+#include <sched.h>
+]], [[
+cpu_set_t cpuset;
+CPU_ZERO(&cpuset);
+CPU_SET(sched_getcpu(), &cpuset);
+sched_setaffinity(0, sizeof(cpuset), &cpuset);
+sched_yield();
+return 0;
+]])], [
+AC_MSG_RESULT([yes])
+AC_DEFINE([HAVE_SCHED], 1, [Define to 1 if you have sched.h.])
+], [
+AC_MSG_RESULT([no])
+])
++AC_LANG_POP([C++])
+
+
 #
 # Check for pthread spinlock (depends on ACX_PTHREAD)
 #
@@ -730,6 +1027,110 @@ dnl check for Linux types
 AC_CHECK_HEADERS([linux/types.h])
 AC_CHECK_TYPES([__u8, __s8, __u16, __s16, __u32, __s32, __u64, __s64, __le16,
   __be16, __le32, __be32, __le64, __be64], [], [], [[#include <linux/types.h>]])
+
+
+dnl Old versions of lttng-gen-tp leave out includes, and they break our stuff.
+AC_MSG_CHECKING([if lttng-gen-tp is sane])
+lttng_gen_tp_dir=`mktemp -d`
+echo "#include <foo-inc.h>" > "$lttng_gen_tp_dir/foo.tp"
+if ( ( cd "$lttng_gen_tp_dir" && lttng-gen-tp foo.tp -o foo.h && grep "#include <foo-inc.h>" foo.h ) > /dev/null 2>&1 ) ; then
+  have_good_lttng_gen_tp=yes
+else
+  have_good_lttng_gen_tp=no
+fi
+rm -rf "$lttng_gen_tp_dir"
+AC_MSG_RESULT([$have_good_lttng_gen_tp])
+
+AC_ARG_WITH([lttng],
+	[AS_HELP_STRING([--with-lttng], [Trace with LTTng])])
+AS_IF([test "x$with_lttng" = "xno"], [use_lttng=no],
+      [test "x$with_lttng" = "xyes"], [use_lttng=yes],
+      [test "x$have_good_lttng_gen_tp" = "xyes"], [use_lttng=yes; AC_MSG_NOTICE([lttng auto-enabled])],
+      [use_lttng=no; AC_MSG_NOTICE([lttng auto-disabled])])
+AM_CONDITIONAL([WITH_LTTNG], test x"$use_lttng" = x"yes")
+AM_COND_IF([WITH_LTTNG], [
+  AC_DEFINE([WITH_LTTNG], [1], [Define if you want to use LTTng])
+
+  AC_CHECK_HEADER([lttng/tracepoint.h], [],
+    AC_MSG_ERROR([lttng/tracepoint.h not found (liblttng-ust-dev, lttng-ust-devel)]))
+
+  AC_CHECK_PROG([LTTNG_GEN_TP_CHECK], [lttng-gen-tp], [yes])
+  if test x"$LTTNG_GEN_TP_CHECK" != "xyes"; then
+      AC_MSG_FAILURE([lttng-gen-tp not found])
+  fi
+  AC_SUBST([LTTNG_GEN_TP_PROG], [lttng-gen-tp])
+
+  if test x"$have_good_lttng_gen_tp" != "xyes"; then
+      AC_MSG_FAILURE([lttng-gen-tp does not behave properly])
+  fi
+
+  AC_MSG_CHECKING([if time_t is an integer])
+  AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[#include <time.h>]], [[
+      struct {
+          unsigned int time_t_is_integer: ((time_t) 1.5 == 1) ? 1 : -1;
+      } x;
+      return 0;
+  ]])], [
+     AC_MSG_RESULT([yes])
+  ], [
+     AC_MSG_RESULT([no])
+     AC_MSG_FAILURE([time_t is not an integer.  We assume this for tracing.])
+  ])
+
+  AC_MSG_CHECKING([if time_t fits in uint64_t])
+  AC_COMPILE_IFELSE([AC_LANG_PROGRAM([[#include <time.h>
+  #include <inttypes.h>]], [[
+      struct {
+          unsigned int time_t_fits_in_uin64_t: (sizeof(time_t) <= sizeof(uint64_t)) ? 1 : -1;
+      } x;
+      return 0;
+  ]])], [
+     AC_MSG_RESULT([yes])
+  ], [
+     AC_MSG_RESULT([no])
+     AC_MSG_FAILURE([time_t is larger than uint64_t.  We assume it can be cast to uint64_t, for tracing.])
+  ])
+], [
+  AC_DEFINE([tracepoint(...)], [], [LTTng is disabled, so define this macro to be nothing.])
+])
+
+
+AC_CHECK_HEADERS([babeltrace/ctf/events.h babeltrace/babeltrace.h])
+AC_CHECK_DECL([BT_CLOCK_REAL],
+              [have_good_babeltrace=yes],
+              [have_good_babeltrace=no],
+              [[#include <babeltrace/babeltrace.h>]])
+AC_ARG_WITH([babeltrace],
+	[AS_HELP_STRING([--with-babeltrace], [Enable Babeltrace])])
+AS_IF([test "x$with_babeltrace" = "xno"], [use_babeltrace=no],
+      [test "x$with_babeltrace" = "xyes"], [use_babeltrace=yes],
+      [test "x$ac_cv_header_babeltrace_ctf_events_h$ac_cv_header_babeltrace_babeltrace_h$have_good_babeltrace" = "xyesyesyes"], [use_babeltrace=yes; AC_MSG_NOTICE([babeltrace auto-enabled])],
+      [use_babeltrace=no; AC_MSG_NOTICE([babeltrace auto-disabled])])
+AM_CONDITIONAL([WITH_BABELTRACE], test x"$use_babeltrace" = x"yes")
+AM_COND_IF([WITH_BABELTRACE], [
+  AC_DEFINE([WITH_BABELTRACE], [1], [Define if you want to use Babeltrace])
+
+  AC_CHECK_HEADER([babeltrace/babeltrace.h], [],
+    AC_MSG_ERROR([babeltrace/babeltrac.h not found (libbabeltrace-dev, libbabeltrace-devel)]))
+
+  AC_CHECK_HEADER([babeltrace/ctf/events.h], [],
+    AC_MSG_ERROR([babeltrace/ctf/events.h not found (libbabeltrace-ctf-dev, libbabeltrace-devel)]))
+])
+
+dnl check for valgrind
+AC_ARG_ENABLE([valgrind],
+              [AS_HELP_STRING([--enable-valgrind], [enable valgrind unit tests])],
+              [enable_valgrind=$enableval], [enable_valgrind=])
+AC_CHECK_PROG(HAVE_VALGRIND, valgrind, yes)
+AS_IF(
+  [test "x$HAVE_VALGRIND" = "x"], AS_IF([test "x$enable_valgrind" = "xyes"], [AC_MSG_ERROR([valgrind not found])]),
+  [test "x$enable_valgrind" = "x"], [enable_valgrind=yes])
+
+AM_CONDITIONAL([VALGRIND_ENABLED], [test "x$enable_valgrind" = "xyes"])
+if test "x$enable_valgrind" = "xyes"; then
+  AC_CHECK_HEADERS([valgrind/helgrind.h])
+fi
+
 
 # Checks for typedefs, structures, and compiler characteristics.
 #AC_HEADER_STDBOOL
@@ -790,6 +1191,7 @@ AC_CONFIG_FILES([Makefile
 	src/ocf/ceph
 	src/ocf/rbd
 	src/java/Makefile
+	src/tracing/Makefile
 	man/Makefile
 	ceph.spec])
 AC_OUTPUT

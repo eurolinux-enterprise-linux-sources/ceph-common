@@ -84,6 +84,20 @@ public:
       // 0 the stats for the osd
       osd_stat_updates[osd] = osd_stat_t();
     }
+    void stat_osd_down_up(int32_t osd, PGMap& pg_map) {
+      // 0 the op_queue_age_hist for this osd
+      map<int32_t,osd_stat_t>::iterator p = osd_stat_updates.find(osd);
+      if (p != osd_stat_updates.end()) {
+	p->second.op_queue_age_hist.clear();
+	return;
+      }
+      ceph::unordered_map<int32_t,osd_stat_t>::iterator q =
+	pg_map.osd_stat.find(osd);
+      if (q != pg_map.osd_stat.end()) {
+	osd_stat_t& t = osd_stat_updates[osd] = q->second;
+	t.op_queue_age_hist.clear();
+      }
+    }
     void rm_stat(int32_t osd) {
       osd_stat_rm.insert(osd);
       osd_epochs.erase(osd);
@@ -106,6 +120,7 @@ public:
   pool_stat_t pg_sum;
   osd_stat_t osd_sum;
   mutable epoch_t min_last_epoch_clean;
+  ceph::unordered_map<int,int> blocked_by_sum;
 
   utime_t stamp;
 
@@ -168,12 +183,12 @@ public:
   set<pg_t> creating_pgs;   // lru: front = new additions, back = recently pinged
   map<int,set<pg_t> > creating_pgs_by_osd;
 
-  enum StuckPG {
-    STUCK_INACTIVE,
-    STUCK_UNCLEAN,
-    STUCK_STALE,
-    STUCK_NONE
-  };
+  // Bits that use to be enum StuckPG
+  static const int STUCK_INACTIVE = (1<<0);
+  static const int STUCK_UNCLEAN = (1<<1);
+  static const int STUCK_UNDERSIZED = (1<<2);
+  static const int STUCK_DEGRADED = (1<<3);
+  static const int STUCK_STALE = (1<<4);
   
   PGMap()
     : version(0),
@@ -234,8 +249,8 @@ public:
   void redo_full_sets();
   void register_nearfull_status(int osd, const osd_stat_t& s);
   void calc_stats();
-  void stat_pg_add(const pg_t &pgid, const pg_stat_t &s);
-  void stat_pg_sub(const pg_t &pgid, const pg_stat_t &s);
+  void stat_pg_add(const pg_t &pgid, const pg_stat_t &s, bool sumonly=false);
+  void stat_pg_sub(const pg_t &pgid, const pg_stat_t &s, bool sumonly=false);
   void stat_osd_add(const osd_stat_t &s);
   void stat_osd_sub(const osd_stat_t &s);
   
@@ -250,23 +265,37 @@ public:
   void dump_pool_stats(Formatter *f) const;
   void dump_osd_stats(Formatter *f) const;
   void dump_delta(Formatter *f) const;
+  void dump_filtered_pg_stats(Formatter *f, set<pg_t>& pgs);
 
   void dump_pg_stats_plain(ostream& ss,
-			   const ceph::unordered_map<pg_t, pg_stat_t>& pg_stats) const;
-  void get_stuck_stats(StuckPG type, utime_t cutoff,
+			   const ceph::unordered_map<pg_t, pg_stat_t>& pg_stats,
+			   bool brief) const;
+  void get_stuck_stats(int types, utime_t cutoff,
 		       ceph::unordered_map<pg_t, pg_stat_t>& stuck_pgs) const;
-  void dump_stuck(Formatter *f, StuckPG type, utime_t cutoff) const;
-  void dump_stuck_plain(ostream& ss, StuckPG type, utime_t cutoff) const;
+  void dump_stuck(Formatter *f, int types, utime_t cutoff) const;
+  void dump_stuck_plain(ostream& ss, int types, utime_t cutoff) const;
 
   void dump(ostream& ss) const;
+  void dump_basic(ostream& ss) const;
+  void dump_pg_stats(ostream& ss, bool brief) const;
+  void dump_pg_sum_stats(ostream& ss, bool header) const;
+  void dump_pool_stats(ostream& ss, bool header) const;
+  void dump_osd_stats(ostream& ss) const;
+  void dump_osd_sum_stats(ostream& ss) const;
+  void dump_filtered_pg_stats(ostream& ss, set<pg_t>& pgs);
 
   void dump_osd_perf_stats(Formatter *f) const;
   void print_osd_perf_stats(std::ostream *ss) const;
 
-  void recovery_summary(Formatter *f, ostream *out,
+  void dump_osd_blocked_by_stats(Formatter *f) const;
+  void print_osd_blocked_by_stats(std::ostream *ss) const;
+
+  void get_filtered_pg_stats(const string& state, int64_t poolid, int64_t osdid,
+                             bool primary, set<pg_t>& pgs);
+  void recovery_summary(Formatter *f, list<string> *psl,
                         const pool_stat_t& delta_sum) const;
-  void overall_recovery_summary(Formatter *f, ostream *out) const;
-  void pool_recovery_summary(Formatter *f, ostream *out,
+  void overall_recovery_summary(Formatter *f, list<string> *psl) const;
+  void pool_recovery_summary(Formatter *f, list<string> *psl,
                              uint64_t poolid) const;
   void recovery_rate_summary(Formatter *f, ostream *out,
                              const pool_stat_t& delta_sum,
@@ -295,7 +324,7 @@ public:
                                    uint64_t poolid) const;
 
   void print_summary(Formatter *f, ostream *out) const;
-  void print_oneline_summary(ostream *out) const;
+  void print_oneline_summary(Formatter *f, ostream *out) const;
 
   epoch_t get_min_last_epoch_clean() const {
     if (!min_last_epoch_clean)
@@ -309,7 +338,7 @@ WRITE_CLASS_ENCODER_FEATURES(PGMap::Incremental)
 WRITE_CLASS_ENCODER_FEATURES(PGMap)
 
 inline ostream& operator<<(ostream& out, const PGMap& m) {
-  m.print_oneline_summary(&out);
+  m.print_oneline_summary(NULL, &out);
   return out;
 }
 

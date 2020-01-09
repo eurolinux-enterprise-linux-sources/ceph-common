@@ -7,8 +7,8 @@
 # common
 #################################################################################
 Name:		ceph-common
-Version:	0.80.7
-Release:	3%{?dist}
+Version:	0.94.5
+Release:	1%{?dist}
 Epoch:		1
 Summary:	Ceph Common
 License:	GPLv2
@@ -17,28 +17,6 @@ URL:		http://ceph.com/
 # We are interested in x86_64 and aarch64 only
 ExclusiveArch:	x86_64 aarch64
 Source0:	http://ceph.com/download/ceph-%{version}.tar.bz2
-Patch1:		0001-google-.h-gperftools-header-files-were-deprecated-in.patch
-Patch2:		0002-ceph_test_librbd_fsx-no-longer-need-Wno-format-remov.patch
-Patch3:		0003-Limit-the-include-scope-do-not-indirectly-include-le.patch
-Patch4:		0004-Introduce-enable-disable-server-option.patch
-Patch5:		0005-os-KeyValueDB-generic-create-test_init.patch
-Patch6:		0006-os-KeyValueDB-make-compaction-interface-generic.patch
-Patch7:		0007-mon-MonitorDBStore-uninline-init_options.patch
-Patch8:		0008-mon-MonitorDBStore-use-generic-KeyValueDB-create.patch
-Patch9:		0009-config-allow-unsafe-setting-of-config-values.patch
-Patch10:	0010-CephContext-Add-AssociatedSingletonObject-to-allow-C.patch
-Patch11:	0011-common-ceph_context-don-t-import-std-namespace.patch
-Patch12:	0012-WorkQueue-add-new-ContextWQ-work-queue.patch
-Patch13:	0013-WorkQueue-added-virtual-destructor.patch
-Patch14:	0014-librbd-add-task-pool-work-queue-for-AIO-requests.patch
-Patch15:	0015-librbd-avoid-blocking-AIO-API-methods.patch
-Patch16:	0016-librbd-add-new-fail-method-to-AioCompletion.patch
-Patch17:	0017-Throttle-added-pending_error-method-to-SimpleThrottl.patch
-Patch18:	0018-librbd-internal-AIO-methods-no-longer-return-result.patch
-Patch19:	0019-tests-update-librbd-AIO-tests-to-remove-result-code.patch
-Patch20:	0020-librbd-AioRequest-send-no-longer-returns-a-result.patch
-Patch21:	0021-librbd-new-rbd_non_blocking_aio-config-option.patch
-Patch22:	0022-tests-verify-librbd-blocking-aio-code-path.patch
 Requires:	librbd1 = %{epoch}:%{version}-%{release}
 Requires:	librados2 = %{epoch}:%{version}-%{release}
 Requires:	python-rbd = %{epoch}:%{version}-%{release}
@@ -76,6 +54,7 @@ BuildRequires:	libxml2-devel
 BuildRequires:	libuuid-devel
 BuildRequires:	libblkid-devel >= 2.17
 BuildRequires:	libudev-devel
+BuildRequires:	expat-devel
 %if ! ( 0%{?rhel} && 0%{?rhel} <= 6 )
 BuildRequires:	xfsprogs-devel
 %endif
@@ -184,28 +163,6 @@ block device.
 #################################################################################
 %prep
 %setup -q -n ceph-%{version}
-%patch1 -p1
-%patch2 -p1
-%patch3 -p1
-%patch4 -p1
-%patch5 -p1
-%patch6 -p1
-%patch7 -p1
-%patch8 -p1
-%patch9 -p1
-%patch10 -p1
-%patch11 -p1
-%patch12 -p1
-%patch13 -p1
-%patch14 -p1
-%patch15 -p1
-%patch16 -p1
-%patch17 -p1
-%patch18 -p1
-%patch19 -p1
-%patch20 -p1
-%patch21 -p1
-%patch22 -p1
 
 %build
 ./autogen.sh
@@ -220,7 +177,7 @@ MY_CONF_OPT=""
 # Do not use gperftools (tcmalloc) on rhel
 # No need to build fuse, rest-bench radosgw and ocf pkgs so far
 # Use nss instead of cryptopp library
-MY_CONF_OPT="$MY_CONF_OPT --disable-server --without-libatomic-ops --without-tcmalloc --without-radosgw --without-rest-bench --without-fuse --without-ocf --without-cryptopp --with-nss"
+MY_CONF_OPT="$MY_CONF_OPT --disable-server --without-libatomic-ops --without-tcmalloc --without-radosgw --without-rest-bench --without-fuse --without-ocf --without-cryptopp --with-nss --without-radosstriper --without-cephfs"
 
 export RPM_OPT_FLAGS=`echo $RPM_OPT_FLAGS | sed -e 's/i386/i486/'`
 
@@ -243,10 +200,19 @@ install -D src/init-rbdmap $RPM_BUILD_ROOT%{_initrddir}/rbdmap
 install -D src/rbdmap $RPM_BUILD_ROOT%{_sysconfdir}/ceph/rbdmap
 rm -f $RPM_BUILD_ROOT%{_docdir}/ceph/sample.ceph.conf
 rm -f $RPM_BUILD_ROOT%{_docdir}/ceph/sample.fetch_config
-rm -f $RPM_BUILD_ROOT%{python_sitelib}/cephfs.py*
-rm -rf $RPM_BUILD_ROOT%{_includedir}/cephfs
-rm -f $RPM_BUILD_ROOT%{_libdir}/libcephfs.so
-rm -f $RPM_BUILD_ROOT%{_libdir}/libcephfs.so.*
+rm -f $RPM_BUILD_ROOT%{_libdir}/ceph/erasure-code/libec_*.so*
+rm -f $RPM_BUILD_ROOT%{_libexecdir}/ceph/ceph-osd-prestart.sh
+rm -f $RPM_BUILD_ROOT%{_sysconfdir}/bash_completion.d/radosgw-admin
+rm -f $RPM_BUILD_ROOT%{_bindir}/crushtool
+rm -f $RPM_BUILD_ROOT%{_bindir}/monmaptool
+rm -f $RPM_BUILD_ROOT%{_bindir}/osdmaptool
+rm -f $RPM_BUILD_ROOT%{_bindir}/rbd-replay
+rm -f $RPM_BUILD_ROOT%{_bindir}/rbd-replay-many
+rm -f $RPM_BUILD_ROOT%{_libdir}/ceph/ceph_common.sh
+rm -f $RPM_BUILD_ROOT%{_libexecdir}/ceph/ceph-osd-prestart.sh
+rm -f $RPM_BUILD_ROOT%{_mandir}/man8/rbd-replay.8*
+rm -f $RPM_BUILD_ROOT%{_mandir}/man8/rbd-replay-many.8*
+rm -f $RPM_BUILD_ROOT%{_mandir}/man8/rbd-replay-prep.8*
 
 # udev rules
 %if 0%{?rhel} >= 7 || 0%{?fedora}
@@ -268,20 +234,21 @@ rm -rf $RPM_BUILD_ROOT
 %{_bindir}/ceph-authtool
 %{_bindir}/ceph-conf
 %{_bindir}/ceph-dencoder
+%{_bindir}/ceph-rbdnamer
 %{_bindir}/ceph-syn
-%{_bindir}/ceph-crush-location
 %{_bindir}/rados
 %{_bindir}/rbd
 %{_bindir}/ceph-post-file
 %{_bindir}/ceph-brag
-%{_mandir}/man8/ceph.8*
 %{_mandir}/man8/ceph-authtool.8*
 %{_mandir}/man8/ceph-conf.8*
 %{_mandir}/man8/ceph-dencoder.8*
+%{_mandir}/man8/ceph-rbdnamer.8*
 %{_mandir}/man8/ceph-syn.8*
+%{_mandir}/man8/ceph-post-file.8*
+%{_mandir}/man8/ceph.8*
 %{_mandir}/man8/rados.8*
 %{_mandir}/man8/rbd.8*
-%{_mandir}/man8/ceph-post-file.8*
 %{_datadir}/ceph/known_hosts_drop.ceph.com
 %{_datadir}/ceph/id_dsa_drop.ceph.com
 %{_datadir}/ceph/id_dsa_drop.ceph.com.pub
@@ -293,6 +260,7 @@ rm -rf $RPM_BUILD_ROOT
 %config(noreplace) %{_sysconfdir}/ceph/rbdmap
 %{_initrddir}/rbdmap
 %{python_sitelib}/ceph_argparse.py*
+%{_udevrulesdir}/50-rbd.rules
 
 %postun
 # Package removal cleanup
@@ -325,6 +293,8 @@ fi
 %{_includedir}/rados/rados_types.hpp
 %{_includedir}/rados/memory.h
 %{_libdir}/librados.so
+%{_bindir}/librados-config
+%{_mandir}/man8/librados-config.8*
 
 #################################################################################
 %files -n librbd1
@@ -362,6 +332,9 @@ fi
 %{python_sitelib}/rbd.py*
 
 %changelog
+* Wed Jun 22 2016 Boris Ranto <branto@redhat.com> - 1:0.94.5-1
+- New version (1:0.94.5-1)
+
 * Wed Jun 17 2015 Boris Ranto <branto@redhat.com> - 1:0.80.7-3
 - Fix librbd: aio calls may block (1225188)
 

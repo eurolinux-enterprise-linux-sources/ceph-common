@@ -67,6 +67,7 @@
     opstate renew              renew state on an entry (use client_id, op_id, object)
     opstate rm                 remove entry (use client_id, op_id, object)
     replicalog get             get replica metadata log entry
+    replicalog update          update replica metadata log entry
     replicalog delete          delete replica metadata log entry
   options:
      --uid=<id>                user id
@@ -81,6 +82,7 @@
      --access=<access>         Set access permissions for sub-user, should be one
                                of read, write, readwrite, full
      --display-name=<name>
+     --max_buckets             max number of buckets for a user
      --system                  set the system flag on the user
      --bucket=<bucket>
      --pool=<pool>
@@ -121,7 +123,7 @@
      --categories=<list>       comma separated list of categories, used in usage show
      --caps=<caps>             list of caps (e.g., "usage=read, write; user=read"
      --yes-i-really-mean-it    required for certain operations
-  
+     --reset-regions           reset regionmap when regionmap update
   <date> := "YYYY-MM-DD[ hh:mm:ss]"
   
   Quota options:

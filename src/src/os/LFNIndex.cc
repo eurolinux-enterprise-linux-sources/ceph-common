@@ -74,10 +74,6 @@ struct FDCloser {
 
 /* Public methods */
 
-void LFNIndex::set_ref(ceph::shared_ptr<CollectionIndex> ref)
-{
-  self_ref = ref;
-}
 
 int LFNIndex::init()
 {
@@ -142,7 +138,7 @@ int LFNIndex::lookup(const ghobject_t &oid,
   } else {
     *exist = 1;
   }
-  *out_path = IndexedPath(new Path(full_path, self_ref));
+  *out_path = IndexedPath(new Path(full_path, this));
   r = 0;
   );
 }
@@ -150,6 +146,11 @@ int LFNIndex::lookup(const ghobject_t &oid,
 int LFNIndex::collection_list(vector<ghobject_t> *ls)
 {
   return _collection_list(ls);
+}
+
+int LFNIndex::pre_hash_collection(uint32_t pg_num, uint64_t expected_num_objs)
+{
+  return _pre_hash_collection(pg_num, expected_num_objs);
 }
 
 
@@ -603,7 +604,7 @@ string LFNIndex::lfn_generate_object_name_keyless(const ghobject_t &oid)
     t += snprintf(t, end - t, "_snapdir");
   else
     t += snprintf(t, end - t, "_%llx", (long long unsigned)oid.hobj.snap);
-  snprintf(t, end - t, "_%.*X", (int)(sizeof(oid.hobj.hash)*2), oid.hobj.hash);
+  snprintf(t, end - t, "_%.*X", (int)(sizeof(oid.hobj.get_hash())*2), oid.hobj.get_hash());
 
   return string(s);
 }
@@ -657,7 +658,7 @@ string LFNIndex::lfn_generate_object_name(const ghobject_t &oid)
     t += snprintf(t, end - t, "snapdir");
   else
     t += snprintf(t, end - t, "%llx", (long long unsigned)oid.hobj.snap);
-  snprintf(t, end - t, "_%.*X", (int)(sizeof(oid.hobj.hash)*2), oid.hobj.hash);
+  snprintf(t, end - t, "_%.*X", (int)(sizeof(oid.hobj.get_hash())*2), oid.hobj.get_hash());
   full_name += string(buf);
   full_name.append("_");
 
@@ -673,7 +674,7 @@ string LFNIndex::lfn_generate_object_name(const ghobject_t &oid)
   full_name += string(buf);
 
   if (oid.generation != ghobject_t::NO_GEN ||
-      oid.shard_id != ghobject_t::NO_SHARD) {
+      oid.shard_id != shard_id_t::NO_SHARD) {
     full_name.append("_");
 
     t = buf;
@@ -721,7 +722,7 @@ string LFNIndex::lfn_generate_object_name_poolless(const ghobject_t &oid)
     t += snprintf(t, end - t, "snapdir");
   else
     t += snprintf(t, end - t, "%llx", (long long unsigned)oid.hobj.snap);
-  snprintf(t, end - t, "_%.*X", (int)(sizeof(oid.hobj.hash)*2), oid.hobj.hash);
+  snprintf(t, end - t, "_%.*X", (int)(sizeof(oid.hobj.get_hash())*2), oid.hobj.get_hash());
   full_name += string(snap_with_hash);
   return full_name;
 }
@@ -1009,7 +1010,10 @@ static int parse_object(const char *s, ghobject_t& o)
       o.hobj.snap = CEPH_SNAPDIR;
     else 
       o.hobj.snap = strtoull(bar+1, NULL, 16);
-    sscanf(hash, "_%X", &o.hobj.hash);
+      
+    uint32_t hobject_hash_input;
+    sscanf(hash, "_%X", &hobject_hash_input);
+    o.hobj.set_hash(hobject_hash_input);
 
     return 1;
   }
@@ -1130,7 +1134,7 @@ bool LFNIndex::lfn_parse_object_name(const string &long_name, ghobject_t *out)
   snapid_t snap;
   uint64_t pool;
   gen_t generation = ghobject_t::NO_GEN;
-  shard_t shard_id = ghobject_t::NO_SHARD;
+  shard_id_t shard_id = shard_id_t::NO_SHARD;
 
   if (index_version == HASH_INDEX_TAG)
     return lfn_parse_object_name_keyless(long_name, out);
@@ -1207,7 +1211,7 @@ bool LFNIndex::lfn_parse_object_name(const string &long_name, ghobject_t *out)
       return false;
     shardstring = string(current, end);
 
-    shard_id = (shard_t)strtoul(shardstring.c_str(), NULL, 16);
+    shard_id = (shard_id_t)strtoul(shardstring.c_str(), NULL, 16);
   }
 
   if (snap_str == "head")

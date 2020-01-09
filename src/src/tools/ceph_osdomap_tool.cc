@@ -10,29 +10,17 @@
 * License kkjversion 2.1, as published by the Free Software
 * Foundation. See file COPYING.
 */
-#include <boost/scoped_ptr.hpp>
-#include <boost/lexical_cast.hpp>
-#include <boost/program_options/option.hpp>
-#include <boost/program_options/options_description.hpp>
 #include <boost/program_options/variables_map.hpp>
-#include <boost/program_options/cmdline.hpp>
 #include <boost/program_options/parsers.hpp>
-#include <iostream>
-#include <set>
-#include <sstream>
-#include <stdlib.h>
-#include <fstream>
-#include <string>
-#include <sstream>
-#include <map>
-#include <set>
-#include <boost/scoped_ptr.hpp>
 
-#include "global/global_init.h"
-#include "os/LevelDBStore.h"
-#include "mon/MonitorDBStore.h"
-#include "os/DBObjectMap.h"
+#include <stdlib.h>
+#include <string>
+
 #include "common/errno.h"
+#include "global/global_init.h"
+
+#include "os/DBObjectMap.h"
+#include "os/LevelDBStore.h"
 
 namespace po = boost::program_options;
 using namespace std;
@@ -53,22 +41,24 @@ int main(int argc, char **argv) {
   po::positional_options_description p;
   p.add("command", 1);
 
+  vector<string> ceph_option_strings;
   po::variables_map vm;
-  po::parsed_options parsed =
-    po::command_line_parser(argc, argv).options(desc).positional(p).run();
-  po::store(
-    parsed,
-    vm);
   try {
+    po::parsed_options parsed =
+      po::command_line_parser(argc, argv).options(desc).positional(p).allow_unregistered().run();
+    po::store(
+	      parsed,
+	      vm);
     po::notify(vm);
-  } catch (...) {
-    cout << desc << std::endl;
+
+    ceph_option_strings = po::collect_unrecognized(parsed.options,
+						   po::include_positional);
+  } catch(po::error &e) {
+    std::cerr << e.what() << std::endl;
     return 1;
   }
 
   vector<const char *> ceph_options, def_args;
-  vector<string> ceph_option_strings = po::collect_unrecognized(
-    parsed.options, po::include_positional);
   ceph_options.reserve(ceph_option_strings.size());
   for (vector<string>::iterator i = ceph_option_strings.begin();
        i != ceph_option_strings.end();

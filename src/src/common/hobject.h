@@ -29,12 +29,20 @@ namespace ceph {
   class Formatter;
 }
 
+#ifndef UINT64_MAX
+#define UINT64_MAX (18446744073709551615ULL)
+#endif
+#ifndef INT64_MIN
+#define INT64_MIN ((int64_t)0x8000000000000000ll)
+#endif
+
 struct hobject_t {
   object_t oid;
   snapid_t snap;
-  uint32_t hash;
 private:
+  uint32_t hash;
   bool max;
+  filestore_hobject_key_t filestore_key_cache;
   static const int64_t POOL_IS_TEMP = -1;
 public:
   int64_t pool;
@@ -49,6 +57,14 @@ public:
   }
 
   string to_str() const;
+  
+  uint32_t get_hash() const { 
+    return hash;
+  }
+  void set_hash(uint32_t value) { 
+    hash = value;
+    build_filestore_key_cache();
+  }
 
   static bool match_hash(uint32_t to_check, uint32_t bits, uint32_t match) {
     return (match & ~((~0)<<bits)) == (to_check & ~((~0)<<bits));
@@ -58,33 +74,39 @@ public:
   }
 
   static hobject_t make_temp(const string &name) {
-    hobject_t ret(object_t(name), "", CEPH_NOSNAP, 0, POOL_IS_TEMP, "");
-    return ret;
+    return hobject_t(object_t(name), "", CEPH_NOSNAP, 0, POOL_IS_TEMP, "");
   }
   bool is_temp() const {
     return pool == POOL_IS_TEMP;
   }
-  
-  hobject_t() : snap(0), hash(0), max(false), pool(-1) {}
+
+  hobject_t() : snap(0), hash(0), max(false), pool(-1) {
+    build_filestore_key_cache();
+  }
 
   hobject_t(object_t oid, const string& key, snapid_t snap, uint64_t hash,
-	    int64_t pool, string nspace) :
-    oid(oid), snap(snap), hash(hash), max(false),
-    pool(pool), nspace(nspace),
-    key(oid.name == key ? string() : key) {}
+	    int64_t pool, string nspace)
+    : oid(oid), snap(snap), hash(hash), max(false),
+      pool(pool), nspace(nspace),
+      key(oid.name == key ? string() : key) {
+    build_filestore_key_cache();
+  }
 
   hobject_t(const sobject_t &soid, const string &key, uint32_t hash,
-	    int64_t pool, string nspace) :
-    oid(soid.oid), snap(soid.snap), hash(hash), max(false),
-    pool(pool), nspace(nspace),
-    key(soid.oid.name == key ? string() : key) {}
+	    int64_t pool, string nspace)
+    : oid(soid.oid), snap(soid.snap), hash(hash), max(false),
+      pool(pool), nspace(nspace),
+      key(soid.oid.name == key ? string() : key) {
+    build_filestore_key_cache();
+  }
 
   /// @return min hobject_t ret s.t. ret.hash == this->hash
   hobject_t get_boundary() const {
     if (is_max())
       return *this;
     hobject_t ret;
-    ret.hash = hash;
+    ret.set_hash(hash);
+    ret.pool = pool;
     return ret;
   }
 
@@ -125,7 +147,7 @@ public:
   /* Do not use when a particular hash function is needed */
   explicit hobject_t(const sobject_t &o) :
     oid(o.oid), snap(o.snap), max(false), pool(-1) {
-    hash = CEPH_HASH_NAMESPACE::hash<sobject_t>()(o);
+    set_hash(CEPH_HASH_NAMESPACE::hash<sobject_t>()(o));
   }
 
   // maximum sorted value.
@@ -170,10 +192,10 @@ public:
     return _reverse_nibbles(hash);
   }
   filestore_hobject_key_t get_filestore_key() const {
-    if (max)
-      return 0x100000000ull;
-    else
-      return get_filestore_key_u32();
+    return max ? 0x100000000ull : filestore_key_cache;
+  }
+  void build_filestore_key_cache() {    
+    filestore_key_cache = _reverse_nibbles(hash);
   }
 
   const string& get_effective_key() const {
@@ -231,11 +253,7 @@ WRITE_CMP_OPERATORS_7(hobject_t,
 		      snap)
 
 typedef version_t gen_t;
-typedef uint8_t shard_t;
 
-#ifndef UINT8_MAX
-#define UINT8_MAX (255)
-#endif
 #ifndef UINT64_MAX
 #define UINT64_MAX (18446744073709551615ULL)
 #endif
@@ -243,18 +261,25 @@ typedef uint8_t shard_t;
 struct ghobject_t {
   hobject_t hobj;
   gen_t generation;
-  shard_t shard_id;
+  shard_id_t shard_id;
 
 public:
-  static const shard_t NO_SHARD = UINT8_MAX;
-  static shard_t no_shard() { return NO_SHARD; }
   static const gen_t NO_GEN = UINT64_MAX;
 
-  ghobject_t() : generation(NO_GEN), shard_id(NO_SHARD) {}
+  ghobject_t() : generation(NO_GEN), shard_id(shard_id_t::NO_SHARD) {}
 
-  ghobject_t(const hobject_t &obj) : hobj(obj), generation(NO_GEN), shard_id(NO_SHARD) {}
+  ghobject_t(const hobject_t &obj) : hobj(obj), generation(NO_GEN), shard_id(shard_id_t::NO_SHARD) {}
 
-  ghobject_t(const hobject_t &obj, gen_t gen, shard_t shard) : hobj(obj), generation(gen), shard_id(shard) {}
+  ghobject_t(const hobject_t &obj, gen_t gen, shard_id_t shard) : hobj(obj), generation(gen), shard_id(shard) {}
+
+  static ghobject_t make_pgmeta(int64_t pool, uint32_t hash, shard_id_t shard) {
+    hobject_t h(object_t(), string(), CEPH_NOSNAP, hash, pool, string());
+    return ghobject_t(h, NO_GEN, shard);
+  }
+  bool is_pgmeta() const {
+    // make sure we are distinct from hobject_t(), which has pool -1
+    return hobj.pool >= 0 && hobj.oid.name.empty();
+  }
 
   bool match(uint32_t bits, uint32_t match) const {
     return hobj.match_hash(hobj.hash, bits, match);
@@ -264,7 +289,9 @@ public:
     if (hobj.is_max())
       return *this;
     ghobject_t ret;
-    ret.hobj.hash = hobj.hash;
+    ret.hobj.set_hash(hobj.hash);
+    ret.shard_id = shard_id;
+    ret.hobj.pool = hobj.pool;
     return ret;
   }
   filestore_hobject_key_t get_filestore_key_u32() const {
@@ -275,7 +302,7 @@ public:
   }
 
   bool is_degenerate() const {
-    return generation == NO_GEN && shard_id == NO_SHARD;
+    return generation == NO_GEN && shard_id == shard_id_t::NO_SHARD;
   }
 
   bool is_no_gen() const {
@@ -283,7 +310,7 @@ public:
   }
 
   bool is_no_shard() const {
-    return shard_id == NO_SHARD;
+    return shard_id == shard_id_t::NO_SHARD;
   }
 
   // maximum sorted value.

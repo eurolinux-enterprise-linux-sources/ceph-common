@@ -45,7 +45,7 @@ TEST(JsonFormatter, Simple2) {
   fmt.close_section();
   fmt.flush(oss);
   ASSERT_EQ(oss.str(), "{\"bar\":{\"int\":263882790666240,\
-\"unsigned\":9223372036854775809,\"float\":\"1.234000\"},\
+\"unsigned\":9223372036854775809,\"float\":1.234000},\
 \"string\":\"str\"}");
 }
 
@@ -177,4 +177,23 @@ TEST(XmlFormatter, NamespaceTest) {
   ASSERT_EQ(oss.str(), "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
     "<foo xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">"
     "<blah>hithere</blah><pi>3.14</pi></foo>");
+}
+
+TEST(XmlFormatter, DumpFormatNameSpaceTest) {
+  ostringstream oss1;
+  XMLFormatter fmt(false);
+
+  fmt.dump_format_ns("foo",
+		     "http://s3.amazonaws.com/doc/2006-03-01/",
+		     "%s","bar");
+  fmt.flush(oss1);
+  ASSERT_EQ(oss1.str(),
+	    "<foo xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">bar</foo>");
+
+  // Testing with a null ns..should be same as dump format
+  ostringstream oss2;
+  fmt.reset();
+  fmt.dump_format_ns("foo",NULL,"%s","bar");
+  fmt.flush(oss2);
+  ASSERT_EQ(oss2.str(),"<foo>bar</foo>");
 }

@@ -286,7 +286,8 @@ inline void decode(T &o, bufferlist& bl)
 #include <deque>
 #include <vector>
 #include <string>
-#include <boost/optional.hpp>
+#include <boost/optional/optional_io.hpp>
+#include <boost/tuple/tuple.hpp>
 
 #ifndef _BACKWARD_BACKWARD_WARNING_H
 #define _BACKWARD_BACKWARD_WARNING_H   // make gcc 4.3 shut up about hash_*
@@ -294,7 +295,6 @@ inline void decode(T &o, bufferlist& bl)
 #include "include/unordered_map.h"
 #include "include/unordered_set.h"
 
-#include "triple.h"
 
 // boost optional
 template<typename T>
@@ -306,6 +306,10 @@ inline void encode(const boost::optional<T> &p, bufferlist &bl)
     encode(p.get(), bl);
 }
 
+#pragma GCC diagnostic ignored "-Wpragmas"
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wuninitialized"
+#pragma GCC diagnostic ignored "-Wmaybe-uninitialized"
 template<typename T>
 inline void decode(boost::optional<T> &p, bufferlist::iterator &bp)
 {
@@ -316,6 +320,24 @@ inline void decode(boost::optional<T> &p, bufferlist::iterator &bp)
     p = t;
     decode(p.get(), bp);
   }
+}
+#pragma GCC diagnostic pop
+#pragma GCC diagnostic warning "-Wpragmas"
+
+//triple tuple
+template<class A, class B, class C>
+inline void encode(const boost::tuple<A, B, C> &t, bufferlist& bl)
+{
+  encode(boost::get<0>(t), bl);
+  encode(boost::get<1>(t), bl);
+  encode(boost::get<2>(t), bl);
+}
+template<class A, class B, class C>
+inline void decode(boost::tuple<A, B, C> &t, bufferlist::iterator &bp)
+{
+  decode(boost::get<0>(t), bp);
+  decode(boost::get<1>(t), bp);
+  decode(boost::get<2>(t), bp);
 }
 
 // pair
@@ -338,23 +360,6 @@ inline void decode(std::pair<A,B> &pa, bufferlist::iterator &p)
   decode(pa.second, p);
 }
 
-// triple
-template<class A, class B, class C>
-inline void encode(const triple<A,B,C> &t, bufferlist &bl)
-{
-  encode(t.first, bl);
-  encode(t.second, bl);
-  encode(t.third, bl);
-}
-template<class A, class B, class C>
-inline void decode(triple<A,B,C> &t, bufferlist::iterator &p)
-{
-  decode(t.first, p);
-  decode(t.second, p);
-  decode(t.third, p);
-}
-
-
 // list
 template<class T>
 inline void encode(const std::list<T>& ls, bufferlist& bl)
@@ -372,7 +377,7 @@ inline void encode(const std::list<T>& ls, bufferlist& bl)
     en = n;
     bl.copy_in(pos, sizeof(en), (char*)&en);
   } else {
-    __u32 n = ls.size();    // FIXME: this is slow on a list.
+    __u32 n = (__u32)(ls.size());    // FIXME: this is slow on a list.
     encode(n, bl);
     for (typename std::list<T>::const_iterator p = ls.begin(); p != ls.end(); ++p)
       encode(*p, bl);
@@ -407,7 +412,7 @@ inline void encode(const std::list<ceph::shared_ptr<T> >& ls, bufferlist& bl)
     en = n;
     bl.copy_in(pos, sizeof(en), (char*)&en);
   } else {
-    __u32 n = ls.size();    // FIXME: this is slow on a list.
+    __u32 n = (__u32)(ls.size());    // FIXME: this is slow on a list.
     encode(n, bl);
     for (typename std::list<ceph::shared_ptr<T> >::const_iterator p = ls.begin(); p != ls.end(); ++p)
       encode(**p, bl);
@@ -430,13 +435,35 @@ inline void decode(std::list<ceph::shared_ptr<T> >& ls, bufferlist::iterator& p)
 template<class T>
 inline void encode(const std::set<T>& s, bufferlist& bl)
 {
-  __u32 n = s.size();
+  __u32 n = (__u32)(s.size());
   encode(n, bl);
   for (typename std::set<T>::const_iterator p = s.begin(); p != s.end(); ++p)
     encode(*p, bl);
 }
 template<class T>
 inline void decode(std::set<T>& s, bufferlist::iterator& p)
+{
+  __u32 n;
+  decode(n, p);
+  s.clear();
+  while (n--) {
+    T v;
+    decode(v, p);
+    s.insert(v);
+  }
+}
+
+// multiset
+template<class T>
+inline void encode(const std::multiset<T>& s, bufferlist& bl)
+{
+  __u32 n = (__u32)(s.size());
+  encode(n, bl);
+  for (typename std::multiset<T>::const_iterator p = s.begin(); p != s.end(); ++p)
+    encode(*p, bl);
+}
+template<class T>
+inline void decode(std::multiset<T>& s, bufferlist::iterator& p)
 {
   __u32 n;
   decode(n, p);
@@ -471,7 +498,7 @@ inline void decode(std::vector<T*>& v, bufferlist::iterator& p)
 template<class T>
 inline void encode(const std::vector<T>& v, bufferlist& bl, uint64_t features)
 {
-  __u32 n = v.size();
+  __u32 n = (__u32)(v.size());
   encode(n, bl);
   for (typename std::vector<T>::const_iterator p = v.begin(); p != v.end(); ++p)
     encode(*p, bl, features);
@@ -479,7 +506,7 @@ inline void encode(const std::vector<T>& v, bufferlist& bl, uint64_t features)
 template<class T>
 inline void encode(const std::vector<T>& v, bufferlist& bl)
 {
-  __u32 n = v.size();
+  __u32 n = (__u32)(v.size());
   encode(n, bl);
   for (typename std::vector<T>::const_iterator p = v.begin(); p != v.end(); ++p)
     encode(*p, bl);
@@ -512,7 +539,7 @@ inline void decode_nohead(int len, std::vector<T>& v, bufferlist::iterator& p)
 template<class T>
 inline void encode(const std::vector<ceph::shared_ptr<T> >& v, bufferlist& bl)
 {
-  __u32 n = v.size();
+  __u32 n = (__u32)(v.size());
   encode(n, bl);
   for (typename std::vector<ceph::shared_ptr<T> >::const_iterator p = v.begin(); p != v.end(); ++p)
     if (*p)
@@ -561,7 +588,7 @@ inline void decode(std::map<T,U*>& m, bufferlist::iterator& p)
 template<class T, class U>
 inline void encode(const std::map<T,U>& m, bufferlist& bl)
 {
-  __u32 n = m.size();
+  __u32 n = (__u32)(m.size());
   encode(n, bl);
   for (typename std::map<T,U>::const_iterator p = m.begin(); p != m.end(); ++p) {
     encode(p->first, bl);
@@ -571,7 +598,7 @@ inline void encode(const std::map<T,U>& m, bufferlist& bl)
 template<class T, class U>
 inline void encode(const std::map<T,U>& m, bufferlist& bl, uint64_t features)
 {
-  __u32 n = m.size();
+  __u32 n = (__u32)(m.size());
   encode(n, bl);
   for (typename std::map<T,U>::const_iterator p = m.begin(); p != m.end(); ++p) {
     encode(p->first, bl, features);
@@ -632,7 +659,7 @@ inline void decode_nohead(int n, std::map<T,U>& m, bufferlist::iterator& p)
 template<class T, class U>
 inline void encode(const std::multimap<T,U>& m, bufferlist& bl)
 {
-  __u32 n = m.size();
+  __u32 n = (__u32)(m.size());
   encode(n, bl);
   for (typename std::multimap<T,U>::const_iterator p = m.begin(); p != m.end(); ++p) {
     encode(p->first, bl);
@@ -657,7 +684,7 @@ inline void decode(std::multimap<T,U>& m, bufferlist::iterator& p)
 template<class T, class U>
 inline void encode(const unordered_map<T,U>& m, bufferlist& bl)
 {
-  __u32 n = m.size();
+  __u32 n = (__u32)(m.size());
   encode(n, bl);
   for (typename unordered_map<T,U>::const_iterator p = m.begin(); p != m.end(); ++p) {
     encode(p->first, bl);
@@ -681,7 +708,7 @@ inline void decode(unordered_map<T,U>& m, bufferlist::iterator& p)
 template<class T>
 inline void encode(const ceph::unordered_set<T>& m, bufferlist& bl)
 {
-  __u32 n = m.size();
+  __u32 n = (__u32)(m.size());
   encode(n, bl);
   for (typename ceph::unordered_set<T>::const_iterator p = m.begin(); p != m.end(); ++p)
     encode(*p, bl);
@@ -735,14 +762,14 @@ inline void decode(std::deque<T>& ls, bufferlist::iterator& p)
  */
 #define ENCODE_START(v, compat, bl)			     \
   __u8 struct_v = v, struct_compat = compat;		     \
-  ::encode(struct_v, bl);				     \
-  ::encode(struct_compat, bl);				     \
-  buffer::list::iterator struct_compat_it = bl.end();	     \
+  ::encode(struct_v, (bl));				     \
+  ::encode(struct_compat, (bl));			     \
+  buffer::list::iterator struct_compat_it = (bl).end();	     \
   struct_compat_it.advance(-1);				     \
   ceph_le32 struct_len;				             \
   struct_len = 0;                                            \
-  ::encode(struct_len, bl);				     \
-  buffer::list::iterator struct_len_it = bl.end();	     \
+  ::encode(struct_len, (bl));				     \
+  buffer::list::iterator struct_len_it = (bl).end();	     \
   struct_len_it.advance(-4);				     \
   do {
 
@@ -754,7 +781,7 @@ inline void decode(std::deque<T>& ls, bufferlist::iterator& p)
  */
 #define ENCODE_FINISH_NEW_COMPAT(bl, new_struct_compat)			\
   } while (false);							\
-  struct_len = bl.length() - struct_len_it.get_off() - sizeof(struct_len); \
+  struct_len = (bl).length() - struct_len_it.get_off() - sizeof(struct_len); \
   struct_len_it.copy_in(4, (char *)&struct_len);			\
   if (new_struct_compat) {						\
     struct_compat = new_struct_compat;					\

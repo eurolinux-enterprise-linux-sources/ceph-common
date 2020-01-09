@@ -138,6 +138,10 @@ int chain_getxattr(const char *fn, const char *name, void *val, size_t size)
     size -= chunk_size;
 
     r = sys_getxattr(fn, raw_name, (char *)val + pos, chunk_size);
+    if (i && r == -ENODATA) {
+      ret = pos;
+      break;
+    }
     if (r < 0) {
       ret = r;
       break;
@@ -201,6 +205,10 @@ int chain_fgetxattr(int fd, const char *name, void *val, size_t size)
     size -= chunk_size;
 
     r = sys_fgetxattr(fd, raw_name, (char *)val + pos, chunk_size);
+    if (i && r == -ENODATA) {
+      ret = pos;
+      break;
+    }
     if (r < 0) {
       ret = r;
       break;
@@ -235,10 +243,9 @@ int chain_setxattr(const char *fn, const char *name, const void *val, size_t siz
   int i = 0, pos = 0;
   char raw_name[CHAIN_XATTR_MAX_NAME_LEN * 2 + 16];
   int ret = 0;
-  size_t chunk_size;
 
   do {
-    chunk_size = (size < CHAIN_XATTR_MAX_BLOCK_LEN ? size : CHAIN_XATTR_MAX_BLOCK_LEN);
+    size_t chunk_size = (size < CHAIN_XATTR_MAX_BLOCK_LEN ? size : CHAIN_XATTR_MAX_BLOCK_LEN);
     get_raw_xattr_name(name, i, raw_name, sizeof(raw_name));
     size -= chunk_size;
 
@@ -252,13 +259,15 @@ int chain_setxattr(const char *fn, const char *name, const void *val, size_t siz
     i++;
   } while (size);
 
-  /* if we're exactly at a chunk size, remove the next one (if wasn't removed
-     before) */
-  if (ret >= 0 && chunk_size == CHAIN_XATTR_MAX_BLOCK_LEN) {
-    get_raw_xattr_name(name, i, raw_name, sizeof(raw_name));
-    int r = sys_removexattr(fn, raw_name);
-    if (r < 0 && r != -ENODATA)
-      ret = r;
+  if (ret >= 0 ) {
+    int r;
+    do {
+      get_raw_xattr_name(name, i, raw_name, sizeof(raw_name));
+      r = sys_removexattr(fn, raw_name);
+      if (r < 0 && r != -ENODATA)
+	ret = r;
+      i++;
+    } while (r != -ENODATA);
   }
   
   return ret;
@@ -269,10 +278,9 @@ int chain_fsetxattr(int fd, const char *name, const void *val, size_t size)
   int i = 0, pos = 0;
   char raw_name[CHAIN_XATTR_MAX_NAME_LEN * 2 + 16];
   int ret = 0;
-  size_t chunk_size;
 
   do {
-    chunk_size = (size < CHAIN_XATTR_MAX_BLOCK_LEN ? size : CHAIN_XATTR_MAX_BLOCK_LEN);
+    size_t chunk_size = (size < CHAIN_XATTR_MAX_BLOCK_LEN ? size : CHAIN_XATTR_MAX_BLOCK_LEN);
     get_raw_xattr_name(name, i, raw_name, sizeof(raw_name));
     size -= chunk_size;
 
@@ -286,13 +294,15 @@ int chain_fsetxattr(int fd, const char *name, const void *val, size_t size)
     i++;
   } while (size);
 
-  /* if we're exactly at a chunk size, remove the next one (if wasn't removed
-     before) */
-  if (ret >= 0 && chunk_size == CHAIN_XATTR_MAX_BLOCK_LEN) {
-    get_raw_xattr_name(name, i, raw_name, sizeof(raw_name));
-    int r = sys_fremovexattr(fd, raw_name);
-    if (r < 0 && r != -ENODATA)
-      ret = r;
+  if (ret >= 0) {
+    int r;
+    do {
+      get_raw_xattr_name(name, i, raw_name, sizeof(raw_name));
+      r = sys_fremovexattr(fd, raw_name);
+      if (r < 0 && r != -ENODATA)
+	ret = r;
+      i++;
+    } while (r != -ENODATA);
   }
   
   return ret;

@@ -32,7 +32,6 @@ struct librados::IoCtxImpl {
   atomic_t ref_cnt;
   RadosClient *client;
   int64_t poolid;
-  string pool_name;
   snapid_t snap_seq;
   ::SnapContext snapc;
   uint64_t assert_ver;
@@ -47,18 +46,19 @@ struct librados::IoCtxImpl {
   xlist<AioCompletionImpl*> aio_write_list;
   map<ceph_tid_t, std::list<AioCompletionImpl*> > aio_write_waiters;
 
-  Mutex *lock;
+  Mutex cached_pool_names_lock;
+  std::list<std::string> cached_pool_names;
+
   Objecter *objecter;
 
   IoCtxImpl();
-  IoCtxImpl(RadosClient *c, Objecter *objecter, Mutex *client_lock,
-	    int poolid, const char *pool_name, snapid_t s);
+  IoCtxImpl(RadosClient *c, Objecter *objecter,
+	    int64_t poolid, snapid_t s);
 
   void dup(const IoCtxImpl& rhs) {
     // Copy everything except the ref count
     client = rhs.client;
     poolid = rhs.poolid;
-    pool_name = rhs.pool_name;
     snap_seq = rhs.snap_seq;
     snapc = rhs.snapc;
     assert_ver = rhs.assert_ver;
@@ -66,7 +66,6 @@ struct librados::IoCtxImpl {
     last_objver = rhs.last_objver;
     notify_timeout = rhs.notify_timeout;
     oloc = rhs.oloc;
-    lock = rhs.lock;
     objecter = rhs.objecter;
   }
 
@@ -91,6 +90,8 @@ struct librados::IoCtxImpl {
     return poolid;
   }
 
+  const string& get_cached_pool_name();
+
   uint32_t get_object_hash_position(const std::string& oid);
   uint32_t get_object_pg_hash_position(const std::string& oid);
 
@@ -110,10 +111,11 @@ struct librados::IoCtxImpl {
                                        ::SnapContext& snapc, uint64_t snapid);
 
   // io
+  int nlist(Objecter::NListContext *context, int max_entries);
+  uint32_t nlist_seek(Objecter::NListContext *context, uint32_t pos);
   int list(Objecter::ListContext *context, int max_entries);
   uint32_t list_seek(Objecter::ListContext *context, uint32_t pos);
   int create(const object_t& oid, bool exclusive);
-  int create(const object_t& oid, bool exclusive, const std::string& category);
   int write(const object_t& oid, bufferlist& bl, size_t len, uint64_t off);
   int append(const object_t& oid, bufferlist& bl, size_t len);
   int write_full(const object_t& oid, bufferlist& bl);
@@ -185,6 +187,7 @@ struct librados::IoCtxImpl {
   int aio_exec(const object_t& oid, AioCompletionImpl *c, const char *cls,
 	       const char *method, bufferlist& inbl, bufferlist *outbl);
   int aio_stat(const object_t& oid, AioCompletionImpl *c, uint64_t *psize, time_t *pmtime);
+  int aio_cancel(AioCompletionImpl *c);
 
   int pool_change_auid(unsigned long long auid);
   int pool_change_auid_async(unsigned long long auid, PoolAsyncCompletionImpl *c);
@@ -195,12 +198,14 @@ struct librados::IoCtxImpl {
 		  bufferlist *pbl);
 
   void set_sync_op_version(version_t ver);
-  int watch(const object_t& oid, uint64_t ver, uint64_t *cookie, librados::WatchCtx *ctx);
-  int unwatch(const object_t& oid, uint64_t cookie);
-  int notify(const object_t& oid, uint64_t ver, bufferlist& bl);
-  int _notify_ack(
-    const object_t& oid, uint64_t notify_id, uint64_t ver,
-    uint64_t cookie);
+  int watch(const object_t& oid, uint64_t *cookie, librados::WatchCtx *ctx,
+	    librados::WatchCtx2 *ctx2);
+  int watch_check(uint64_t cookie);
+  int unwatch(uint64_t cookie);
+  int notify(const object_t& oid, bufferlist& bl, uint64_t timeout_ms,
+	     bufferlist *preplybl, char **preply_buf, size_t *preply_buf_len);
+  int notify_ack(const object_t& oid, uint64_t notify_id, uint64_t cookie,
+		 bufferlist& bl);
 
   int set_alloc_hint(const object_t& oid,
                      uint64_t expected_object_size,
@@ -211,30 +216,6 @@ struct librados::IoCtxImpl {
   void set_assert_src_version(const object_t& oid, uint64_t ver);
   void set_notify_timeout(uint32_t timeout);
 
-  struct C_NotifyComplete : public librados::WatchCtx {
-    Mutex *lock;
-    Cond *cond;
-    bool *done;
-
-    C_NotifyComplete(Mutex *_l, Cond *_c, bool *_d);
-    void notify(uint8_t opcode, uint64_t ver, bufferlist& bl);
-  };
 };
 
-namespace librados {
-struct WatchContext : public RefCountedWaitObject {
-  IoCtxImpl *io_ctx_impl;
-  const object_t oid;
-  librados::WatchCtx *ctx;
-  uint64_t linger_id;
-  uint64_t cookie;
-
-  WatchContext(IoCtxImpl *io_ctx_impl_,
-	       const object_t& _oc,
-	       librados::WatchCtx *_ctx);
-  ~WatchContext();
-  void notify(Mutex *lock, uint8_t opcode, uint64_t ver, uint64_t notify_id,
-	      bufferlist& payload);
-};
-}
 #endif

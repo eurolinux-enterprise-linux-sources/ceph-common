@@ -167,8 +167,8 @@ public:
 private:
   void reset_to_type(impl_type_t type);
 };
-WRITE_CLASS_ENCODER(HitSet);
-WRITE_CLASS_ENCODER(HitSet::Params);
+WRITE_CLASS_ENCODER(HitSet)
+WRITE_CLASS_ENCODER(HitSet::Params)
 
 typedef boost::shared_ptr<HitSet> HitSetRef;
 
@@ -210,11 +210,11 @@ public:
     return false;
   }
   void insert(const hobject_t& o) {
-    hits.insert(o.hash);
+    hits.insert(o.get_hash());
     ++count;
   }
   bool contains(const hobject_t& o) const {
-    return hits.count(o.hash);
+    return hits.count(o.get_hash());
   }
   unsigned insert_count() const {
     return count;
@@ -431,10 +431,10 @@ public:
   }
 
   void insert(const hobject_t& o) {
-    bloom.insert(o.hash);
+    bloom.insert(o.get_hash());
   }
   bool contains(const hobject_t& o) const {
-    return bloom.contains(o.hash);
+    return bloom.contains(o.get_hash());
   }
   unsigned insert_count() const {
     return bloom.element_count();

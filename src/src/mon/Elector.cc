@@ -52,8 +52,8 @@ void Elector::bump_epoch(epoch_t e)
   dout(10) << "bump_epoch " << epoch << " to " << e << dendl;
   assert(epoch <= e);
   epoch = e;
-  MonitorDBStore::Transaction t;
-  t.put(Monitor::MONITOR_NAME, "election_epoch", epoch);
+  MonitorDBStore::TransactionRef t(new MonitorDBStore::Transaction);
+  t->put(Monitor::MONITOR_NAME, "election_epoch", epoch);
   mon->store->apply_transaction(t);
 
   mon->join_election();
@@ -214,6 +214,9 @@ void Elector::handle_propose(MMonElection *m)
 
   assert(m->epoch % 2 == 1); // election
   uint64_t required_features = mon->get_required_features();
+  dout(10) << __func__ << " required features " << required_features
+           << ", peer features " << m->get_connection()->get_features()
+           << dendl;
   if ((required_features ^ m->get_connection()->get_features()) &
       required_features) {
     dout(5) << " ignoring propose from mon" << from
@@ -283,6 +286,7 @@ void Elector::handle_ack(MMonElection *m)
       required_features) {
     dout(5) << " ignoring ack from mon" << from
 	    << " without required features" << dendl;
+    m->put();
     return;
   }
   
@@ -365,7 +369,7 @@ void Elector::nak_old_peer(MMonElection *m)
 					   mon->monmap);
     reply->quorum_features = required_features;
     mon->features.encode(reply->sharing_bl);
-    mon->messenger->send_message(reply, m->get_connection());
+    m->get_connection()->send_message(reply);
   }
   m->put();
 }
@@ -429,9 +433,9 @@ void Elector::dispatch(Message *m)
 		<< ", taking it"
 		<< dendl;
 	mon->monmap->decode(em->monmap_bl);
-        MonitorDBStore::Transaction t;
-        t.put("monmap", mon->monmap->epoch, em->monmap_bl);
-        t.put("monmap", "last_committed", mon->monmap->epoch);
+        MonitorDBStore::TransactionRef t(new MonitorDBStore::Transaction);
+        t->put("monmap", mon->monmap->epoch, em->monmap_bl);
+        t->put("monmap", "last_committed", mon->monmap->epoch);
         mon->store->apply_transaction(t);
 	//mon->monmon()->paxos->stash_latest(mon->monmap->epoch, em->monmap_bl);
 	cancel_timer();

@@ -1,3 +1,6 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// vim: ts=8 sw=2 smarttab
+
 #ifndef RGW_HTTP_ERRORS_H_
 #define RGW_HTTP_ERRORS_H_
 
@@ -34,6 +37,8 @@ const static struct rgw_http_errors RGW_HTTP_ERRORS[] = {
     { ERR_LENGTH_REQUIRED, 411, "MissingContentLength" },
     { EACCES, 403, "AccessDenied" },
     { EPERM, 403, "AccessDenied" },
+    { ERR_SIGNATURE_NO_MATCH, 403, "SignatureDoesNotMatch" },
+    { ERR_INVALID_ACCESS_KEY, 403, "InvalidAccessKeyId" },
     { ERR_USER_SUSPENDED, 403, "UserSuspended" },
     { ERR_REQUEST_TIME_SKEWED, 403, "RequestTimeTooSkewed" },
     { ERR_QUOTA_EXCEEDED, 403, "QuotaExceeded" },

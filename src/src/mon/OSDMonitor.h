@@ -26,6 +26,7 @@
 using namespace std;
 
 #include "include/types.h"
+#include "common/simple_cache.hpp"
 #include "msg/Messenger.h"
 
 #include "osd/OSDMap.h"
@@ -139,6 +140,10 @@ private:
    * optimization to try to avoid sending the same inc maps twice.
    */
   map<int,epoch_t> osd_epoch;
+  SimpleLRU<version_t, bufferlist> inc_osd_cache;
+  SimpleLRU<version_t, bufferlist> full_osd_cache;
+
+  void note_osd_has_epoch(int osd, epoch_t epoch);
 
   void check_failures(utime_t now);
   bool check_failure(utime_t now, int target_osd, failure_info_t& fi);
@@ -158,7 +163,7 @@ public:
 private:
   void update_from_paxos(bool *need_bootstrap);
   void create_pending();  // prepare a new pending
-  void encode_pending(MonitorDBStore::Transaction *t);
+  void encode_pending(MonitorDBStore::TransactionRef t);
   void on_active();
   void on_shutdown();
 
@@ -166,7 +171,7 @@ private:
    * we haven't delegated full version stashing to paxosservice for some time
    * now, making this function useless in current context.
    */
-  virtual void encode_full(MonitorDBStore::Transaction *t) { }
+  virtual void encode_full(MonitorDBStore::TransactionRef t) { }
   /**
    * do not let paxosservice periodically stash full osdmaps, or we will break our
    * locally-managed full maps.  (update_from_paxos loads the latest and writes them
@@ -182,7 +187,7 @@ private:
    * This ensures that anyone post-sync will have enough to rebuild their
    * full osdmaps.
    */
-  void encode_trim_extra(MonitorDBStore::Transaction *tx, version_t first);
+  void encode_trim_extra(MonitorDBStore::TransactionRef tx, version_t first);
 
   void update_msgr_features();
   int check_cluster_features(uint64_t features, stringstream &ss);
@@ -217,12 +222,17 @@ private:
   MOSDMap *build_incremental(epoch_t first, epoch_t last);
   void send_full(PaxosServiceMessage *m);
   void send_incremental(PaxosServiceMessage *m, epoch_t first);
-  void send_incremental(epoch_t first, entity_inst_t& dest, bool onetime);
+  void send_incremental(epoch_t first, MonSession *session, bool onetime);
 
-  int reweight_by_utilization(int oload, std::string& out_str);
+  int reweight_by_utilization(int oload, std::string& out_str, bool by_pg,
+			      const set<int64_t> *pools);
+
+  void print_utilization(ostream &out, Formatter *f, bool tree) const;
 
   bool check_source(PaxosServiceMessage *m, uuid_d fsid);
  
+  bool preprocess_get_osdmap(class MMonGetOSDMap *m);
+
   bool preprocess_mark_me_down(class MOSDMarkMeDown *m);
 
   friend class C_AckMarkedDown;
@@ -244,6 +254,14 @@ private:
   bool prepare_pgtemp(class MOSDPGTemp *m);
 
   int _check_remove_pool(int64_t pool, const pg_pool_t *pi, ostream *ss);
+  bool _check_become_tier(
+      int64_t tier_pool_id, const pg_pool_t *tier_pool,
+      int64_t base_pool_id, const pg_pool_t *base_pool,
+      int *err, ostream *ss) const;
+  bool _check_remove_tier(
+      int64_t base_pool_id, const pg_pool_t *base_pool,
+      int *err, ostream *ss) const;
+
   int _prepare_remove_pool(int64_t pool, ostream *ss);
   int _prepare_rename_pool(int64_t pool, string newname);
 
@@ -252,10 +270,16 @@ private:
   bool prepare_pool_op (MPoolOp *m);
   bool prepare_pool_op_create (MPoolOp *m);
   bool prepare_pool_op_delete(MPoolOp *m);
+  int crush_rename_bucket(const string& srcname,
+			  const string& dstname,
+			  ostream *ss);
   int crush_ruleset_create_erasure(const string &name,
 				   const string &profile,
 				   int *ruleset,
 				   stringstream &ss);
+  int get_crush_ruleset(const string &ruleset_name,
+			int *crush_ruleset,
+			stringstream &ss);
   int get_erasure_code(const string &erasure_code_profile,
 		       ErasureCodeInterfaceRef *erasure_code,
 		       stringstream &ss) const;
@@ -284,6 +308,7 @@ private:
                        unsigned pg_num, unsigned pgp_num,
 		       const string &erasure_code_profile,
                        const unsigned pool_type,
+                       const uint64_t expected_num_objects,
 		       stringstream &ss);
   int prepare_new_pool(MPoolOp *m);
 
@@ -358,9 +383,7 @@ private:
   bool prepare_remove_snaps(struct MRemoveSnaps *m);
 
  public:
-  OSDMonitor(Monitor *mn, Paxos *p, string service_name)
-  : PaxosService(mn, p, service_name),
-    thrash_map(0), thrash_last_up_osd(-1) { }
+  OSDMonitor(Monitor *mn, Paxos *p, string service_name);
 
   void tick();  // check state, take actions
 
@@ -372,6 +395,7 @@ private:
   bool prepare_command(MMonCommand *m);
   bool prepare_command_impl(MMonCommand *m, map<string,cmd_vartype> &cmdmap);
 
+  int set_crash_replay_interval(const int64_t pool_id, const uint32_t cri);
   int prepare_command_pool_set(map<string,cmd_vartype> &cmdmap,
                                stringstream& ss);
 
@@ -383,6 +407,9 @@ private:
   void send_latest_now_nodelete(PaxosServiceMessage *m, epoch_t start=0) {
     send_incremental(m, start);
   }
+
+  int get_version(version_t ver, bufferlist& bl);
+  int get_version_full(version_t ver, bufferlist& bl);
 
   epoch_t blacklist(const entity_addr_t& a, utime_t until);
 

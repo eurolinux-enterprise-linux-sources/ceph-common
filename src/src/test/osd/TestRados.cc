@@ -1,4 +1,5 @@
 // -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// vim: ts=8 sw=2 smarttab
 #include "common/Mutex.h"
 #include "common/Cond.h"
 #include "common/errno.h"
@@ -54,9 +55,9 @@ public:
       cout << m_op << ": write initial oid " << oid.str() << std::endl;
       context.oid_not_flushing.insert(oid.str());
       if (m_ec_pool) {
-	return new WriteOp(m_op, &context, oid.str(), true);
+	return new WriteOp(m_op, &context, oid.str(), true, true);
       } else {
-	return new WriteOp(m_op, &context, oid.str(), false);
+	return new WriteOp(m_op, &context, oid.str(), false, true);
       }
     } else if (m_op >= m_ops) {
       return NULL;
@@ -104,7 +105,14 @@ private:
       oid = *(rand_choose(context.oid_not_in_use));
       cout << m_op << ": " << "write oid " << oid << " current snap is "
 	   << context.current_snap << std::endl;
-      return new WriteOp(m_op, &context, oid, false, m_stats);
+      return new WriteOp(m_op, &context, oid, false, false, m_stats);
+
+    case TEST_OP_WRITE_EXCL:
+      oid = *(rand_choose(context.oid_not_in_use));
+      cout << m_op << ": " << "write (excl) oid "
+	   << oid << " current snap is "
+	   << context.current_snap << std::endl;
+      return new WriteOp(m_op, &context, oid, false, true, m_stats);
 
     case TEST_OP_DELETE:
       oid = *(rand_choose(context.oid_not_in_use));
@@ -205,7 +213,13 @@ private:
       oid = *(rand_choose(context.oid_not_in_use));
       cout << "append oid " << oid << " current snap is "
 	   << context.current_snap << std::endl;
-      return new WriteOp(m_op, &context, oid, true, m_stats);
+      return new WriteOp(m_op, &context, oid, true, false, m_stats);
+
+    case TEST_OP_APPEND_EXCL:
+      oid = *(rand_choose(context.oid_not_in_use));
+      cout << "append oid (excl) " << oid << " current snap is "
+	   << context.current_snap << std::endl;
+      return new WriteOp(m_op, &context, oid, true, true, m_stats);
 
     default:
       cerr << m_op << ": Invalid op type " << type << std::endl;
@@ -234,6 +248,7 @@ int main(int argc, char **argv)
   int64_t min_stride_size = -1, max_stride_size = -1;
   int max_seconds = 0;
   bool pool_snaps = false;
+  bool write_fadvise_dontneed = false;
 
   struct {
     TestOpType op;
@@ -242,6 +257,7 @@ int main(int argc, char **argv)
   } op_types[] = {
     { TEST_OP_READ, "read", true },
     { TEST_OP_WRITE, "write", false },
+    { TEST_OP_WRITE_EXCL, "write_excl", false },
     { TEST_OP_DELETE, "delete", true },
     { TEST_OP_SNAP_CREATE, "snap_create", true },
     { TEST_OP_SNAP_REMOVE, "snap_remove", true },
@@ -257,11 +273,12 @@ int main(int argc, char **argv)
     { TEST_OP_CACHE_TRY_FLUSH, "cache_try_flush", true },
     { TEST_OP_CACHE_EVICT, "cache_evict", true },
     { TEST_OP_APPEND, "append", true },
+    { TEST_OP_APPEND_EXCL, "append_excl", true },
     { TEST_OP_READ /* grr */, NULL },
   };
 
   map<TestOpType, unsigned int> op_weights;
-  string pool_name = "data";
+  string pool_name = "rbd";
   bool ec_pool = false;
   bool no_omap = false;
 
@@ -286,6 +303,8 @@ int main(int argc, char **argv)
       no_omap = true;
     else if (strcmp(argv[i], "--pool-snaps") == 0)
       pool_snaps = true;
+    else if (strcmp(argv[i], "--write-fadvise-dontneed") == 0)
+      write_fadvise_dontneed = true;
     else if (strcmp(argv[i], "--ec-pool") == 0) {
       if (!op_weights.empty()) {
 	cerr << "--ec-pool must be specified prior to any ops" << std::endl;
@@ -381,6 +400,7 @@ int main(int argc, char **argv)
     max_stride_size,
     no_omap,
     pool_snaps,
+    write_fadvise_dontneed,
     id);
 
   TestOpStat stats;

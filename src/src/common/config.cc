@@ -148,7 +148,7 @@ md_config_t::md_config_t()
 #undef OPTION
 #undef SUBSYS
 #undef DEFAULT_SUBSYS
-  lock("md_config_t", true)
+  lock("md_config_t", true, false)
 {
   init_subsys();
 }
@@ -659,7 +659,7 @@ void md_config_t::set_val_or_die(const char *key, const char *val)
   assert(ret == 0);
 }
 
-int md_config_t::set_val(const char *key, const char *val, bool meta)
+int md_config_t::set_val(const char *key, const char *val, bool meta, bool safe)
 {
   Mutex::Locker l(lock);
   if (!key)
@@ -696,7 +696,7 @@ int md_config_t::set_val(const char *key, const char *val, bool meta)
   for (int i = 0; i < NUM_CONFIG_OPTIONS; ++i) {
     config_option *opt = &config_optionsp[i];
     if (strcmp(opt->name, k.c_str()) == 0) {
-      if (internal_safe_to_start_threads) {
+      if (safe && internal_safe_to_start_threads) {
 	// If threads have been started...
 	if ((opt->type == OPT_STR) || (opt->type == OPT_ADDR) ||
 	    (opt->type == OPT_UUID)) {
@@ -877,7 +877,7 @@ int md_config_t::set_val_raw(const char *val, const config_option *opt)
   switch (opt->type) {
     case OPT_INT: {
       std::string err;
-      int f = strict_sistrtoll(val, &err);
+      int f = strict_si_cast<int>(val, &err);
       if (!err.empty())
 	return -EINVAL;
       *(int*)opt->conf_ptr(this) = f;
@@ -885,7 +885,7 @@ int md_config_t::set_val_raw(const char *val, const config_option *opt)
     }
     case OPT_LONGLONG: {
       std::string err;
-      long long f = strict_sistrtoll(val, &err);
+      long long f = strict_si_cast<long long>(val, &err);
       if (!err.empty())
 	return -EINVAL;
       *(long long*)opt->conf_ptr(this) = f;
@@ -894,12 +894,22 @@ int md_config_t::set_val_raw(const char *val, const config_option *opt)
     case OPT_STR:
       *(std::string*)opt->conf_ptr(this) = val ? val : "";
       return 0;
-    case OPT_FLOAT:
-      *(float*)opt->conf_ptr(this) = atof(val);
+    case OPT_FLOAT: {
+      std::string err;
+      float f = strict_strtof(val, &err);
+      if (!err.empty())
+	return -EINVAL;
+      *(float*)opt->conf_ptr(this) = f;
       return 0;
-    case OPT_DOUBLE:
-      *(double*)opt->conf_ptr(this) = atof(val);
+    }
+    case OPT_DOUBLE: {
+      std::string err;
+      double f = strict_strtod(val, &err);
+      if (!err.empty())
+	return -EINVAL;
+      *(double*)opt->conf_ptr(this) = f;
       return 0;
+    }
     case OPT_BOOL:
       if (strcasecmp(val, "false") == 0)
 	*(bool*)opt->conf_ptr(this) = false;
@@ -915,7 +925,7 @@ int md_config_t::set_val_raw(const char *val, const config_option *opt)
       return 0;
     case OPT_U32: {
       std::string err;
-      int f = strict_sistrtoll(val, &err);
+      int f = strict_si_cast<int>(val, &err);
       if (!err.empty())
 	return -EINVAL;
       *(uint32_t*)opt->conf_ptr(this) = f;
@@ -923,7 +933,7 @@ int md_config_t::set_val_raw(const char *val, const config_option *opt)
     }
     case OPT_U64: {
       std::string err;
-      long long f = strict_sistrtoll(val, &err);
+      uint64_t f = strict_si_cast<uint64_t>(val, &err);
       if (!err.empty())
 	return -EINVAL;
       *(uint64_t*)opt->conf_ptr(this) = f;
@@ -947,7 +957,7 @@ int md_config_t::set_val_raw(const char *val, const config_option *opt)
 }
 
 static const char *CONF_METAVARIABLES[] =
-  { "cluster", "type", "name", "host", "num", "id", "pid" };
+  { "cluster", "type", "name", "host", "num", "id", "pid", "cctid" };
 static const int NUM_CONF_METAVARIABLES =
       (sizeof(CONF_METAVARIABLES) / sizeof(CONF_METAVARIABLES[0]));
 
@@ -1059,6 +1069,8 @@ bool md_config_t::expand_meta(std::string &origval,
 	  out += name.get_id().c_str();
 	else if (var == "pid")
 	  out += stringify(getpid());
+	else if (var == "cctid")
+	  out += stringify((unsigned long long)this);
 	else
 	  assert(0); // unreachable
 	expanded = true;
@@ -1096,6 +1108,39 @@ bool md_config_t::expand_meta(std::string &origval,
   // override the original value with the expanded value
   origval = out;
   return found_meta;
+}
+
+void md_config_t::diff(
+    const md_config_t *other,
+    map<string,pair<string,string> > *diff,
+    set<string> *unknown)
+{
+  Mutex::Locker l(lock);
+
+  char local_buf[4096];
+  char other_buf[4096];
+  for (int i = 0; i < NUM_CONFIG_OPTIONS; i++) {
+    config_option *opt = &config_optionsp[i];
+    memset(local_buf, 0, sizeof(local_buf));
+    memset(other_buf, 0, sizeof(other_buf));
+
+    char *other_val = other_buf;
+    int err = other->get_val(opt->name, &other_val, sizeof(other_buf));
+    if (err < 0) {
+      if (err == -ENOENT) {
+        unknown->insert(opt->name);
+      }
+      continue;
+    }
+
+    char *local_val = local_buf;
+    err = _get_val(opt->name, &local_val, sizeof(local_buf));
+    if (err != 0)
+      continue;
+
+    if (strcmp(local_val, other_val))
+      diff->insert(make_pair(opt->name, make_pair(local_val, other_val)));
+  }
 }
 
 md_config_obs_t::

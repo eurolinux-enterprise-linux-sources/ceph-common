@@ -1,3 +1,5 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// vim: ts=8 sw=2 smarttab
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -54,7 +56,12 @@ int RGWClientIO::write(const char *buf, int len)
     return ret;
 
   if (account)
-    bytes_sent += len;
+    bytes_sent += ret;
+
+  if (ret < len) {
+    /* sent less than tried to send, error out */
+    return -EIO;
+  }
 
   return 0;
 }

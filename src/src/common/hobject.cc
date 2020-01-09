@@ -130,8 +130,18 @@ void hobject_t::decode(bufferlist::iterator& bl)
   if (struct_v >= 4) {
     ::decode(nspace, bl);
     ::decode(pool, bl);
+    // newer OSDs have a different hobject_t::get_min(); decode it properly.
+    if (pool == INT64_MIN &&
+	hash == 0 &&
+	snap == 0 &&
+	!max &&
+	oid.name.empty()) {
+      pool = -1;
+      assert(is_min());
+    }
   }
   DECODE_FINISH(bl);
+  build_filestore_key_cache();
 }
 
 void hobject_t::decode(json_spirit::Value& v)
@@ -155,6 +165,7 @@ void hobject_t::decode(json_spirit::Value& v)
     else if (p.name_ == "namespace")
       nspace = p.value_.get_str();
   }
+  build_filestore_key_cache();
 }
 
 void hobject_t::dump(Formatter *f) const
@@ -184,7 +195,7 @@ ostream& operator<<(ostream& out, const hobject_t& o)
 {
   if (o.is_max())
     return out << "MAX";
-  out << std::hex << o.hash << std::dec;
+  out << std::hex << o.get_hash() << std::dec;
   if (o.get_key().length())
     out << "." << o.get_key();
   out << "/" << o.oid << "/" << o.snap;
@@ -224,24 +235,48 @@ void ghobject_t::decode(bufferlist::iterator& bl)
   if (struct_v >= 4) {
     ::decode(hobj.nspace, bl);
     ::decode(hobj.pool, bl);
+    // newer OSDs have a different hobject_t::get_min(); decode it properly.
+    if (hobj.pool == INT64_MIN &&
+	hobj.hash == 0 &&
+	hobj.snap == 0 &&
+	!hobj.max &&
+	hobj.oid.name.empty()) {
+      hobj.pool = -1;
+      assert(hobj.is_min());
+    }
   }
   if (struct_v >= 5) {
     ::decode(generation, bl);
     ::decode(shard_id, bl);
   } else {
     generation = ghobject_t::NO_GEN;
-    shard_id = ghobject_t::NO_SHARD;
+    shard_id = shard_id_t::NO_SHARD;
   }
   DECODE_FINISH(bl);
+  hobj.set_hash(hobj.get_hash()); //to call build_filestore_key_cache();
+}
+
+void ghobject_t::decode(json_spirit::Value& v)
+{
+  hobj.decode(v);
+  using namespace json_spirit;
+  Object& o = v.get_obj();
+  for (Object::size_type i=0; i<o.size(); i++) {
+    Pair& p = o[i];
+    if (p.name_ == "generation")
+      generation = p.value_.get_uint64();
+    else if (p.name_ == "shard_id")
+      shard_id.id = p.value_.get_int();
+  }
 }
 
 void ghobject_t::dump(Formatter *f) const
 {
   hobj.dump(f);
-  if (generation != NO_GEN) {
+  if (generation != NO_GEN)
     f->dump_int("generation", generation);
+  if (shard_id != shard_id_t::NO_SHARD)
     f->dump_int("shard_id", shard_id);
-  }
 }
 
 void ghobject_t::generate_test_instances(list<ghobject_t*>& o)
@@ -252,29 +287,29 @@ void ghobject_t::generate_test_instances(list<ghobject_t*>& o)
   o.push_back(new ghobject_t(hobject_t(object_t("oname"), string(), 1, 234, -1, "")));
 
   o.push_back(new ghobject_t(hobject_t(object_t("oname2"), string("okey"), CEPH_NOSNAP,
-	67, 0, "n1"), 1, 0));
+        67, 0, "n1"), 1, shard_id_t(0)));
   o.push_back(new ghobject_t(hobject_t(object_t("oname2"), string("okey"), CEPH_NOSNAP,
-	67, 0, "n1"), 1, 1));
+        67, 0, "n1"), 1, shard_id_t(1)));
   o.push_back(new ghobject_t(hobject_t(object_t("oname2"), string("okey"), CEPH_NOSNAP,
-	67, 0, "n1"), 1, 2));
+        67, 0, "n1"), 1, shard_id_t(2)));
   o.push_back(new ghobject_t(hobject_t(object_t("oname3"), string("oname3"),
-	CEPH_SNAPDIR, 910, 1, "n2"), 1, 0));
+        CEPH_SNAPDIR, 910, 1, "n2"), 1, shard_id_t(0)));
   o.push_back(new ghobject_t(hobject_t(object_t("oname3"), string("oname3"),
-	CEPH_SNAPDIR, 910, 1, "n2"), 2, 0));
+        CEPH_SNAPDIR, 910, 1, "n2"), 2, shard_id_t(0)));
   o.push_back(new ghobject_t(hobject_t(object_t("oname3"), string("oname3"),
-	CEPH_SNAPDIR, 910, 1, "n2"), 3, 0));
+        CEPH_SNAPDIR, 910, 1, "n2"), 3, shard_id_t(0)));
   o.push_back(new ghobject_t(hobject_t(object_t("oname3"), string("oname3"),
-	CEPH_SNAPDIR, 910, 1, "n2"), 3, 1));
+        CEPH_SNAPDIR, 910, 1, "n2"), 3, shard_id_t(1)));
   o.push_back(new ghobject_t(hobject_t(object_t("oname3"), string("oname3"),
-	CEPH_SNAPDIR, 910, 1, "n2"), 3, 2));
+        CEPH_SNAPDIR, 910, 1, "n2"), 3, shard_id_t(2)));
 }
 
 ostream& operator<<(ostream& out, const ghobject_t& o)
 {
   out << o.hobj;
   if (o.generation != ghobject_t::NO_GEN ||
-      o.shard_id != ghobject_t::NO_SHARD) {
-    assert(o.shard_id != ghobject_t::NO_SHARD);
+      o.shard_id != shard_id_t::NO_SHARD) {
+    assert(o.shard_id != shard_id_t::NO_SHARD);
     out << "/" << o.generation << "/" << (unsigned)(o.shard_id);
   }
   return out;

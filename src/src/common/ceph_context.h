@@ -17,6 +17,8 @@
 
 #include <iostream>
 #include <stdint.h>
+#include <string>
+#include <set>
 
 #include "include/buffer.h"
 #include "include/atomic.h"
@@ -29,6 +31,7 @@ class PerfCountersCollection;
 class md_config_obs_t;
 struct md_config_t;
 class CephContextHook;
+class CephContextObs;
 class CryptoNone;
 class CryptoAES;
 class CryptoHandler;
@@ -58,6 +61,10 @@ private:
   ~CephContext();
   atomic_t nref;
 public:
+  class AssociatedSingletonObject {
+   public:
+    virtual ~AssociatedSingletonObject() {}
+  };
   CephContext *get() {
     nref.inc();
     return this;
@@ -69,6 +76,9 @@ public:
 
   md_config_t *_conf;
   ceph::log::Log *_log;
+
+  /* init ceph::crypto */
+  void init_crypto();
 
   /* Start the Ceph Context's service thread */
   void start_service_thread();
@@ -102,10 +112,26 @@ public:
   void do_command(std::string command, cmdmap_t& cmdmap, std::string format,
 		  bufferlist *out);
 
+  template<typename T>
+  void lookup_or_create_singleton_object(T*& p, const std::string &name) {
+    ceph_spin_lock(&_associated_objs_lock);
+    if (!_associated_objs.count(name)) {
+      p = new T(this);
+      _associated_objs[name] = reinterpret_cast<AssociatedSingletonObject*>(p);
+    } else {
+      p = reinterpret_cast<T*>(_associated_objs[name]);
+    }
+    ceph_spin_unlock(&_associated_objs_lock);
+  }
   /**
    * get a crypto handler
    */
   CryptoHandler *get_crypto_handler(int type);
+
+  /// check if experimental feature is enable, and emit appropriate warnings
+  bool check_experimental_feature_enabled(const std::string& feature);
+  bool check_experimental_feature_enabled(const std::string& feature,
+					  std::ostream *message);
 
 private:
   CephContext(const CephContext &rhs);
@@ -115,6 +141,8 @@ private:
   void join_service_thread();
 
   uint32_t _module_type;
+
+  bool _crypto_inited;
 
   /* libcommon service thread.
    * SIGHUP wakes this thread, which then reopens logfiles */
@@ -138,9 +166,21 @@ private:
 
   ceph::HeartbeatMap *_heartbeat_map;
 
+  ceph_spinlock_t _associated_objs_lock;
+  std::map<std::string, AssociatedSingletonObject*> _associated_objs;
+
   // crypto
   CryptoNone *_crypto_none;
   CryptoAES *_crypto_aes;
+
+  // experimental
+  CephContextObs *_cct_obs;
+  ceph_spinlock_t _feature_lock;
+  std::set<std::string> _experimental_features;
+
+  md_config_obs_t *_lockdep_obs;
+
+  friend class CephContextObs;
 };
 
 #endif

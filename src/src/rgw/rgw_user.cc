@@ -1,3 +1,6 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// vim: ts=8 sw=2 smarttab
+
 #include <errno.h>
 
 #include <string>
@@ -6,6 +9,7 @@
 #include "common/errno.h"
 #include "common/Formatter.h"
 #include "common/ceph_json.h"
+#include "common/RWLock.h"
 #include "rgw_rados.h"
 #include "rgw_acl.h"
 
@@ -192,24 +196,59 @@ int rgw_store_user_info(RGWRados *store, RGWUserInfo& info, RGWUserInfo *old_inf
   return ret;
 }
 
+struct user_info_entry {
+  RGWUserInfo info;
+  RGWObjVersionTracker objv_tracker;
+  time_t mtime;
+};
+
+static RGWChainedCacheImpl<user_info_entry> uinfo_cache;
+
 int rgw_get_user_info_from_index(RGWRados *store, string& key, rgw_bucket& bucket, RGWUserInfo& info,
                                  RGWObjVersionTracker *objv_tracker, time_t *pmtime)
 {
+  user_info_entry e;
+  if (uinfo_cache.find(key, &e)) {
+    info = e.info;
+    if (objv_tracker)
+      *objv_tracker = e.objv_tracker;
+    if (pmtime)
+      *pmtime = e.mtime;
+    return 0;
+  }
+
   bufferlist bl;
   RGWUID uid;
+  RGWObjectCtx obj_ctx(store);
 
-  int ret = rgw_get_system_obj(store, NULL, bucket, key, bl, NULL, pmtime);
+  int ret = rgw_get_system_obj(store, obj_ctx, bucket, key, bl, NULL, &e.mtime);
   if (ret < 0)
     return ret;
+
+  rgw_cache_entry_info cache_info;
 
   bufferlist::iterator iter = bl.begin();
   try {
     ::decode(uid, iter);
-    return rgw_get_user_info_by_uid(store, uid.user_id, info, objv_tracker);
+    int ret = rgw_get_user_info_by_uid(store, uid.user_id, e.info, &e.objv_tracker, NULL, &cache_info);
+    if (ret < 0) {
+      return ret;
+    }
   } catch (buffer::error& err) {
     ldout(store->ctx(), 0) << "ERROR: failed to decode user info, caught buffer::error" << dendl;
     return -EIO;
   }
+
+  list<rgw_cache_entry_info *> cache_info_entries;
+  cache_info_entries.push_back(&cache_info);
+
+  uinfo_cache.put(store, key, &e, cache_info_entries);
+
+  info = e.info;
+  if (objv_tracker)
+    *objv_tracker = e.objv_tracker;
+  if (pmtime)
+    *pmtime = e.mtime;
 
   return 0;
 }
@@ -219,12 +258,14 @@ int rgw_get_user_info_from_index(RGWRados *store, string& key, rgw_bucket& bucke
  * returns: 0 on success, -ERR# on failure (including nonexistence)
  */
 int rgw_get_user_info_by_uid(RGWRados *store, string& uid, RGWUserInfo& info,
-                             RGWObjVersionTracker *objv_tracker, time_t *pmtime)
+                             RGWObjVersionTracker *objv_tracker, time_t *pmtime,
+                             rgw_cache_entry_info *cache_info)
 {
   bufferlist bl;
   RGWUID user_id;
 
-  int ret = rgw_get_system_obj(store, NULL, store->zone.user_uid_pool, uid, bl, objv_tracker, pmtime);
+  RGWObjectCtx obj_ctx(store);
+  int ret = rgw_get_system_obj(store, obj_ctx, store->zone.user_uid_pool, uid, bl, objv_tracker, pmtime, NULL, cache_info);
   if (ret < 0)
     return ret;
 
@@ -279,7 +320,7 @@ extern int rgw_get_user_info_by_access_key(RGWRados *store, string& access_key, 
 int rgw_remove_key_index(RGWRados *store, RGWAccessKey& access_key)
 {
   rgw_obj obj(store->zone.user_keys_pool, access_key.id);
-  int ret = store->delete_system_obj(NULL, obj);
+  int ret = store->delete_system_obj(obj);
   return ret;
 }
 
@@ -301,14 +342,14 @@ int rgw_remove_uid_index(RGWRados *store, string& uid)
 int rgw_remove_email_index(RGWRados *store, string& email)
 {
   rgw_obj obj(store->zone.user_email_pool, email);
-  int ret = store->delete_system_obj(NULL, obj);
+  int ret = store->delete_system_obj(obj);
   return ret;
 }
 
 int rgw_remove_swift_name_index(RGWRados *store, string& swift_name)
 {
   rgw_obj obj(store->zone.user_swift_pool, swift_name);
-  int ret = store->delete_system_obj(NULL, obj);
+  int ret = store->delete_system_obj(obj);
   return ret;
 }
 
@@ -370,7 +411,7 @@ int rgw_delete_user(RGWRados *store, RGWUserInfo& info, RGWObjVersionTracker& ob
 
   rgw_obj email_obj(store->zone.user_email_pool, info.user_email);
   ldout(store->ctx(), 10) << "removing email index: " << info.user_email << dendl;
-  ret = store->delete_system_obj(NULL, email_obj);
+  ret = store->delete_system_obj(email_obj);
   if (ret < 0 && ret != -ENOENT) {
     ldout(store->ctx(), 0) << "ERROR: could not remove " << info.user_id << ":" << email_obj << ", should be fixed (err=" << ret << ")" << dendl;
     return ret;
@@ -380,7 +421,7 @@ int rgw_delete_user(RGWRados *store, RGWUserInfo& info, RGWObjVersionTracker& ob
   rgw_get_buckets_obj(info.user_id, buckets_obj_id);
   rgw_obj uid_bucks(store->zone.user_uid_pool, buckets_obj_id);
   ldout(store->ctx(), 10) << "removing user buckets index" << dendl;
-  ret = store->delete_system_obj(NULL, uid_bucks);
+  ret = store->delete_system_obj(uid_bucks);
   if (ret < 0 && ret != -ENOENT) {
     ldout(store->ctx(), 0) << "ERROR: could not remove " << info.user_id << ":" << uid_bucks << ", should be fixed (err=" << ret << ")" << dendl;
     return ret;
@@ -582,7 +623,8 @@ static void dump_swift_keys_info(Formatter *f, RGWUserInfo &info)
   f->close_section();
 }
 
-static void dump_user_info(Formatter *f, RGWUserInfo &info)
+static void dump_user_info(Formatter *f, RGWUserInfo &info,
+                           RGWStorageStats *stats = NULL)
 {
   f->open_object_section("user_info");
 
@@ -596,6 +638,9 @@ static void dump_user_info(Formatter *f, RGWUserInfo &info)
   dump_access_keys_info(f, info);
   dump_swift_keys_info(f, info);
   info.caps.dump(f);
+  if (stats) {
+    encode_json("stats", *stats, f);
+  }
 
   f->close_section();
 }
@@ -666,15 +711,6 @@ bool RGWAccessKeyPool::check_existing_key(RGWUserAdminOpState& op_state)
 
   switch (key_type) {
   case KEY_TYPE_SWIFT:
-    kiter = swift_keys->find(kid);
-
-    existing_key = (kiter != swift_keys->end());
-    if (existing_key)
-      break;
-
-    if (swift_kid.empty())
-      return false;
-
     kiter = swift_keys->find(swift_kid);
 
     existing_key = (kiter != swift_keys->end());
@@ -737,9 +773,6 @@ int RGWAccessKeyPool::check_op(RGWUserAdminOpState& op_state,
     return -EACCES;
   }
 
-  std::string access_key = op_state.get_access_key();
-  std::string secret_key = op_state.get_secret_key();
-
   int32_t key_type = op_state.get_key_type();
 
   // if a key type wasn't specified set it to s3
@@ -748,8 +781,9 @@ int RGWAccessKeyPool::check_op(RGWUserAdminOpState& op_state,
 
   op_state.set_key_type(key_type);
 
-  /* see if the access key or secret key was specified */
-  if (key_type == KEY_TYPE_S3 && !op_state.will_gen_access() && access_key.empty()) {
+  /* see if the access key was specified */
+  if (key_type == KEY_TYPE_S3 && !op_state.will_gen_access() && 
+      op_state.get_access_key().empty()) {
     set_err_msg(err_msg, "empty access key");
     return -EINVAL;
   }
@@ -775,7 +809,6 @@ int RGWAccessKeyPool::generate_key(RGWUserAdminOpState& op_state, std::string *e
   int key_type = op_state.get_key_type();
   bool gen_access = op_state.will_gen_access();
   bool gen_secret = op_state.will_gen_secret();
-  std::string subuser = op_state.get_subuser();
 
   if (!keys_allowed) {
     set_err_msg(err_msg, "access keys not allowed for this user");
@@ -815,7 +848,7 @@ int RGWAccessKeyPool::generate_key(RGWUserAdminOpState& op_state, std::string *e
   } else if (gen_secret) {
     char secret_key_buf[SECRET_KEY_LEN + 1];
 
-    ret = gen_rand_base64(g_ceph_context, secret_key_buf, sizeof(secret_key_buf));
+    ret = gen_rand_alphanumeric_plain(g_ceph_context, secret_key_buf, sizeof(secret_key_buf));
     if (ret < 0) {
       set_err_msg(err_msg, "unable to generate secret key");
       return ret;
@@ -845,7 +878,7 @@ int RGWAccessKeyPool::generate_key(RGWUserAdminOpState& op_state, std::string *e
     } while (!rgw_get_user_info_by_access_key(store, id, duplicate_check));
   }
 
-  if (key_type == KEY_TYPE_SWIFT && gen_access) {
+  if (key_type == KEY_TYPE_SWIFT) {
     id = op_state.build_default_swift_kid();
     if (id.empty()) {
       set_err_msg(err_msg, "empty swift access key");
@@ -929,7 +962,7 @@ int RGWAccessKeyPool::modify_key(RGWUserAdminOpState& op_state, std::string *err
 
     int ret;
     int key_buf_size = sizeof(secret_key_buf);
-    ret  = gen_rand_base64(g_ceph_context, secret_key_buf, key_buf_size);
+    ret = gen_rand_alphanumeric_plain(g_ceph_context, secret_key_buf, key_buf_size);
     if (ret < 0) {
       set_err_msg(err_msg, "unable to generate secret key");
       return ret;
@@ -1697,7 +1730,8 @@ int RGWUser::execute_add(RGWUserAdminOpState& op_state, std::string *err_msg)
 
   // fail if the user exists already
   if (op_state.has_existing_user()) {
-    if ((user_email.empty() || old_info.user_email == user_email) &&
+    if (!op_state.exclusive &&
+        (user_email.empty() || old_info.user_email == user_email) &&
         old_info.display_name == display_name) {
       return execute_modify(op_state, err_msg);
     }
@@ -1733,7 +1767,13 @@ int RGWUser::execute_add(RGWUserAdminOpState& op_state, std::string *err_msg)
   if (!user_email.empty())
     user_info.user_email = user_email;
 
-  user_info.max_buckets = op_state.get_max_buckets();
+  CephContext *cct = store->ctx();
+  if (op_state.max_buckets_specified) {
+    user_info.max_buckets = op_state.get_max_buckets();
+  } else {
+    user_info.max_buckets = cct->_conf->rgw_user_max_buckets;
+  }
+
   user_info.suspended = op_state.get_suspension_status();
   user_info.system = op_state.system;
 
@@ -1923,11 +1963,8 @@ int RGWUser::execute_modify(RGWUserAdminOpState& op_state, std::string *err_msg)
 
   std::string old_email = old_info.user_email;
   if (!op_email.empty()) {
-    bool same_email = false;
-    same_email = (old_email.compare(op_email) == 0);
-
     // make sure we are not adding a duplicate email
-    if (!same_email) {
+    if (old_email.compare(op_email) != 0) {
       ret = rgw_get_user_info_by_email(store, op_email, duplicate_check);
       if (ret >= 0 && duplicate_check.user_id != user_id) {
         set_err_msg(err_msg, "cannot add duplicate email");
@@ -1942,13 +1979,8 @@ int RGWUser::execute_modify(RGWUserAdminOpState& op_state, std::string *err_msg)
   if (!display_name.empty())
     user_info.display_name = display_name;
 
-  // will be set to RGW_DEFAULT_MAX_BUCKETS by default
-  uint32_t max_buckets = op_state.get_max_buckets();
-
-  ldout(store->ctx(), 0) << "max_buckets=" << max_buckets << " specified=" << op_state.max_buckets_specified << dendl;
-
   if (op_state.max_buckets_specified)
-    user_info.max_buckets = max_buckets;
+    user_info.max_buckets = op_state.get_max_buckets();
 
   if (op_state.system_specified)
     user_info.system = op_state.system;
@@ -2094,9 +2126,20 @@ int RGWUserAdminOp_User::info(RGWRados *store, RGWUserAdminOpState& op_state,
   if (ret < 0)
     return ret;
 
+  RGWStorageStats stats;
+  RGWStorageStats *arg_stats = NULL;
+  if (op_state.fetch_stats) {
+    int ret = store->get_user_stats(info.user_id, stats);
+    if (ret < 0) {
+      return ret;
+    }
+
+    arg_stats = &stats;
+  }
+
   flusher.start(0);
 
-  dump_user_info(formatter, info);
+  dump_user_info(formatter, info, arg_stats);
   flusher.flush();
 
   return 0;
@@ -2472,8 +2515,10 @@ public:
   }
 };
 
-void rgw_user_init(RGWMetadataManager *mm)
+void rgw_user_init(RGWRados *store)
 {
+  uinfo_cache.init(store);
+
   user_meta_handler = new RGWUserMetadataHandler;
-  mm->register_handler(user_meta_handler);
+  store->meta_mgr->register_handler(user_meta_handler);
 }

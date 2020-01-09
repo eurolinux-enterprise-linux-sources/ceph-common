@@ -23,17 +23,16 @@
 #include "messages/MAuthReply.h"
 #include "messages/MMonGlobalID.h"
 
-#include "include/str_list.h"
 #include "common/Timer.h"
+#include "common/config.h"
+#include "common/cmdparse.h"
 
 #include "auth/AuthServiceHandler.h"
 #include "auth/KeyRing.h"
 
 #include "osd/osd_types.h"
 
-#include "common/config.h"
 #include "include/assert.h"
-#include "common/cmdparse.h"
 #include "include/str_list.h"
 
 #define dout_subsys ceph_subsys_mon
@@ -190,8 +189,8 @@ void AuthMonitor::update_from_paxos(bool *need_bootstrap)
     mon->key_server.set_ver(keys_ver);
 
     if (keys_ver == 1 && mon->is_keyring_required()) {
-      MonitorDBStore::Transaction t;
-      t.erase("mkfs", "keyring");
+      MonitorDBStore::TransactionRef t(new MonitorDBStore::Transaction);
+      t->erase("mkfs", "keyring");
       mon->store->apply_transaction(t);
     }
   }
@@ -228,7 +227,7 @@ void AuthMonitor::create_pending()
   dout(10) << "create_pending v " << (get_last_committed() + 1) << dendl;
 }
 
-void AuthMonitor::encode_pending(MonitorDBStore::Transaction *t)
+void AuthMonitor::encode_pending(MonitorDBStore::TransactionRef t)
 {
   dout(10) << __func__ << " v " << (get_last_committed() + 1) << dendl;
 
@@ -245,7 +244,7 @@ void AuthMonitor::encode_pending(MonitorDBStore::Transaction *t)
   put_last_committed(t, version);
 }
 
-void AuthMonitor::encode_full(MonitorDBStore::Transaction *t)
+void AuthMonitor::encode_full(MonitorDBStore::TransactionRef t)
 {
   version_t version = mon->key_server.get_ver();
   // do not stash full version 0 as it will never be removed nor read
@@ -339,7 +338,8 @@ uint64_t AuthMonitor::assign_global_id(MAuth *m, bool should_increase_max)
 
   // bump the max?
   while (mon->is_leader() &&
-	 next_global_id >= max_global_id - g_conf->mon_globalid_prealloc / 2) {
+	 (max_global_id < g_conf->mon_globalid_prealloc ||
+	  next_global_id >= max_global_id - g_conf->mon_globalid_prealloc / 2)) {
     increase_max_global_id();
   }
 
@@ -558,7 +558,7 @@ bool AuthMonitor::preprocess_command(MMonCommand *m)
 
   string format;
   cmd_getval(g_ceph_context, cmdmap, "format", format, string("plain"));
-  boost::scoped_ptr<Formatter> f(new_formatter(format));
+  boost::scoped_ptr<Formatter> f(Formatter::create(format));
 
   if (prefix == "auth export") {
     KeyRing keyring;
@@ -686,7 +686,7 @@ bool AuthMonitor::prepare_command(MMonCommand *m)
 
   string format;
   cmd_getval(g_ceph_context, cmdmap, "format", format, string("plain"));
-  boost::scoped_ptr<Formatter> f(new_formatter(format));
+  boost::scoped_ptr<Formatter> f(Formatter::create(format));
 
   MonSession *session = m->get_session();
   if (!session) {
@@ -860,6 +860,11 @@ bool AuthMonitor::prepare_command(MMonCommand *m)
 	     !entity_name.empty()) {
     // auth get-or-create <name> [mon osdcapa osd osdcapb ...]
 
+    if (!valid_caps(caps_vec, &ss)) {
+      err = -EINVAL;
+      goto done;
+    }
+
     // do we have it?
     EntityAuth entity_auth;
     if (mon->key_server.get_auth(entity, entity_auth)) {
@@ -950,6 +955,11 @@ bool AuthMonitor::prepare_command(MMonCommand *m)
     if (!mon->key_server.get_auth(auth_inc.name, auth_inc.auth)) {
       ss << "couldn't find entry " << auth_inc.name;
       err = -ENOENT;
+      goto done;
+    }
+
+    if (!valid_caps(caps_vec, &ss)) {
+      err = -EINVAL;
       goto done;
     }
 

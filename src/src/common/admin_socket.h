@@ -32,7 +32,7 @@ class AdminSocketHook {
 public:
   virtual bool call(std::string command, cmdmap_t &cmdmap, std::string format,
 		    bufferlist& out) = 0;
-  virtual ~AdminSocketHook() {};
+  virtual ~AdminSocketHook() {}
 };
 
 class AdminSocket : public Thread
@@ -79,6 +79,7 @@ private:
   void shutdown();
 
   std::string create_shutdown_pipe(int *pipe_rd, int *pipe_wr);
+  std::string destroy_shutdown_pipe();
   std::string bind_and_listen(const std::string &sock_path, int *fd);
 
   void *entry();

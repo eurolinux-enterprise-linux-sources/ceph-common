@@ -233,7 +233,8 @@ TEST_F(OSDMapTest, PrimaryTempRespected) {
 
   pg_t rawpg(0, 0, -1);
   pg_t pgid = osdmap.raw_pg_to_pg(rawpg);
-  vector<int> up_osds, acting_osds;
+  vector<int> up_osds;
+  vector<int> acting_osds;
   int up_primary, acting_primary;
 
   osdmap.pg_to_up_acting_osds(pgid, &up_osds, &up_primary,
@@ -305,7 +306,7 @@ TEST_F(OSDMapTest, KeepsNecessaryTemps) {
     }
   }
   if (i == (int)get_num_osds())
-    ASSERT_EQ(0, "did not find unused OSD for temp mapping");
+    FAIL() << "did not find unused OSD for temp mapping";
 
   pgtemp_map.new_pg_temp[pgid] = up_osds;
   pgtemp_map.new_primary_temp[pgid] = up_osds[1];
@@ -323,7 +324,7 @@ TEST_F(OSDMapTest, PrimaryAffinity) {
 
   /*
   osdmap.print(cout);
-  Formatter *f = new_formatter("json-pretty");
+  Formatter *f = Formatter::create("json-pretty");
   f->open_object_section("CRUSH");
   osdmap.crush->dump(f);
   f->close_section();

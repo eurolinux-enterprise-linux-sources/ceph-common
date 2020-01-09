@@ -17,7 +17,6 @@
 #include "CDentry.h"
 #include "CInode.h"
 #include "CDir.h"
-#include "Anchor.h"
 
 #include "MDS.h"
 #include "MDCache.h"
@@ -44,7 +43,7 @@ LockType CDentry::versionlock_type(CEPH_LOCK_DVERSION);
 
 // CDentry
 
-ostream& operator<<(ostream& out, CDentry& dn)
+ostream& operator<<(ostream& out, const CDentry& dn)
 {
   filepath path;
   dn.make_path(path);
@@ -138,13 +137,13 @@ inodeno_t CDentry::get_ino()
 }
 */
 
-pair<int,int> CDentry::authority()
+mds_authority_t CDentry::authority() const
 {
   return dir->authority();
 }
 
 
-void CDentry::add_waiter(uint64_t tag, Context *c)
+void CDentry::add_waiter(uint64_t tag, MDSInternalContextBase *c)
 {
   // wait on the directory?
   if (tag & (WAIT_UNFREEZE|WAIT_SINGLEAUTH)) {
@@ -214,7 +213,7 @@ void CDentry::mark_new()
   state_set(STATE_NEW);
 }
 
-void CDentry::make_path_string(string& s)
+void CDentry::make_path_string(string& s) const
 {
   if (dir) {
     dir->inode->make_path_string(s);
@@ -225,7 +224,7 @@ void CDentry::make_path_string(string& s)
   s.append(name.data(), name.length());
 }
 
-void CDentry::make_path(filepath& fp)
+void CDentry::make_path(filepath& fp) const
 {
   assert(dir);
   if (dir->inode->is_base())
@@ -253,20 +252,6 @@ void CDentry::make_path(string& s, inodeno_t tobase)
   s += name;
 }
 */
-
-/** make_anchor_trace
- * construct an anchor trace for this dentry, as if it were linked to *in.
- */
-void CDentry::make_anchor_trace(vector<Anchor>& trace, CInode *in)
-{
-  // start with parent dir inode
-  dir->inode->make_anchor_trace(trace);
-
-  // add this inode (in my dirfrag) to the end
-  trace.push_back(Anchor(in->ino(), dir->ino(), get_hash(), 0, 0));
-  dout(10) << "make_anchor_trace added " << trace.back() << dendl;
-}
-
 
 /*
  * we only add ourselves to remote_parents when the linkage is
@@ -345,7 +330,7 @@ CDentry::linkage_t *CDentry::pop_projected_linkage()
 // ----------------------------
 // auth pins
 
-int CDentry::get_num_dir_auth_pins()
+int CDentry::get_num_dir_auth_pins() const
 {
   assert(!is_projected());
   if (get_linkage()->is_primary())
@@ -353,7 +338,7 @@ int CDentry::get_num_dir_auth_pins()
   return auth_pins;
 }
 
-bool CDentry::can_auth_pin()
+bool CDentry::can_auth_pin() const
 {
   assert(dir);
   return dir->can_auth_pin();
@@ -409,25 +394,15 @@ void CDentry::adjust_nested_auth_pins(int adjustment, int diradj, void *by)
   dir->adjust_nested_auth_pins(adjustment, diradj, by);
 }
 
-bool CDentry::is_frozen()
+bool CDentry::is_frozen() const
 {
   return dir->is_frozen();
 }
 
-bool CDentry::is_freezing()
+bool CDentry::is_freezing() const
 {
   return dir->is_freezing();
 }
-
-
-void CDentry::adjust_nested_anchors(int by)
-{
-  nested_anchors += by;
-  dout(20) << "adjust_nested_anchors by " << by << " -> " << nested_anchors << dendl;
-  assert(nested_anchors >= 0);
-  dir->adjust_nested_anchors(by);
-}
-
 
 void CDentry::decode_replica(bufferlist::iterator& p, bool is_new)
 {
@@ -567,9 +542,15 @@ void CDentry::remove_client_lease(ClientLease *l, Locker *locker)
     locker->eval_gather(&lock);
 }
 
+void CDentry::remove_client_leases(Locker *locker)
+{
+  while (!client_lease_map.empty())
+    remove_client_lease(client_lease_map.begin()->second, locker);
+}
+
 void CDentry::_put()
 {
-  if (get_num_ref() <= (int)is_dirty() + 1) {
+  if (get_num_ref() <= ((int)is_dirty() + 1)) {
     CDentry::linkage_t *dnl = get_projected_linkage();
     if (dnl->is_primary()) {
       CInode *in = dnl->get_inode();

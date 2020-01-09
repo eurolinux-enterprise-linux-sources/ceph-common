@@ -15,6 +15,7 @@
 #include "SnapServer.h"
 #include "MDS.h"
 #include "osd/OSDMap.h"
+#include "osdc/Objecter.h"
 #include "mon/MonClient.h"
 
 #include "include/types.h"
@@ -28,7 +29,7 @@
 
 #define dout_subsys ceph_subsys_mds
 #undef dout_prefix
-#define dout_prefix *_dout << "mds." << mds->get_nodeid() << ".snap "
+#define dout_prefix *_dout << "mds." << rank << ".snap "
 
 
 void SnapServer::reset_state()
@@ -36,12 +37,27 @@ void SnapServer::reset_state()
   last_snap = 1;  /* snapid 1 reserved for initial root snaprealm */
   snaps.clear();
   need_to_purge.clear();
+
+  // find any removed snapshot in data pools
+  snapid_t first_free = 0;
+  const OSDMap *osdmap = mds->objecter->get_osdmap_read();
+  for (set<int64_t>::const_iterator p = mds->mdsmap->get_data_pools().begin();
+       p != mds->mdsmap->get_data_pools().end();
+       ++p) {
+    const pg_pool_t *pi = osdmap->get_pg_pool(*p);
+    if (!pi->removed_snaps.empty() &&
+        pi->removed_snaps.range_end() > first_free)
+      first_free = pi->removed_snaps.range_end();
+  }
+  mds->objecter->put_osdmap_read();
+  if (first_free > last_snap)
+    last_snap = first_free;
 }
 
 
 // SERVER
 
-void SnapServer::_prepare(bufferlist &bl, uint64_t reqid, int bymds)
+void SnapServer::_prepare(bufferlist &bl, uint64_t reqid, mds_rank_t bymds)
 {
   bufferlist::iterator p = bl.begin();
   __u32 op;
@@ -185,30 +201,6 @@ void SnapServer::_server_update(bufferlist& bl)
 
 void SnapServer::handle_query(MMDSTableRequest *req)
 {
-  /*  bufferlist::iterator p = req->bl.begin();
-  inodeno_t curino;
-  ::decode(curino, p);
-  dout(7) << "handle_lookup " << *req << " ino " << curino << dendl;
-
-  vector<Anchor> trace;
-  while (true) {
-    assert(anchor_map.count(curino) == 1);
-    Anchor &anchor = anchor_map[curino];
-    
-    dout(10) << "handle_lookup  adding " << anchor << dendl;
-    trace.insert(trace.begin(), anchor);  // lame FIXME
-    
-    if (anchor.dirino < MDS_INO_BASE) break;
-    curino = anchor.dirino;
-  }
-
-  // reply
-  MMDSTableRequest *reply = new MMDSTableRequest(table, TABLE_OP_QUERY_REPLY, req->reqid, version);
-  ::encode(curino, req->bl);
-  ::encode(trace, req->bl);
-  mds->send_message_mds(reply, req->get_source().num());
-
-  */
   req->put();
 }
 
@@ -225,11 +217,12 @@ void SnapServer::check_osd_map(bool force)
   map<int, vector<snapid_t> > all_purge;
   map<int, vector<snapid_t> > all_purged;
 
+  const OSDMap *osdmap = mds->objecter->get_osdmap_read();
   for (map<int, set<snapid_t> >::iterator p = need_to_purge.begin();
        p != need_to_purge.end();
        ++p) {
     int id = p->first;
-    const pg_pool_t *pi = mds->osdmap->get_pg_pool(id);
+    const pg_pool_t *pi = osdmap->get_pg_pool(id);
     for (set<snapid_t>::iterator q = p->second.begin();
 	 q != p->second.end();
 	 ++q) {
@@ -241,6 +234,7 @@ void SnapServer::check_osd_map(bool force)
       }
     }
   }
+  mds->objecter->put_osdmap_read();
 
   if (!all_purged.empty()) {
     // prepare to remove from need_to_purge list

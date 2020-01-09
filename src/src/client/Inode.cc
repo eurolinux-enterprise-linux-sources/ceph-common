@@ -11,6 +11,7 @@ ostream& operator<<(ostream &out, Inode &in)
 {
   out << in.vino() << "("
       << "ref=" << in._ref
+      << " ll_ref=" << in.ll_ref
       << " cap_refs=" << in.cap_refs
       << " open=" << in.open_by_mode
       << " mode=" << oct << in.mode << dec
@@ -19,7 +20,7 @@ ostream& operator<<(ostream &out, Inode &in)
       << " caps=" << ccap_string(in.caps_issued());
   if (!in.caps.empty()) {
     out << "(";
-    for (map<int,Cap*>::iterator p = in.caps.begin(); p != in.caps.end(); ++p) {
+    for (map<mds_rank_t,Cap*>::iterator p = in.caps.begin(); p != in.caps.end(); ++p) {
       if (p != in.caps.begin())
         out << ',';
       out << p->first << '=' << ccap_string(p->second->issued);
@@ -42,6 +43,9 @@ ostream& operator<<(ostream &out, Inode &in)
 
   if (in.is_dir() && in.has_dir_layout())
     out << " has_dir_layout";
+
+  if (in.quota.is_enable())
+    out << " " << in.quota;
 
   out << ' ' << &in << ")";
   return out;
@@ -137,7 +141,7 @@ int Inode::put_cap_ref(int cap)
 
 bool Inode::is_any_caps()
 {
-  return caps.size();
+  return !caps.empty() || snap_caps;
 }
 
 bool Inode::cap_is_valid(Cap* cap)
@@ -157,7 +161,7 @@ int Inode::caps_issued(int *implemented)
 {
   int c = snap_caps;
   int i = 0;
-  for (map<int,Cap*>::iterator it = caps.begin();
+  for (map<mds_rank_t,Cap*>::iterator it = caps.begin();
        it != caps.end();
        ++it)
     if (cap_is_valid(it->second)) {
@@ -175,7 +179,7 @@ void Inode::touch_cap(Cap *cap)
   cap->session->caps.push_back(&cap->cap_item);
 }
 
-void Inode::try_touch_cap(int mds)
+void Inode::try_touch_cap(mds_rank_t mds)
 {
   if (caps.count(mds))
     touch_cap(caps[mds]);
@@ -194,7 +198,7 @@ bool Inode::caps_issued_mask(unsigned mask)
     return true;
   }
   // try any cap
-  for (map<int,Cap*>::iterator it = caps.begin();
+  for (map<mds_rank_t,Cap*>::iterator it = caps.begin();
        it != caps.end();
        ++it) {
     if (cap_is_valid(it->second)) {
@@ -207,7 +211,7 @@ bool Inode::caps_issued_mask(unsigned mask)
   }
   if ((c & mask) == mask) {
     // bah.. touch them all
-    for (map<int,Cap*>::iterator it = caps.begin();
+    for (map<mds_rank_t,Cap*>::iterator it = caps.begin();
 	 it != caps.end();
 	 ++it)
       touch_cap(it->second);
@@ -359,7 +363,7 @@ void Inode::dump(Formatter *f) const
   }
 
   f->open_array_section("caps");
-  for (map<int,Cap*>::const_iterator p = caps.begin(); p != caps.end(); ++p) {
+  for (map<mds_rank_t,Cap*>::const_iterator p = caps.begin(); p != caps.end(); ++p) {
     f->open_object_section("cap");
     f->dump_int("mds", p->first);
     if (p->second == auth_cap)

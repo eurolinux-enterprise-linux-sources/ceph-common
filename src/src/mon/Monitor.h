@@ -52,6 +52,7 @@
 
 #include <memory>
 #include "include/memory.h"
+#include "include/str_map.h"
 #include <errno.h>
 
 
@@ -66,9 +67,9 @@ enum {
   l_cluster_num_osd_up,
   l_cluster_num_osd_in,
   l_cluster_osd_epoch,
-  l_cluster_osd_kb,
-  l_cluster_osd_kb_used,
-  l_cluster_osd_kb_avail,
+  l_cluster_osd_bytes,
+  l_cluster_osd_bytes_used,
+  l_cluster_osd_bytes_avail,
   l_cluster_num_pool,
   l_cluster_num_pg,
   l_cluster_num_pg_active_clean,
@@ -76,6 +77,7 @@ enum {
   l_cluster_num_pg_peering,
   l_cluster_num_object,
   l_cluster_num_object_degraded,
+  l_cluster_num_object_misplaced,
   l_cluster_num_object_unfound,
   l_cluster_num_bytes,
   l_cluster_num_mds_up,
@@ -83,6 +85,19 @@ enum {
   l_cluster_num_mds_failed,
   l_cluster_mds_epoch,
   l_cluster_last,
+};
+
+enum {
+  l_mon_first = 456000,
+  l_mon_num_sessions,
+  l_mon_session_add,
+  l_mon_session_rm,
+  l_mon_session_trim,
+  l_mon_num_elections,
+  l_mon_election_call,
+  l_mon_election_win,
+  l_mon_election_lose,
+  l_mon_last,
 };
 
 class QuorumService;
@@ -106,7 +121,8 @@ struct MonCommand;
 
 #define COMPAT_SET_LOC "feature_set"
 
-class Monitor : public Dispatcher {
+class Monitor : public Dispatcher,
+                public md_config_obs_t {
 public:
   // me
   string name;
@@ -132,7 +148,9 @@ public:
 
   set<entity_addr_t> extra_probe_peers;
 
-  LogClient clog;
+  LogClient log_client;
+  LogChannelRef clog;
+  LogChannelRef audit_clog;
   KeyRing keyring;
   KeyServer key_server;
 
@@ -191,7 +209,7 @@ public:
 
   const utime_t &get_leader_since() const;
 
-  void prepare_new_fingerprint(MonitorDBStore::Transaction *t);
+  void prepare_new_fingerprint(MonitorDBStore::TransactionRef t);
 
   // -- elector --
 private:
@@ -358,7 +376,7 @@ private:
    * We store a few things on the side that we don't want to get clobbered by sync.  This
    * includes the latest monmap and a lower bound on last_committed.
    */
-  void sync_stash_critical_state(MonitorDBStore::Transaction *tx);
+  void sync_stash_critical_state(MonitorDBStore::TransactionRef tx);
 
   /**
    * reset the sync timeout
@@ -532,13 +550,14 @@ public:
     return quorum_features;
   }
   uint64_t get_required_features() const {
-    return quorum_features;
+    return required_features;
   }
   void apply_quorum_to_compatset_features();
   void apply_compatset_features_to_quorum_requirements();
 
 private:
   void _reset();   ///< called from bootstrap, start_, or join_election
+  void wait_for_paxos_write();
 public:
   void bootstrap();
   void join_election();
@@ -629,18 +648,70 @@ public:
                         const MonCommand *this_cmd);
   void get_mon_status(Formatter *f, ostream& ss);
   void _quorum_status(Formatter *f, ostream& ss);
-  void _osdmonitor_prepare_command(cmdmap_t& cmdmap, ostream& ss);
-  void _add_bootstrap_peer_hint(string cmd, cmdmap_t& cmdmap, ostream& ss);
+  bool _add_bootstrap_peer_hint(string cmd, cmdmap_t& cmdmap, ostream& ss);
   void handle_command(class MMonCommand *m);
   void handle_route(MRoute *m);
+
+  /**
+   *
+   */
+  struct health_cache_t {
+    health_status_t overall;
+    string summary;
+
+    void reset() {
+      // health_status_t doesn't really have a NONE value and we're not
+      // okay with setting something else (say, HEALTH_ERR).  so just
+      // leave it be.
+      summary.clear();
+    }
+  } health_status_cache;
+
+  struct C_HealthToClogTick : public Context {
+    Monitor *mon;
+    C_HealthToClogTick(Monitor *m) : mon(m) { }
+    void finish(int r) {
+      if (r < 0)
+        return;
+      mon->do_health_to_clog();
+      mon->health_tick_start();
+    }
+  };
+
+  struct C_HealthToClogInterval : public Context {
+    Monitor *mon;
+    C_HealthToClogInterval(Monitor *m) : mon(m) { }
+    void finish(int r) {
+      if (r < 0)
+        return;
+      mon->do_health_to_clog_interval();
+    }
+  };
+
+  Context *health_tick_event;
+  Context *health_interval_event;
+
+  void health_tick_start();
+  void health_tick_stop();
+  utime_t health_interval_calc_next_update();
+  void health_interval_start();
+  void health_interval_stop();
+  void health_events_cleanup();
+
+  void health_to_clog_update_conf(const std::set<std::string> &changed);
+
+  void do_health_to_clog_interval();
+  void do_health_to_clog(bool force = false);
 
   /**
    * Generate health report
    *
    * @param status one-line status summary
    * @param detailbl optional bufferlist* to fill with a detailed report
+   * @returns health status
    */
-  void get_health(string& status, bufferlist *detailbl, Formatter *f);
+  health_status_t get_health(list<string>& status, bufferlist *detailbl,
+                             Formatter *f);
   void get_cluster_status(stringstream &ss, Formatter *f);
 
   void reply_command(MMonCommand *m, int rc, const string &rs, version_t version);
@@ -709,8 +780,26 @@ public:
     C_Command(Monitor *_mm, MMonCommand *_m, int r, string s, bufferlist rd, version_t v) :
       mon(_mm), m(_m), rc(r), rs(s), rdata(rd), version(v){}
     void finish(int r) {
-      if (r >= 0)
+      if (r >= 0) {
+        ostringstream ss;
+        if (!m->get_connection()) {
+          ss << "connection dropped for command ";
+        } else {
+          MonSession *s = m->get_session();
+
+          // if client drops we may not have a session to draw information from.
+          if (s) {
+            ss << "from='" << s->inst << "' "
+              << "entity='" << s->entity_name << "' ";
+          } else {
+            ss << "session dropped for command ";
+          }
+        }
+        ss << "cmd='" << m->cmd << "': finished";
+
+        mon->audit_clog->info() << ss.str();
 	mon->reply_command(m, rc, rs, rdata, version);
+      }
       else if (r == -ECANCELED)
 	m->put();
       else if (r == -EAGAIN)
@@ -738,15 +827,15 @@ public:
 
   //ms_dispatch handles a lot of logic and we want to reuse it
   //on forwarded messages, so we create a non-locking version for this class
-  bool _ms_dispatch(Message *m);
+  void _ms_dispatch(Message *m);
   bool ms_dispatch(Message *m) {
     lock.Lock();
-    bool ret = _ms_dispatch(m);
+    _ms_dispatch(m);
     lock.Unlock();
-    return ret;
+    return true;
   }
   // dissociate message handling from session and connection logic
-  bool dispatch(MonSession *s, Message *m, const bool src_is_mon);
+  void dispatch(MonSession *s, Message *m, const bool src_is_mon);
   //mon_caps is used for un-connected messages from monitors
   MonCap * mon_caps;
   bool ms_get_authorizer(int dest_type, AuthAuthorizer **authorizer, bool force_new);
@@ -760,12 +849,13 @@ public:
   void extract_save_mon_key(KeyRing& keyring);
 
   // features
+  static CompatSet get_initial_supported_features();
   static CompatSet get_supported_features();
   static CompatSet get_legacy_features();
   /// read the ondisk features into the CompatSet pointed to by read_features
   static void read_features_off_disk(MonitorDBStore *store, CompatSet *read_features);
   void read_features();
-  void write_features(MonitorDBStore::Transaction &t);
+  void write_features(MonitorDBStore::TransactionRef t);
 
  public:
   Monitor(CephContext *cct_, string nm, MonitorDBStore *s,
@@ -774,6 +864,13 @@ public:
 
   static int check_features(MonitorDBStore *store);
 
+  // config observer
+  virtual const char** get_tracked_conf_keys() const;
+  virtual void handle_conf_change(const struct md_config_t *conf,
+                                  const std::set<std::string> &changed);
+
+  void update_log_clients();
+  int sanitize_options();
   int preinit();
   int init();
   void init_paxos();
@@ -798,7 +895,7 @@ public:
    * @return 0 on success, or negative error code
    */
   int write_fsid();
-  int write_fsid(MonitorDBStore::Transaction &t);
+  int write_fsid(MonitorDBStore::TransactionRef t);
 
   void do_admin_command(std::string command, cmdmap_t& cmdmap,
 			std::string format, ostream& ss);
@@ -809,83 +906,6 @@ private:
   Monitor& operator=(const Monitor &rhs);
 
 public:
-  class StoreConverter {
-    const string path;
-    MonitorDBStore *db;
-    boost::scoped_ptr<MonitorStore> store;
-
-    set<version_t> gvs;
-    map<version_t, set<pair<string,version_t> > > gv_map;
-
-    version_t highest_last_pn;
-    version_t highest_accepted_pn;
-
-   public:
-    StoreConverter(string path, MonitorDBStore *d)
-      : path(path), db(d), store(NULL),
-	highest_last_pn(0), highest_accepted_pn(0)
-    { }
-
-    /**
-     * Check if store needs to be converted from old format to a
-     * k/v store.
-     *
-     * @returns 0 if store doesn't need conversion; 1 if it does; <0 if error
-     */
-    int needs_conversion();
-    int convert();
-
-    bool is_converting() {
-      return db->exists("mon_convert", "on_going");
-    }
-
-   private:
-
-    bool _check_gv_store();
-
-    void _init() {
-      assert(!store);
-      MonitorStore *store_ptr = new MonitorStore(path);
-      store.reset(store_ptr);
-    }
-
-    void _deinit() {
-      store.reset(NULL);
-    }
-
-    set<string> _get_machines_names() {
-      set<string> names;
-      names.insert("auth");
-      names.insert("logm");
-      names.insert("mdsmap");
-      names.insert("monmap");
-      names.insert("osdmap");
-      names.insert("pgmap");
-
-      return names;
-    }
-
-    void _mark_convert_start() {
-      MonitorDBStore::Transaction tx;
-      tx.put("mon_convert", "on_going", 1);
-      db->apply_transaction(tx);
-    }
-
-    void _convert_finish_features(MonitorDBStore::Transaction &t);
-    void _mark_convert_finish() {
-      MonitorDBStore::Transaction tx;
-      tx.erase("mon_convert", "on_going");
-      _convert_finish_features(tx);
-      db->apply_transaction(tx);
-    }
-
-    void _convert_monitor();
-    void _convert_machines(string machine);
-    void _convert_osdmap_full();
-    void _convert_machines();
-    void _convert_paxos();
-  };
-
   static void format_command_descriptions(const MonCommand *commands,
 					  unsigned commands_size,
 					  Formatter *f,
@@ -903,6 +923,7 @@ public:
 #define CEPH_MON_FEATURE_INCOMPAT_SINGLE_PAXOS CompatSet::Feature (3, "single paxos with k/v store (v0.\?)")
 #define CEPH_MON_FEATURE_INCOMPAT_OSD_ERASURE_CODES CompatSet::Feature(4, "support erasure code pools")
 #define CEPH_MON_FEATURE_INCOMPAT_OSDMAP_ENC CompatSet::Feature(5, "new-style osdmap encoding")
+#define CEPH_MON_FEATURE_INCOMPAT_ERASURE_CODE_PLUGINS_V2 CompatSet::Feature(6, "support isa/lrc erasure code")
 // make sure you add your feature to Monitor::get_supported_features
 
 long parse_pos_long(const char *s, ostream *pss = NULL);
@@ -913,6 +934,16 @@ struct MonCommand {
   string module;
   string req_perms;
   string availability;
+  uint64_t flags;
+
+  // MonCommand flags
+  enum {
+    FLAG_NOFORWARD = (1 << 0),
+  };
+
+  bool has_flag(uint64_t flag) const { return (flags & flag) != 0; }
+  void set_flag(uint64_t flag) { flags |= flag; }
+  void unset_flag(uint64_t flag) { flags &= ~flag; }
 
   void encode(bufferlist &bl) const {
     /*
@@ -933,33 +964,43 @@ struct MonCommand {
     ::decode(req_perms, bl);
     ::decode(availability, bl);
   }
-  bool operator==(const MonCommand& o) const {
-    return cmdstring == o.cmdstring && helpstring == o.helpstring &&
-	module == o.module && req_perms == o.req_perms &&
-	availability == o.availability;
-  }
-  bool operator!=(const MonCommand& o) const {
-    return !(*this == o);
+  bool is_compat(const MonCommand* o) const {
+    return cmdstring == o->cmdstring && helpstring == o->helpstring &&
+	module == o->module && req_perms == o->req_perms &&
+	availability == o->availability;
   }
 
   static void encode_array(const MonCommand *cmds, int size, bufferlist &bl) {
-    ENCODE_START(1, 1, bl);
+    ENCODE_START(2, 1, bl);
     uint16_t s = size;
     ::encode(s, bl);
     ::encode_array_nohead(cmds, size, bl);
+    for (int i = 0; i < size; i++)
+      ::encode(cmds[i].flags, bl);
     ENCODE_FINISH(bl);
   }
   static void decode_array(MonCommand **cmds, int *size,
                            bufferlist::iterator &bl) {
-    DECODE_START(1, bl);
+    DECODE_START(2, bl);
     uint16_t s = 0;
     ::decode(s, bl);
     *size = s;
     *cmds = new MonCommand[*size];
     ::decode_array_nohead(*cmds, *size, bl);
+    if (struct_v >= 2) {
+      for (int i = 0; i < *size; i++)
+	::decode((*cmds)[i].flags, bl);
+    } else {
+      for (int i = 0; i < *size; i++)
+	(*cmds)[i].flags = 0;
+    }
     DECODE_FINISH(bl);
   }
+
+  bool requires_perm(char p) const {
+    return (req_perms.find(p) != string::npos); 
+  }
 };
-WRITE_CLASS_ENCODER(MonCommand);
+WRITE_CLASS_ENCODER(MonCommand)
 
 #endif

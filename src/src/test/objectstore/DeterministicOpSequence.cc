@@ -26,7 +26,6 @@
 #include <boost/lexical_cast.hpp>
 
 #include "DeterministicOpSequence.h"
-
 #include "common/config.h"
 #include "include/assert.h"
 
@@ -71,14 +70,14 @@ bool DeterministicOpSequence::run_one_op(int op, rngen_t& gen)
   case DSOP_OBJ_REMOVE:
     ok = do_remove(gen);
     break;
-  case DSOP_COLL_ADD:
-    ok = do_coll_add(gen);
-    break;
-  case DSOP_COLL_RENAME:
-    //do_coll_rename(gen);
+  case DSOP_COLL_MOVE:
+    ok = do_coll_move(gen);
     break;
   case DSOP_SET_ATTRS:
     ok = do_set_attrs(gen);
+    break;
+  case DSOP_COLL_CREATE:
+    ok = do_coll_create(gen);
     break;
   default:
     assert(0 == "bad op");
@@ -382,31 +381,7 @@ bool DeterministicOpSequence::_prepare_colls(rngen_t& gen,
 }
 
 
-bool DeterministicOpSequence::do_coll_rename(rngen_t& gen)
-{
-  int coll_pos = _gen_coll_id(gen);
-  dout(0) << "do_coll_rename coll pos #" << coll_pos << dendl;
-
-  coll_entry_t *coll_entry = get_coll_at(coll_pos);
-  if (!coll_entry) {
-    dout(0) << "do_coll_rename no collection at pos #" << coll_pos << dendl;
-    return false;
-  }
-
-  coll_t orig_coll = coll_entry->m_coll;
-  char buf[100];
-  memset(buf, 0, 100);
-  snprintf(buf, 100, "0.%d_head", m_next_coll_nr++);
-  coll_t new_coll(buf);
-  coll_entry->m_coll = new_coll;
-
-  dout(0) << "do_coll_rename " << orig_coll.to_str()
-      << " => " << new_coll.to_str() << dendl;
-  _do_coll_rename(orig_coll, new_coll);
-  return true;
-}
-
-bool DeterministicOpSequence::do_coll_add(rngen_t& gen)
+bool DeterministicOpSequence::do_coll_move(rngen_t& gen)
 {
   coll_entry_t *orig_coll = NULL, *new_coll = NULL;
   if (!_prepare_colls(gen, orig_coll, new_coll))
@@ -419,23 +394,67 @@ bool DeterministicOpSequence::do_coll_add(rngen_t& gen)
   int obj_key = -1;
   hobject_t *obj = orig_coll->get_obj_at(obj_pos, &obj_key);
   if (!obj) {
-    dout(0) << "do_coll_add coll " << orig_coll->m_coll.to_str()
+    dout(0) << "do_coll_move coll " << orig_coll->m_coll.to_str()
         << " has no object as pos #" << obj_pos << " (key " << obj_key << ")"
         << dendl;
     return false;
   }
   if (new_coll->check_for_obj(obj_key)) {
-    dout(0) << "do_coll_add coll " << orig_coll->m_coll.to_str()
+    dout(0) << "do_coll_move coll " << orig_coll->m_coll.to_str()
         << " already has object as pos #" << obj_pos << " (key " << obj_key << ")"
         << dendl;
     return false;
   }
-  dout(0) << "do_coll_add " << orig_coll->m_coll.to_str() << "/" << obj->oid.name
+  dout(0) << "do_coll_move " << orig_coll->m_coll.to_str() << "/" << obj->oid.name
         << " => " << new_coll->m_coll.to_str() << "/" << obj->oid.name << dendl;
   new_coll->touch_obj(obj_key);
 
-  _do_coll_add(orig_coll->m_coll, new_coll->m_coll, *obj);
+  orig_coll->remove_obj(obj_key);
+
+  _do_coll_move(orig_coll->m_coll, new_coll->m_coll, *obj);
+
   return true;
+}
+
+bool DeterministicOpSequence::do_coll_create(rngen_t& gen)
+{
+  boost::uniform_int<> pg_num_range(0, 512);
+  int pg_num = pg_num_range(gen);
+
+  // Assume there is 7 OSDs in total, the PGs are evenly distributed across those OSDs
+  int pgs = pg_num / 7;
+
+  boost::uniform_int<> num_objs_range(1, 1024);
+  int num_objs = num_objs_range(gen);
+
+  int pool_id = get_next_pool_id();
+  std::set<int> pg_created;
+  for (int i = 0; i < pgs; i++) {
+    boost::uniform_int<> pg_range(0, pg_num - 1);
+    int pg_id = pg_range(gen);
+    if (pg_created.count(pg_id) > 0)
+      continue;
+    char buf[100];
+    snprintf(buf, 100, "%d.%x_head", pool_id, pg_id);
+    _do_coll_create(coll_t(buf), (uint32_t) pg_num, (uint64_t) num_objs);
+    pg_created.insert(pg_id);
+  }
+  return true;
+}
+
+void DeterministicOpSequence::_do_coll_create(coll_t cid, uint32_t pg_num, uint64_t num_objs)
+{
+  ObjectStore::Transaction t;
+  note_txn(&t);
+  t.create_collection(cid);
+  bufferlist hint;
+  ::encode(pg_num, hint);
+  ::encode(num_objs, hint);
+  t.collection_hint(cid, ObjectStore::Transaction::COLL_HINT_EXPECTED_NUM_OBJECTS, hint);
+  dout(0) << "Give collection: " << cid << " a hint, pg_num is: " << pg_num << ", num_objs is: "
+    << num_objs << dendl;
+
+  m_store->apply_transaction(t);
 }
 
 void DeterministicOpSequence::_do_touch(coll_t coll, hobject_t& obj)
@@ -507,20 +526,13 @@ void DeterministicOpSequence::_do_write_and_clone_range(coll_t coll,
   m_store->apply_transaction(t);
 }
 
-void DeterministicOpSequence::_do_coll_add(coll_t orig_coll, coll_t new_coll,
-					   hobject_t& obj)
+void DeterministicOpSequence::_do_coll_move(coll_t orig_coll, coll_t new_coll,
+					    hobject_t& obj)
 {
   ObjectStore::Transaction t;
   note_txn(&t);
   t.remove(new_coll, obj);
-  t.collection_add(new_coll, orig_coll, obj);
+  t.collection_move(new_coll, orig_coll, obj);
   m_store->apply_transaction(t);
 }
 
-void DeterministicOpSequence::_do_coll_rename(coll_t orig_coll, coll_t new_coll)
-{
-  ObjectStore::Transaction t;
-  note_txn(&t);
-  t.collection_rename(orig_coll, new_coll);
-  m_store->apply_transaction(t);
-}

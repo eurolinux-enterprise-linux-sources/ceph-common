@@ -27,6 +27,8 @@
 #include "librados/IoCtxImpl.h"
 #include "librados/PoolAsyncCompletionImpl.h"
 #include "librados/RadosClient.h"
+#include "librados/RadosXattrIter.h"
+#include "librados/ListObjectImpl.h"
 #include <cls/lock/cls_lock_client.h>
 
 #include <string>
@@ -35,6 +37,12 @@
 #include <vector>
 #include <list>
 #include <stdexcept>
+
+#ifdef WITH_LTTNG
+#include "tracing/librados.h"
+#else
+#define tracepoint(...)
+#endif
 
 using std::string;
 using std::map;
@@ -82,13 +90,30 @@ static void set_op_flags(::ObjectOperation *o, int flags)
     rados_flags |= CEPH_OSD_OP_FLAG_EXCL;
   if (flags & LIBRADOS_OP_FLAG_FAILOK)
     rados_flags |= CEPH_OSD_OP_FLAG_FAILOK;
+  if (flags & LIBRADOS_OP_FLAG_FADVISE_RANDOM)
+    rados_flags |= CEPH_OSD_OP_FLAG_FADVISE_RANDOM;
+  if (flags & LIBRADOS_OP_FLAG_FADVISE_SEQUENTIAL)
+    rados_flags |= CEPH_OSD_OP_FLAG_FADVISE_SEQUENTIAL;
+  if (flags & LIBRADOS_OP_FLAG_FADVISE_WILLNEED)
+    rados_flags |= CEPH_OSD_OP_FLAG_FADVISE_WILLNEED;
+  if (flags & LIBRADOS_OP_FLAG_FADVISE_DONTNEED)
+    rados_flags |= CEPH_OSD_OP_FLAG_FADVISE_DONTNEED;
+  if (flags & LIBRADOS_OP_FLAG_FADVISE_NOCACHE)
+    rados_flags |= CEPH_OSD_OP_FLAG_FADVISE_NOCACHE;
   o->set_last_op_flags(rados_flags);
 }
 
+//deprcated
 void librados::ObjectOperation::set_op_flags(ObjectOperationFlags flags)
 {
   ::ObjectOperation *o = (::ObjectOperation *)impl;
   ::set_op_flags(o, (int)flags);
+}
+
+void librados::ObjectOperation::set_op_flags2(int flags)
+{
+  ::ObjectOperation *o = (::ObjectOperation *)impl;
+  ::set_op_flags(o, flags);
 }
 
 void librados::ObjectOperation::cmpxattr(const char *name, uint8_t op, const bufferlist& v)
@@ -308,10 +333,11 @@ void librados::ObjectWriteOperation::create(bool exclusive)
   o->create(exclusive);
 }
 
-void librados::ObjectWriteOperation::create(bool exclusive, const std::string& category)
+void librados::ObjectWriteOperation::create(bool exclusive,
+					    const std::string& category) // unused
 {
   ::ObjectOperation *o = (::ObjectOperation *)impl;
-  o->create(exclusive, category);
+  o->create(exclusive);
 }
 
 void librados::ObjectWriteOperation::write(uint64_t off, const bufferlist& bl)
@@ -473,17 +499,247 @@ librados::WatchCtx::
 {
 }
 
+librados::WatchCtx2::
+~WatchCtx2()
+{
+}
+
 
 struct librados::ObjListCtx {
+  bool new_request;
+  librados::IoCtxImpl dupctx;
   librados::IoCtxImpl *ctx;
   Objecter::ListContext *lc;
+  Objecter::NListContext *nlc;
 
-  ObjListCtx(IoCtxImpl *c, Objecter::ListContext *l) : ctx(c), lc(l) {}
+  ObjListCtx(IoCtxImpl *c, Objecter::ListContext *l) : new_request(false), lc(l), nlc(NULL) {
+    // Get our own private IoCtxImpl so that namespace setting isn't changed by caller
+    // between uses.
+    ctx = &dupctx;
+    dupctx.dup(*c);
+  }
+  ObjListCtx(IoCtxImpl *c, Objecter::NListContext *nl) : new_request(true), lc(NULL), nlc(nl) {
+    // Get our own private IoCtxImpl so that namespace setting isn't changed by caller
+    // between uses.
+    ctx = &dupctx;
+    dupctx.dup(*c);
+  }
   ~ObjListCtx() {
-    delete lc;
+    ctx = NULL;
+    if (new_request)
+      delete nlc;
+    else
+      delete lc;
   }
 };
 
+///////////////////////////// NObjectIteratorImpl /////////////////////////////
+librados::NObjectIteratorImpl::NObjectIteratorImpl(ObjListCtx *ctx_)
+  : ctx(ctx_)
+{
+}
+
+librados::NObjectIteratorImpl::~NObjectIteratorImpl()
+{
+  ctx.reset();
+}
+
+librados::NObjectIteratorImpl::NObjectIteratorImpl(const NObjectIteratorImpl &rhs)
+{
+  *this = rhs;
+}
+
+librados::NObjectIteratorImpl& librados::NObjectIteratorImpl::operator=(const librados::NObjectIteratorImpl &rhs)
+{
+  if (&rhs == this)
+    return *this;
+  if (rhs.ctx.get() == NULL) {
+    ctx.reset();
+    return *this;
+  }
+  if (rhs.ctx->new_request) {
+    Objecter::NListContext *list_ctx = new Objecter::NListContext(*rhs.ctx->nlc);
+    ctx.reset(new ObjListCtx(rhs.ctx->ctx, list_ctx));
+    cur_obj = rhs.cur_obj;
+  } else {
+    Objecter::ListContext *list_ctx = new Objecter::ListContext(*rhs.ctx->lc);
+    ctx.reset(new ObjListCtx(rhs.ctx->ctx, list_ctx));
+    cur_obj = rhs.cur_obj;
+  }
+  return *this;
+}
+
+bool librados::NObjectIteratorImpl::operator==(const librados::NObjectIteratorImpl& rhs) const {
+
+  if (ctx.get() == NULL) {
+    if (rhs.ctx.get() == NULL)
+      return true;
+    if (rhs.ctx->new_request)
+      return rhs.ctx->nlc->at_end();
+    else
+      return rhs.ctx->lc->at_end();
+  }
+  if (rhs.ctx.get() == NULL) {
+    // Redundant but same as ObjectIterator version
+    if (ctx.get() == NULL)
+      return true;
+    if (ctx->new_request)
+      return ctx->nlc->at_end();
+    else
+      return ctx->lc->at_end();
+  }
+  return ctx.get() == rhs.ctx.get();
+}
+
+bool librados::NObjectIteratorImpl::operator!=(const librados::NObjectIteratorImpl& rhs) const {
+  return !(*this == rhs);
+}
+
+const librados::ListObject& librados::NObjectIteratorImpl::operator*() const {
+  return cur_obj;
+}
+
+const librados::ListObject* librados::NObjectIteratorImpl::operator->() const {
+  return &cur_obj;
+}
+
+librados::NObjectIteratorImpl& librados::NObjectIteratorImpl::operator++()
+{
+  get_next();
+  return *this;
+}
+
+librados::NObjectIteratorImpl librados::NObjectIteratorImpl::operator++(int)
+{
+  librados::NObjectIteratorImpl ret(*this);
+  get_next();
+  return ret;
+}
+
+uint32_t librados::NObjectIteratorImpl::seek(uint32_t pos)
+{
+  uint32_t r = rados_nobjects_list_seek(ctx.get(), pos);
+  get_next();
+  return r;
+}
+
+void librados::NObjectIteratorImpl::get_next()
+{
+  const char *entry, *key, *nspace;
+  if (ctx->new_request) {
+    if (ctx->nlc->at_end())
+      return;
+  } else {
+    if (ctx->lc->at_end())
+      return;
+  }
+  int ret = rados_nobjects_list_next(ctx.get(), &entry, &key, &nspace);
+  if (ret == -ENOENT) {
+    return;
+  }
+  else if (ret) {
+    ostringstream oss;
+    oss << "rados returned " << cpp_strerror(ret);
+    throw std::runtime_error(oss.str());
+  }
+
+  if (cur_obj.impl == NULL)
+    cur_obj.impl = new ListObjectImpl();
+  cur_obj.impl->nspace = nspace;
+  cur_obj.impl->oid = entry;
+  cur_obj.impl->locator = key ? key : string();
+}
+
+uint32_t librados::NObjectIteratorImpl::get_pg_hash_position() const
+{
+  if (ctx->new_request)
+    return ctx->nlc->get_pg_hash_position();
+  else
+    return ctx->lc->get_pg_hash_position();
+}
+
+///////////////////////////// NObjectIterator /////////////////////////////
+librados::NObjectIterator::NObjectIterator(ObjListCtx *ctx_)
+{
+  impl = new NObjectIteratorImpl(ctx_);
+}
+
+librados::NObjectIterator::~NObjectIterator()
+{
+  delete impl;
+}
+
+librados::NObjectIterator::NObjectIterator(const NObjectIterator &rhs)
+{
+  if (rhs.impl == NULL) {
+    impl = NULL;
+    return;
+  }
+  impl = new NObjectIteratorImpl();
+  *impl = *(rhs.impl);
+}
+
+librados::NObjectIterator& librados::NObjectIterator::operator=(const librados::NObjectIterator &rhs)
+{
+  if (rhs.impl == NULL) {
+    delete impl;
+    impl = NULL;
+    return *this;
+  }
+  if (impl == NULL)
+    impl = new NObjectIteratorImpl();
+  *impl = *(rhs.impl);
+  return *this;
+}
+
+bool librados::NObjectIterator::operator==(const librados::NObjectIterator& rhs) const 
+{
+  return *impl == *(rhs.impl);
+}
+
+bool librados::NObjectIterator::operator!=(const librados::NObjectIterator& rhs) const {
+  return !(*impl == *(rhs.impl));
+}
+
+const librados::ListObject& librados::NObjectIterator::operator*() const {
+  return *(impl->get_listobjectp());
+}
+
+const librados::ListObject* librados::NObjectIterator::operator->() const {
+  return impl->get_listobjectp();
+}
+
+librados::NObjectIterator& librados::NObjectIterator::operator++()
+{
+  impl->get_next();
+  return *this;
+}
+
+librados::NObjectIterator librados::NObjectIterator::operator++(int)
+{
+  librados::NObjectIterator ret(*this);
+  impl->get_next();
+  return ret;
+}
+
+uint32_t librados::NObjectIterator::seek(uint32_t pos)
+{
+  return impl->seek(pos);
+}
+
+void librados::NObjectIterator::get_next()
+{
+  impl->get_next();
+}
+
+uint32_t librados::NObjectIterator::get_pg_hash_position() const
+{
+  return impl->get_pg_hash_position();
+}
+
+const librados::NObjectIterator librados::NObjectIterator::__EndObjectIterator(NULL);
+
+// DEPRECATED; Use NObjectIterator instead
 ///////////////////////////// ObjectIterator /////////////////////////////
 librados::ObjectIterator::ObjectIterator(ObjListCtx *ctx_)
   : ctx(ctx_)
@@ -783,16 +1039,27 @@ std::string librados::IoCtx::get_pool_name()
   return s;
 }
 
+const std::string& librados::IoCtx::get_pool_name() const
+{
+  return io_ctx_impl->get_cached_pool_name();
+}
+
+uint64_t librados::IoCtx::get_instance_id() const
+{
+  return io_ctx_impl->client->get_instance_id();
+}
+
 int librados::IoCtx::create(const std::string& oid, bool exclusive)
 {
   object_t obj(oid);
   return io_ctx_impl->create(obj, exclusive);
 }
 
-int librados::IoCtx::create(const std::string& oid, bool exclusive, const std::string& category)
+int librados::IoCtx::create(const std::string& oid, bool exclusive,
+			    const std::string& category) // unused
 {
   object_t obj(oid);
-  return io_ctx_impl->create(obj, exclusive, category);
+  return io_ctx_impl->create(obj, exclusive);
 }
 
 int librados::IoCtx::write(const std::string& oid, bufferlist& bl, size_t len, uint64_t off)
@@ -1256,9 +1523,38 @@ int librados::IoCtx::list_lockers(const std::string &oid, const std::string &nam
   return tmp_lockers.size();
 }
 
+librados::NObjectIterator librados::IoCtx::nobjects_begin()
+{
+  rados_list_ctx_t listh;
+  rados_nobjects_list_open(io_ctx_impl, &listh);
+  NObjectIterator iter((ObjListCtx*)listh);
+  iter.get_next();
+  return iter;
+}
+
+librados::NObjectIterator librados::IoCtx::nobjects_begin(uint32_t pos)
+{
+  rados_list_ctx_t listh;
+  rados_nobjects_list_open(io_ctx_impl, &listh);
+  NObjectIterator iter((ObjListCtx*)listh);
+  iter.seek(pos);
+  return iter;
+}
+
+const librados::NObjectIterator& librados::IoCtx::nobjects_end() const
+{
+  return NObjectIterator::__EndObjectIterator;
+}
+
+// DEPRECATED; use n versions above
 librados::ObjectIterator librados::IoCtx::objects_begin()
 {
   rados_list_ctx_t listh;
+  if (io_ctx_impl->oloc.nspace == librados::all_nspaces) {
+    ostringstream oss;
+    oss << "rados returned " << cpp_strerror(-EINVAL);
+    throw std::runtime_error(oss.str());
+  }
   rados_objects_list_open(io_ctx_impl, &listh);
   ObjectIterator iter((ObjListCtx*)listh);
   iter.get_next();
@@ -1268,6 +1564,11 @@ librados::ObjectIterator librados::IoCtx::objects_begin()
 librados::ObjectIterator librados::IoCtx::objects_begin(uint32_t pos)
 {
   rados_list_ctx_t listh;
+  if (io_ctx_impl->oloc.nspace == librados::all_nspaces) {
+    ostringstream oss;
+    oss << "rados returned " << cpp_strerror(-EINVAL);
+    throw std::runtime_error(oss.str());
+  }
   rados_objects_list_open(io_ctx_impl, &listh);
   ObjectIterator iter((ObjListCtx*)listh);
   iter.seek(pos);
@@ -1381,25 +1682,59 @@ int librados::IoCtx::aio_stat(const std::string& oid, librados::AioCompletion *c
   return io_ctx_impl->aio_stat(oid, c->pc, psize, pmtime);
 }
 
+int librados::IoCtx::aio_cancel(librados::AioCompletion *c)
+{
+  return io_ctx_impl->aio_cancel(c->pc);
+}
 
 int librados::IoCtx::watch(const string& oid, uint64_t ver, uint64_t *cookie,
 			   librados::WatchCtx *ctx)
 {
   object_t obj(oid);
-  return io_ctx_impl->watch(obj, ver, cookie, ctx);
+  return io_ctx_impl->watch(obj, cookie, ctx, NULL);
+}
+
+int librados::IoCtx::watch2(const string& oid, uint64_t *cookie,
+			    librados::WatchCtx2 *ctx2)
+{
+  object_t obj(oid);
+  return io_ctx_impl->watch(obj, cookie, NULL, ctx2);
 }
 
 int librados::IoCtx::unwatch(const string& oid, uint64_t handle)
 {
-  uint64_t cookie = handle;
   object_t obj(oid);
-  return io_ctx_impl->unwatch(obj, cookie);
+  return io_ctx_impl->unwatch(handle);
+}
+
+int librados::IoCtx::unwatch2(uint64_t handle)
+{
+  return io_ctx_impl->unwatch(handle);
+}
+
+int librados::IoCtx::watch_check(uint64_t handle)
+{
+  return io_ctx_impl->watch_check(handle);
 }
 
 int librados::IoCtx::notify(const string& oid, uint64_t ver, bufferlist& bl)
 {
   object_t obj(oid);
-  return io_ctx_impl->notify(obj, ver, bl);
+  return io_ctx_impl->notify(obj, bl, 0, NULL, NULL, NULL);
+}
+
+int librados::IoCtx::notify2(const string& oid, bufferlist& bl,
+			     uint64_t timeout_ms, bufferlist *preplybl)
+{
+  object_t obj(oid);
+  return io_ctx_impl->notify(obj, bl, timeout_ms, preplybl, NULL, NULL);
+}
+
+void librados::IoCtx::notify_ack(const std::string& o,
+				 uint64_t notify_id, uint64_t handle,
+				 bufferlist& bl)
+{
+  io_ctx_impl->notify_ack(o, notify_id, handle, bl);
 }
 
 int librados::IoCtx::list_watchers(const std::string& oid,
@@ -1455,11 +1790,6 @@ void librados::IoCtx::set_assert_src_version(const std::string& oid, uint64_t ve
 {
   object_t obj(oid);
   io_ctx_impl->set_assert_src_version(obj, ver);
-}
-
-const std::string& librados::IoCtx::get_pool_name() const
-{
-  return io_ctx_impl->pool_name;
 }
 
 void librados::IoCtx::locator_set_key(const string& key)
@@ -1543,6 +1873,13 @@ int librados::Rados::connect()
 librados::config_t librados::Rados::cct()
 {
   return (config_t)client->cct;
+}
+
+int librados::Rados::watch_flush()
+{
+  if (!client)
+    return -EINVAL;
+  return client->watch_flush();
 }
 
 void librados::Rados::shutdown()
@@ -1638,6 +1975,14 @@ int librados::Rados::pool_create_async(const char *name, uint64_t auid, __u8 cru
   return client->pool_create_async(str, c->pc, auid, crush_rule);
 }
 
+int librados::Rados::pool_get_base_tier(int64_t pool_id, int64_t* base_tier)
+{
+  tracepoint(librados, rados_pool_get_base_tier_enter, (rados_t)client, pool_id);
+  int retval = client->pool_get_base_tier(pool_id, base_tier);
+  tracepoint(librados, rados_pool_get_base_tier_exit, retval, *base_tier);
+  return retval;
+}
+
 int librados::Rados::pool_delete(const char *name)
 {
   return client->pool_delete(name);
@@ -1649,6 +1994,22 @@ int librados::Rados::pool_delete_async(const char *name, PoolAsyncCompletion *c)
 }
 
 int librados::Rados::pool_list(std::list<std::string>& v)
+{
+  std::list<std::pair<int64_t, std::string> > pools;
+  int r = client->pool_list(pools);
+  if (r < 0) {
+    return r;
+  }
+
+  v.clear();
+  for (std::list<std::pair<int64_t, std::string> >::iterator it = pools.begin();
+       it != pools.end(); ++it) {
+    v.push_back(it->second);
+  }
+  return 0;
+}
+
+int librados::Rados::pool_list2(std::list<std::pair<int64_t, std::string> >& v)
 {
   return client->pool_list(v);
 }
@@ -1681,72 +2042,67 @@ int librados::Rados::ioctx_create(const char *name, IoCtx &io)
   return 0;
 }
 
+int librados::Rados::ioctx_create2(int64_t pool_id, IoCtx &io)
+{
+  rados_ioctx_t p;
+  int ret = rados_ioctx_create2((rados_t)client, pool_id, &p);
+  if (ret)
+    return ret;
+  io.io_ctx_impl = (IoCtxImpl*)p;
+  return 0;
+}
+
 void librados::Rados::test_blacklist_self(bool set)
 {
   client->blacklist_self(set);
 }
 
-int librados::Rados::get_pool_stats(std::list<string>& v, std::map<string, stats_map>& result)
-{
-  string category;
-  return get_pool_stats(v, category, result);
-}
-
-int librados::Rados::get_pool_stats(std::list<string>& v, string& category,
-				    std::map<string, stats_map>& result)
+int librados::Rados::get_pool_stats(std::list<string>& v,
+				    stats_map& result)
 {
   map<string,::pool_stat_t> rawresult;
   int r = client->get_pool_stats(v, rawresult);
-  if (r < 0)
-    return r;
   for (map<string,::pool_stat_t>::iterator p = rawresult.begin();
        p != rawresult.end();
        ++p) {
-    stats_map& c = result[p->first];
-
-    string cat;
-    vector<string> cats;
-
-    if (!category.size()) {
-      cats.push_back(cat);
-      map<string,object_stat_sum_t>::iterator iter;
-      for (iter = p->second.stats.cat_sum.begin(); iter != p->second.stats.cat_sum.end(); ++iter) {
-        cats.push_back(iter->first);
-      }
-    } else {
-      cats.push_back(category);
-    }
-
-    vector<string>::iterator cat_iter;
-    for (cat_iter = cats.begin(); cat_iter != cats.end(); ++cat_iter) {
-      string& cur_category = *cat_iter;
-      object_stat_sum_t *sum;
-
-      if (!cur_category.size()) {
-         sum = &p->second.stats.sum;
-      } else {
-        map<string,object_stat_sum_t>::iterator iter = p->second.stats.cat_sum.find(cur_category);
-        if (iter == p->second.stats.cat_sum.end())
-          continue;
-        sum = &iter->second;
-      }
-
-      pool_stat_t& pv = c[cur_category];
-      pv.num_kb = SHIFT_ROUND_UP(sum->num_bytes, 10);
-      pv.num_bytes = sum->num_bytes;
-      pv.num_objects = sum->num_objects;
-      pv.num_object_clones = sum->num_object_clones;
-      pv.num_object_copies = sum->num_object_copies;
-      pv.num_objects_missing_on_primary = sum->num_objects_missing_on_primary;
-      pv.num_objects_unfound = sum->num_objects_unfound;
-      pv.num_objects_degraded = sum->num_objects_degraded;
-      pv.num_rd = sum->num_rd;
-      pv.num_rd_kb = sum->num_rd_kb;
-      pv.num_wr = sum->num_wr;
-      pv.num_wr_kb = sum->num_wr_kb;
-    }
+    pool_stat_t& pv = result[p->first];
+    object_stat_sum_t *sum = &p->second.stats.sum;
+    pv.num_kb = SHIFT_ROUND_UP(sum->num_bytes, 10);
+    pv.num_bytes = sum->num_bytes;
+    pv.num_objects = sum->num_objects;
+    pv.num_object_clones = sum->num_object_clones;
+    pv.num_object_copies = sum->num_object_copies;
+    pv.num_objects_missing_on_primary = sum->num_objects_missing_on_primary;
+    pv.num_objects_unfound = sum->num_objects_unfound;
+    pv.num_objects_degraded = sum->num_objects_degraded;
+    pv.num_rd = sum->num_rd;
+    pv.num_rd_kb = sum->num_rd_kb;
+    pv.num_wr = sum->num_wr;
+    pv.num_wr_kb = sum->num_wr_kb;
   }
   return r;
+}
+
+int librados::Rados::get_pool_stats(std::list<string>& v,
+				    std::map<string, stats_map>& result)
+{
+  stats_map m;
+  int r = get_pool_stats(v, m);
+  if (r < 0)
+    return r;
+  for (map<string,pool_stat_t>::iterator p = m.begin();
+       p != m.end();
+       ++p) {
+    result[p->first][string()] = p->second;
+  }
+  return r;
+}
+
+int librados::Rados::get_pool_stats(std::list<string>& v,
+				    string& category, // unused
+				    std::map<string, stats_map>& result)
+{
+  return -EOPNOTSUPP;
 }
 
 int librados::Rados::cluster_stat(cluster_stat_t& result)
@@ -1768,6 +2124,12 @@ int librados::Rados::cluster_fsid(string *fsid)
 int librados::Rados::wait_for_latest_osdmap()
 {
   return client->wait_for_latest_osdmap();
+}
+
+int librados::Rados::blacklist_add(const std::string& client_address,
+				   uint32_t expire_seconds)
+{
+  return client->blacklist_add(client_address, expire_seconds);
 }
 
 librados::PoolAsyncCompletion *librados::Rados::pool_async_create_completion()
@@ -1800,7 +2162,8 @@ librados::ObjectOperation::ObjectOperation()
 librados::ObjectOperation::~ObjectOperation()
 {
   ::ObjectOperation *o = (::ObjectOperation *)impl;
-  delete o;
+  if (o)
+    delete o;
 }
 
 ///////////////////////////// C API //////////////////////////////
@@ -1826,11 +2189,14 @@ int rados_create_common(rados_t *pcluster,
 
 extern "C" int rados_create(rados_t *pcluster, const char * const id)
 {
+  tracepoint(librados, rados_create_enter, id);
   CephInitParameters iparams(CEPH_ENTITY_TYPE_CLIENT);
   if (id) {
     iparams.name.set(CEPH_ENTITY_TYPE_CLIENT, id);
   }
-  return rados_create_common(pcluster, "ceph", &iparams);
+  int retval = rados_create_common(pcluster, "ceph", &iparams);
+  tracepoint(librados, rados_create_exit, retval, *pcluster);
+  return retval;
 }
 
 // as above, but 
@@ -1842,12 +2208,17 @@ extern "C" int rados_create(rados_t *pcluster, const char * const id)
 extern "C" int rados_create2(rados_t *pcluster, const char *const clustername,
 			     const char * const name, uint64_t flags)
 {
+  tracepoint(librados, rados_create2_enter, clustername, name, flags);
   // client is assumed, but from_str will override
   CephInitParameters iparams(CEPH_ENTITY_TYPE_CLIENT);
-  if (!name || !iparams.name.from_str(name)) 
+  if (!name || !iparams.name.from_str(name)) {
+    tracepoint(librados, rados_create2_exit, -EINVAL, *pcluster);
     return -EINVAL;
+  }
 
-  return rados_create_common(pcluster, clustername, &iparams);
+  int retval = rados_create_common(pcluster, clustername, &iparams);
+  tracepoint(librados, rados_create2_exit, retval, *pcluster);
+  return retval;
 }
 
 /* This function is intended for use by Ceph daemons. These daemons have
@@ -1856,74 +2227,101 @@ extern "C" int rados_create2(rados_t *pcluster, const char *const clustername,
  */
 extern "C" int rados_create_with_context(rados_t *pcluster, rados_config_t cct_)
 {
+  tracepoint(librados, rados_create_with_context_enter, cct_);
   CephContext *cct = (CephContext *)cct_;
   librados::RadosClient *radosp = new librados::RadosClient(cct);
   *pcluster = (void *)radosp;
+  tracepoint(librados, rados_create_with_context_exit, 0, *pcluster);
   return 0;
 }
 
 extern "C" rados_config_t rados_cct(rados_t cluster)
 {
+  tracepoint(librados, rados_cct_enter, cluster);
   librados::RadosClient *client = (librados::RadosClient *)cluster;
-  return (rados_config_t)client->cct;
+  rados_config_t retval = (rados_config_t)client->cct;
+  tracepoint(librados, rados_cct_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_connect(rados_t cluster)
 {
+  tracepoint(librados, rados_connect_enter, cluster);
   librados::RadosClient *client = (librados::RadosClient *)cluster;
-  return client->connect();
+  int retval = client->connect();
+  tracepoint(librados, rados_connect_exit, retval);
+  return retval;
 }
 
 extern "C" void rados_shutdown(rados_t cluster)
 {
+  tracepoint(librados, rados_shutdown_enter, cluster);
   librados::RadosClient *radosp = (librados::RadosClient *)cluster;
   radosp->shutdown();
   delete radosp;
+  tracepoint(librados, rados_shutdown_exit);
 }
 
 extern "C" uint64_t rados_get_instance_id(rados_t cluster)
 {
+  tracepoint(librados, rados_get_instance_id_enter, cluster);
   librados::RadosClient *client = (librados::RadosClient *)cluster;
-  return client->get_instance_id();
+  uint64_t retval = client->get_instance_id();
+  tracepoint(librados, rados_get_instance_id_exit, retval);
+  return retval;
 }
 
 extern "C" void rados_version(int *major, int *minor, int *extra)
 {
+  tracepoint(librados, rados_version_enter, major, minor, extra);
   if (major)
     *major = LIBRADOS_VER_MAJOR;
   if (minor)
     *minor = LIBRADOS_VER_MINOR;
   if (extra)
     *extra = LIBRADOS_VER_EXTRA;
+  tracepoint(librados, rados_version_exit, LIBRADOS_VER_MAJOR, LIBRADOS_VER_MINOR, LIBRADOS_VER_EXTRA);
 }
 
 
 // -- config --
 extern "C" int rados_conf_read_file(rados_t cluster, const char *path_list)
 {
+  tracepoint(librados, rados_conf_read_file_enter, cluster, path_list);
   librados::RadosClient *client = (librados::RadosClient *)cluster;
   md_config_t *conf = client->cct->_conf;
   std::deque<std::string> parse_errors;
   int ret = conf->parse_config_files(path_list, &parse_errors, NULL, 0);
-  if (ret)
+  if (ret) {
+    tracepoint(librados, rados_conf_read_file_exit, ret);
     return ret;
+  }
   conf->parse_env(); // environment variables override
 
   conf->apply_changes(NULL);
   complain_about_parse_errors(client->cct, &parse_errors);
+  tracepoint(librados, rados_conf_read_file_exit, 0);
   return 0;
 }
 
 extern "C" int rados_conf_parse_argv(rados_t cluster, int argc, const char **argv)
 {
+  tracepoint(librados, rados_conf_parse_argv_enter, cluster, argc);
+  int i;
+  for(i = 0; i < argc; i++) {
+    tracepoint(librados, rados_conf_parse_argv_arg, argv[i]);
+  }
   librados::RadosClient *client = (librados::RadosClient *)cluster;
   md_config_t *conf = client->cct->_conf;
   vector<const char*> args;
   argv_to_vec(argc, argv, args);
   int ret = conf->parse_argv(args);
-  if (ret)
+  if (ret) {
+    tracepoint(librados, rados_conf_parse_argv_exit, ret);
     return ret;
+  }
   conf->apply_changes(NULL);
+  tracepoint(librados, rados_conf_parse_argv_exit, 0);
   return 0;
 }
 
@@ -1936,53 +2334,70 @@ extern "C" int rados_conf_parse_argv_remainder(rados_t cluster, int argc,
 					       const char **argv,
 					       const char **remargv)
 {
+  tracepoint(librados, rados_conf_parse_argv_remainder_enter, cluster, argc);
+  unsigned int i;
+  for(i = 0; i < (unsigned int) argc; i++) {
+    tracepoint(librados, rados_conf_parse_argv_remainder_arg, argv[i]);
+  }
   librados::RadosClient *client = (librados::RadosClient *)cluster;
   md_config_t *conf = client->cct->_conf;
   vector<const char*> args;
   for (int i=0; i<argc; i++)
     args.push_back(argv[i]);
   int ret = conf->parse_argv(args);
-  if (ret)
+  if (ret) {
+    tracepoint(librados, rados_conf_parse_argv_remainder_exit, ret);
     return ret;
+  }
   conf->apply_changes(NULL);
   assert(args.size() <= (unsigned int)argc);
-  unsigned int i;
   for (i = 0; i < (unsigned int)argc; ++i) {
     if (i < args.size())
       remargv[i] = args[i];
     else
       remargv[i] = (const char *)NULL;
+    tracepoint(librados, rados_conf_parse_argv_remainder_remarg, remargv[i]);
   }
+  tracepoint(librados, rados_conf_parse_argv_remainder_exit, 0);
   return 0;
 }
 
 extern "C" int rados_conf_parse_env(rados_t cluster, const char *env)
 {
+  tracepoint(librados, rados_conf_parse_env_enter, cluster, env);
   librados::RadosClient *client = (librados::RadosClient *)cluster;
   md_config_t *conf = client->cct->_conf;
   vector<const char*> args;
   env_to_vec(args, env);
   int ret = conf->parse_argv(args);
-  if (ret)
+  if (ret) {
+    tracepoint(librados, rados_conf_parse_env_exit, ret);
     return ret;
+  }
   conf->apply_changes(NULL);
+  tracepoint(librados, rados_conf_parse_env_exit, 0);
   return 0;
 }
 
 extern "C" int rados_conf_set(rados_t cluster, const char *option, const char *value)
 {
+  tracepoint(librados, rados_conf_set_enter, cluster, option, value);
   librados::RadosClient *client = (librados::RadosClient *)cluster;
   md_config_t *conf = client->cct->_conf;
   int ret = conf->set_val(option, value);
-  if (ret)
+  if (ret) {
+    tracepoint(librados, rados_conf_set_exit, ret);
     return ret;
+  }
   conf->apply_changes(NULL);
+  tracepoint(librados, rados_conf_set_exit, 0);
   return 0;
 }
 
 /* cluster info */
 extern "C" int rados_cluster_stat(rados_t cluster, rados_cluster_stat_t *result)
 {
+  tracepoint(librados, rados_cluster_stat_enter, cluster);
   librados::RadosClient *client = (librados::RadosClient *)cluster;
 
   ceph_statfs stats;
@@ -1991,86 +2406,125 @@ extern "C" int rados_cluster_stat(rados_t cluster, rados_cluster_stat_t *result)
   result->kb_used = stats.kb_used;
   result->kb_avail = stats.kb_avail;
   result->num_objects = stats.num_objects;
+  tracepoint(librados, rados_cluster_stat_exit, r, result->kb, result->kb_used, result->kb_avail, result->num_objects);
   return r;
 }
 
 extern "C" int rados_conf_get(rados_t cluster, const char *option, char *buf, size_t len)
 {
+  tracepoint(librados, rados_conf_get_enter, cluster, option, len);
   char *tmp = buf;
   librados::RadosClient *client = (librados::RadosClient *)cluster;
   md_config_t *conf = client->cct->_conf;
-  return conf->get_val(option, &tmp, len);
+  int retval = conf->get_val(option, &tmp, len);
+  tracepoint(librados, rados_conf_get_exit, retval, retval ? "" : option);
+  return retval;
 }
 
 extern "C" int64_t rados_pool_lookup(rados_t cluster, const char *name)
 {
+  tracepoint(librados, rados_pool_lookup_enter, cluster, name);
   librados::RadosClient *radosp = (librados::RadosClient *)cluster;
-  return radosp->lookup_pool(name);
+  int64_t retval = radosp->lookup_pool(name);
+  tracepoint(librados, rados_pool_lookup_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_pool_reverse_lookup(rados_t cluster, int64_t id,
 					 char *buf, size_t maxlen)
 {
+  tracepoint(librados, rados_pool_reverse_lookup_enter, cluster, id, maxlen);
   librados::RadosClient *radosp = (librados::RadosClient *)cluster;
   std::string name;
   int r = radosp->pool_get_name(id, &name);
-  if (r < 0)
+  if (r < 0) {
+    tracepoint(librados, rados_pool_reverse_lookup_exit, r, "");
     return r;
-  if (name.length() >= maxlen)
+  }
+  if (name.length() >= maxlen) {
+    tracepoint(librados, rados_pool_reverse_lookup_exit, -ERANGE, "");
     return -ERANGE;
+  }
   strcpy(buf, name.c_str());
-  return name.length();
+  int retval = name.length();
+  tracepoint(librados, rados_pool_reverse_lookup_exit, retval, buf);
+  return retval;
 }
 
 extern "C" int rados_cluster_fsid(rados_t cluster, char *buf,
 				  size_t maxlen)
 {
+  tracepoint(librados, rados_cluster_fsid_enter, cluster, maxlen);
   librados::RadosClient *radosp = (librados::RadosClient *)cluster;
   std::string fsid;
   radosp->get_fsid(&fsid);
-  if (fsid.length() >= maxlen)
+  if (fsid.length() >= maxlen) {
+    tracepoint(librados, rados_cluster_fsid_exit, -ERANGE, "");
     return -ERANGE;
+  }
   strcpy(buf, fsid.c_str());
-  return fsid.length();
+  int retval = fsid.length();
+  tracepoint(librados, rados_cluster_fsid_exit, retval, buf);
+  return retval;
 }
 
 extern "C" int rados_wait_for_latest_osdmap(rados_t cluster)
 {
+  tracepoint(librados, rados_wait_for_latest_osdmap_enter, cluster);
   librados::RadosClient *radosp = (librados::RadosClient *)cluster;
-  return radosp->wait_for_latest_osdmap();
+  int retval = radosp->wait_for_latest_osdmap();
+  tracepoint(librados, rados_wait_for_latest_osdmap_exit, retval);
+  return retval;
+}
+
+extern "C" int rados_blacklist_add(rados_t cluster, char *client_address,
+				   uint32_t expire_seconds)
+{
+  librados::RadosClient *radosp = (librados::RadosClient *)cluster;
+  return radosp->blacklist_add(client_address, expire_seconds);
 }
 
 extern "C" int rados_pool_list(rados_t cluster, char *buf, size_t len)
 {
+  tracepoint(librados, rados_pool_list_enter, cluster, len);
   librados::RadosClient *client = (librados::RadosClient *)cluster;
-  std::list<std::string> pools;
+  std::list<std::pair<int64_t, std::string> > pools;
   int r = client->pool_list(pools);
-  if (r < 0)
+  if (r < 0) {
+    tracepoint(librados, rados_pool_list_exit, r);
     return r;
+  }
 
-  if (len > 0 && !buf)
+  if (len > 0 && !buf) {
+    tracepoint(librados, rados_pool_list_exit, -EINVAL);
     return -EINVAL;
+  }
 
   char *b = buf;
   if (b)
     memset(b, 0, len);
   int needed = 0;
-  std::list<std::string>::const_iterator i = pools.begin();
-  std::list<std::string>::const_iterator p_end = pools.end();
+  std::list<std::pair<int64_t, std::string> >::const_iterator i = pools.begin();
+  std::list<std::pair<int64_t, std::string> >::const_iterator p_end =
+    pools.end();
   for (; i != p_end; ++i) {
-    int rl = i->length() + 1;
+    int rl = i->second.length() + 1;
     if (len < (unsigned)rl)
       break;
-    strncat(b, i->c_str(), rl);
+    const char* pool = i->second.c_str();
+    tracepoint(librados, rados_pool_list_pool, pool);
+    strncat(b, pool, rl);
     needed += rl;
     len -= rl;
     b += rl;
   }
   for (; i != p_end; ++i) {
-    int rl = i->length() + 1;
+    int rl = i->second.length() + 1;
     needed += rl;
   }
-  return needed + 1;
+  int retval = needed + 1;
+  tracepoint(librados, rados_pool_list_exit, retval);
+  return retval;
 }
 
 static void do_out_buffer(bufferlist& outbl, char **outbuf, size_t *outbuflen)
@@ -2104,16 +2558,20 @@ static void do_out_buffer(string& outbl, char **outbuf, size_t *outbuflen)
 extern "C" int rados_ping_monitor(rados_t cluster, const char *mon_id,
                                   char **outstr, size_t *outstrlen)
 {
+  tracepoint(librados, rados_ping_monitor_enter, cluster, mon_id);
   librados::RadosClient *client = (librados::RadosClient *)cluster;
   string str;
 
-  if (!mon_id)
+  if (!mon_id) {
+    tracepoint(librados, rados_ping_monitor_exit, -EINVAL, NULL, NULL);
     return -EINVAL;
+  }
 
   int ret = client->ping_monitor(mon_id, &str);
   if (ret == 0 && !str.empty() && outstr && outstrlen) {
     do_out_buffer(str, outstr, outstrlen);
   }
+  tracepoint(librados, rados_ping_monitor_exit, ret, ret < 0 ? NULL : outstr, ret < 0 ? NULL : outstrlen);
   return ret;
 }
 
@@ -2123,20 +2581,24 @@ extern "C" int rados_mon_command(rados_t cluster, const char **cmd,
 				 char **outbuf, size_t *outbuflen,
 				 char **outs, size_t *outslen)
 {
+  tracepoint(librados, rados_mon_command_enter, cluster, cmdlen, inbuf, inbuflen);
   librados::RadosClient *client = (librados::RadosClient *)cluster;
   bufferlist inbl;
   bufferlist outbl;
   string outstring;
   vector<string> cmdvec;
 
-  for (size_t i = 0; i < cmdlen; i++)
+  for (size_t i = 0; i < cmdlen; i++) {
+    tracepoint(librados, rados_mon_command_cmd, cmd[i]);
     cmdvec.push_back(cmd[i]);
+  }
 
   inbl.append(inbuf, inbuflen);
   int ret = client->mon_command(cmdvec, inbl, &outbl, &outstring);
 
   do_out_buffer(outbl, outbuf, outbuflen);
   do_out_buffer(outstring, outs, outslen);
+  tracepoint(librados, rados_mon_command_exit, ret, outbuf, outbuflen, outs, outslen);
   return ret;
 }
 
@@ -2147,6 +2609,7 @@ extern "C" int rados_mon_command_target(rados_t cluster, const char *name,
 					char **outbuf, size_t *outbuflen,
 					char **outs, size_t *outslen)
 {
+  tracepoint(librados, rados_mon_command_target_enter, cluster, name, cmdlen, inbuf, inbuflen);
   librados::RadosClient *client = (librados::RadosClient *)cluster;
   bufferlist inbl;
   bufferlist outbl;
@@ -2164,8 +2627,10 @@ extern "C" int rados_mon_command_target(rados_t cluster, const char *name,
     rank = -1;
   }
 
-  for (size_t i = 0; i < cmdlen; i++)
+  for (size_t i = 0; i < cmdlen; i++) {
+    tracepoint(librados, rados_mon_command_target_cmd, cmd[i]);
     cmdvec.push_back(cmd[i]);
+  }
 
   inbl.append(inbuf, inbuflen);
   int ret;
@@ -2176,6 +2641,7 @@ extern "C" int rados_mon_command_target(rados_t cluster, const char *name,
 
   do_out_buffer(outbl, outbuf, outbuflen);
   do_out_buffer(outstring, outs, outslen);
+  tracepoint(librados, rados_mon_command_target_exit, ret, outbuf, outbuflen, outs, outslen);
   return ret;
 }
 
@@ -2185,20 +2651,24 @@ extern "C" int rados_osd_command(rados_t cluster, int osdid, const char **cmd,
 				 char **outbuf, size_t *outbuflen,
 				 char **outs, size_t *outslen)
 {
+  tracepoint(librados, rados_osd_command_enter, cluster, osdid, cmdlen, inbuf, inbuflen);
   librados::RadosClient *client = (librados::RadosClient *)cluster;
   bufferlist inbl;
   bufferlist outbl;
   string outstring;
   vector<string> cmdvec;
 
-  for (size_t i = 0; i < cmdlen; i++)
+  for (size_t i = 0; i < cmdlen; i++) {
+    tracepoint(librados, rados_osd_command_cmd, cmd[i]);
     cmdvec.push_back(cmd[i]);
+  }
 
   inbl.append(inbuf, inbuflen);
   int ret = client->osd_command(osdid, cmdvec, inbl, &outbl, &outstring);
 
   do_out_buffer(outbl, outbuf, outbuflen);
   do_out_buffer(outstring, outs, outslen);
+  tracepoint(librados, rados_osd_command_exit, ret, outbuf, outbuflen, outs, outslen);
   return ret;
 }
 
@@ -2210,6 +2680,7 @@ extern "C" int rados_pg_command(rados_t cluster, const char *pgstr,
 				char **outbuf, size_t *outbuflen,
 				char **outs, size_t *outslen)
 {
+  tracepoint(librados, rados_pg_command_enter, cluster, pgstr, cmdlen, inbuf, inbuflen);
   librados::RadosClient *client = (librados::RadosClient *)cluster;
   bufferlist inbl;
   bufferlist outbl;
@@ -2217,8 +2688,10 @@ extern "C" int rados_pg_command(rados_t cluster, const char *pgstr,
   pg_t pgid;
   vector<string> cmdvec;
 
-  for (size_t i = 0; i < cmdlen; i++)
+  for (size_t i = 0; i < cmdlen; i++) {
+    tracepoint(librados, rados_pg_command_cmd, cmd[i]);
     cmdvec.push_back(cmd[i]);
+  }
 
   inbl.append(inbuf, inbuflen);
   if (!pgid.parse(pgstr))
@@ -2228,54 +2701,94 @@ extern "C" int rados_pg_command(rados_t cluster, const char *pgstr,
 
   do_out_buffer(outbl, outbuf, outbuflen);
   do_out_buffer(outstring, outs, outslen);
+  tracepoint(librados, rados_pg_command_exit, ret, outbuf, outbuflen, outs, outslen);
   return ret;
 }
 
 extern "C" void rados_buffer_free(char *buf)
 {
+  tracepoint(librados, rados_buffer_free_enter, buf);
   if (buf)
     free(buf);
+  tracepoint(librados, rados_buffer_free_exit);
 }
 
 extern "C" int rados_monitor_log(rados_t cluster, const char *level, rados_log_callback_t cb, void *arg)
 {
+  tracepoint(librados, rados_monitor_log_enter, cluster, level, cb, arg);
   librados::RadosClient *client = (librados::RadosClient *)cluster;
-  return client->monitor_log(level, cb, arg);
+  int retval = client->monitor_log(level, cb, arg);
+  tracepoint(librados, rados_monitor_log_exit, retval);
+  return retval;
 }
-
 
 extern "C" int rados_ioctx_create(rados_t cluster, const char *name, rados_ioctx_t *io)
 {
+  tracepoint(librados, rados_ioctx_create_enter, cluster, name);
   librados::RadosClient *client = (librados::RadosClient *)cluster;
   librados::IoCtxImpl *ctx;
 
   int r = client->create_ioctx(name, &ctx);
-  if (r < 0)
+  if (r < 0) {
+    tracepoint(librados, rados_ioctx_create_exit, r, NULL);
     return r;
+  }
 
   *io = ctx;
   ctx->get();
+  tracepoint(librados, rados_ioctx_create_exit, 0, ctx);
+  return 0;
+}
+
+extern "C" int rados_ioctx_create2(rados_t cluster, int64_t pool_id,
+                                   rados_ioctx_t *io)
+{
+  tracepoint(librados, rados_ioctx_create2_enter, cluster, pool_id);
+  librados::RadosClient *client = (librados::RadosClient *)cluster;
+  librados::IoCtxImpl *ctx;
+
+  int r = client->create_ioctx(pool_id, &ctx);
+  if (r < 0) {
+    tracepoint(librados, rados_ioctx_create2_exit, r, NULL);
+    return r;
+  }
+
+  *io = ctx;
+  ctx->get();
+  tracepoint(librados, rados_ioctx_create2_exit, 0, ctx);
   return 0;
 }
 
 extern "C" void rados_ioctx_destroy(rados_ioctx_t io)
 {
+  tracepoint(librados, rados_ioctx_destroy_enter, io);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   ctx->put();
+  tracepoint(librados, rados_ioctx_destroy_exit);
 }
 
 extern "C" int rados_ioctx_pool_stat(rados_ioctx_t io, struct rados_pool_stat_t *stats)
 {
+  tracepoint(librados, rados_ioctx_pool_stat_enter, io);
   librados::IoCtxImpl *io_ctx_impl = (librados::IoCtxImpl *)io;
   list<string> ls;
-  ls.push_back(io_ctx_impl->pool_name);
-  map<string, ::pool_stat_t> rawresult;
+  std::string pool_name;
 
-  int err = io_ctx_impl->client->get_pool_stats(ls, rawresult);
-  if (err)
+  int err = io_ctx_impl->client->pool_get_name(io_ctx_impl->get_id(), &pool_name);
+  if (err) {
+    tracepoint(librados, rados_ioctx_pool_stat_exit, err, stats);
     return err;
+  }
+  ls.push_back(pool_name);
 
-  ::pool_stat_t& r = rawresult[io_ctx_impl->pool_name];
+  map<string, ::pool_stat_t> rawresult;
+  err = io_ctx_impl->client->get_pool_stats(ls, rawresult);
+  if (err) {
+    tracepoint(librados, rados_ioctx_pool_stat_exit, err, stats);
+    return err;
+  }
+
+  ::pool_stat_t& r = rawresult[pool_name];
   stats->num_kb = SHIFT_ROUND_UP(r.stats.sum.num_bytes, 10);
   stats->num_bytes = r.stats.sum.num_bytes;
   stats->num_objects = r.stats.sum.num_objects;
@@ -2283,88 +2796,125 @@ extern "C" int rados_ioctx_pool_stat(rados_ioctx_t io, struct rados_pool_stat_t 
   stats->num_object_copies = r.stats.sum.num_object_copies;
   stats->num_objects_missing_on_primary = r.stats.sum.num_objects_missing_on_primary;
   stats->num_objects_unfound = r.stats.sum.num_objects_unfound;
-  stats->num_objects_degraded = r.stats.sum.num_objects_degraded;
+  stats->num_objects_degraded =
+    r.stats.sum.num_objects_degraded +
+    r.stats.sum.num_objects_misplaced; // FIXME: this is imprecise
   stats->num_rd = r.stats.sum.num_rd;
   stats->num_rd_kb = r.stats.sum.num_rd_kb;
   stats->num_wr = r.stats.sum.num_wr;
   stats->num_wr_kb = r.stats.sum.num_wr_kb;
+  tracepoint(librados, rados_ioctx_pool_stat_exit, 0, stats);
   return 0;
 }
 
 extern "C" rados_config_t rados_ioctx_cct(rados_ioctx_t io)
 {
+  tracepoint(librados, rados_ioctx_cct_enter, io);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
-  return (rados_config_t)ctx->client->cct;
+  rados_config_t retval = (rados_config_t)ctx->client->cct;
+  tracepoint(librados, rados_ioctx_cct_exit, retval);
+  return retval;
 }
 
 extern "C" void rados_ioctx_snap_set_read(rados_ioctx_t io, rados_snap_t seq)
 {
+  tracepoint(librados, rados_ioctx_snap_set_read_enter, io, seq);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   ctx->set_snap_read((snapid_t)seq);
+  tracepoint(librados, rados_ioctx_snap_set_read_exit);
 }
 
 extern "C" int rados_ioctx_selfmanaged_snap_set_write_ctx(rados_ioctx_t io,
 	    rados_snap_t seq, rados_snap_t *snaps, int num_snaps)
 {
+  tracepoint(librados, rados_ioctx_selfmanaged_snap_set_write_ctx_enter, io, seq, snaps, num_snaps);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   vector<snapid_t> snv;
   snv.resize(num_snaps);
-  for (int i=0; i<num_snaps; i++)
+  for (int i=0; i<num_snaps; i++) {
     snv[i] = (snapid_t)snaps[i];
-  return ctx->set_snap_write_context((snapid_t)seq, snv);
+  }
+  int retval = ctx->set_snap_write_context((snapid_t)seq, snv);
+  tracepoint(librados, rados_ioctx_selfmanaged_snap_set_write_ctx_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_write(rados_ioctx_t io, const char *o, const char *buf, size_t len, uint64_t off)
 {
+  tracepoint(librados, rados_write_enter, io, o, buf, len, off);
+  if (len > UINT_MAX/2)
+    return -E2BIG;
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   object_t oid(o);
   bufferlist bl;
   bl.append(buf, len);
-  return ctx->write(oid, bl, len, off);
+  int retval = ctx->write(oid, bl, len, off);
+  tracepoint(librados, rados_write_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_append(rados_ioctx_t io, const char *o, const char *buf, size_t len)
 {
+  tracepoint(librados, rados_append_enter, io, o, buf, len);
+  if (len > UINT_MAX/2)
+    return -E2BIG;
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   object_t oid(o);
   bufferlist bl;
   bl.append(buf, len);
-  return ctx->append(oid, bl, len);
+  int retval = ctx->append(oid, bl, len);
+  tracepoint(librados, rados_append_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_write_full(rados_ioctx_t io, const char *o, const char *buf, size_t len)
 {
+  tracepoint(librados, rados_write_full_enter, io, o, buf, len);
+  if (len > UINT_MAX/2)
+    return -E2BIG;
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   object_t oid(o);
   bufferlist bl;
   bl.append(buf, len);
-  return ctx->write_full(oid, bl);
+  int retval = ctx->write_full(oid, bl);
+  tracepoint(librados, rados_write_full_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_clone_range(rados_ioctx_t io, const char *dst, uint64_t dst_off,
                                  const char *src, uint64_t src_off, size_t len)
 {
+  tracepoint(librados, rados_clone_range_enter, io, dst, dst_off, src, src_off, len);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   object_t dst_oid(dst), src_oid(src);
-  return ctx->clone_range(dst_oid, dst_off, src_oid, src_off, len);
+  int retval = ctx->clone_range(dst_oid, dst_off, src_oid, src_off, len);
+  tracepoint(librados, rados_clone_range_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_trunc(rados_ioctx_t io, const char *o, uint64_t size)
 {
+  tracepoint(librados, rados_trunc_enter, io, o, size);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   object_t oid(o);
-  return ctx->trunc(oid, size);
+  int retval = ctx->trunc(oid, size);
+  tracepoint(librados, rados_trunc_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_remove(rados_ioctx_t io, const char *o)
 {
+  tracepoint(librados, rados_remove_enter, io, o);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   object_t oid(o);
-  return ctx->remove(oid);
+  int retval = ctx->remove(oid);
+  tracepoint(librados, rados_remove_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_read(rados_ioctx_t io, const char *o, char *buf, size_t len, uint64_t off)
 {
+  tracepoint(librados, rados_read_enter, io, o, buf, len, off);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   int ret;
   object_t oid(o);
@@ -2375,141 +2925,214 @@ extern "C" int rados_read(rados_ioctx_t io, const char *o, char *buf, size_t len
 
   ret = ctx->read(oid, bl, len, off);
   if (ret >= 0) {
-    if (bl.length() > len)
+    if (bl.length() > len) {
+      tracepoint(librados, rados_read_exit, -ERANGE, NULL);
       return -ERANGE;
+    }
     if (bl.c_str() != buf)
       bl.copy(0, bl.length(), buf);
     ret = bl.length();    // hrm :/
   }
 
+  tracepoint(librados, rados_read_exit, ret, buf);
   return ret;
 }
 
 extern "C" uint64_t rados_get_last_version(rados_ioctx_t io)
 {
+  tracepoint(librados, rados_get_last_version_enter, io);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
-  return ctx->last_version();
+  uint64_t retval = ctx->last_version();
+  tracepoint(librados, rados_get_last_version_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_pool_create(rados_t cluster, const char *name)
 {
+  tracepoint(librados, rados_pool_create_enter, cluster, name);
   librados::RadosClient *radosp = (librados::RadosClient *)cluster;
   string sname(name);
-  return radosp->pool_create(sname);
+  int retval = radosp->pool_create(sname);
+  tracepoint(librados, rados_pool_create_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_pool_create_with_auid(rados_t cluster, const char *name,
 					   uint64_t auid)
 {
+  tracepoint(librados, rados_pool_create_with_auid_enter, cluster, name, auid);
   librados::RadosClient *radosp = (librados::RadosClient *)cluster;
   string sname(name);
-  return radosp->pool_create(sname, auid);
+  int retval = radosp->pool_create(sname, auid);
+  tracepoint(librados, rados_pool_create_with_auid_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_pool_create_with_crush_rule(rados_t cluster, const char *name,
 						 __u8 crush_rule_num)
 {
+  tracepoint(librados, rados_pool_create_with_crush_rule_enter, cluster, name, crush_rule_num);
   librados::RadosClient *radosp = (librados::RadosClient *)cluster;
   string sname(name);
-  return radosp->pool_create(sname, 0, crush_rule_num);
+  int retval = radosp->pool_create(sname, 0, crush_rule_num);
+  tracepoint(librados, rados_pool_create_with_crush_rule_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_pool_create_with_all(rados_t cluster, const char *name,
 					  uint64_t auid, __u8 crush_rule_num)
 {
+  tracepoint(librados, rados_pool_create_with_all_enter, cluster, name, auid, crush_rule_num);
   librados::RadosClient *radosp = (librados::RadosClient *)cluster;
   string sname(name);
-  return radosp->pool_create(sname, auid, crush_rule_num);
+  int retval = radosp->pool_create(sname, auid, crush_rule_num);
+  tracepoint(librados, rados_pool_create_with_all_exit, retval);
+  return retval;
+}
+
+extern "C" int rados_pool_get_base_tier(rados_t cluster, int64_t pool_id, int64_t* base_tier)
+{
+  tracepoint(librados, rados_pool_get_base_tier_enter, cluster, pool_id);
+  librados::RadosClient *client = (librados::RadosClient *)cluster;
+  int retval = client->pool_get_base_tier(pool_id, base_tier);
+  tracepoint(librados, rados_pool_get_base_tier_exit, retval, *base_tier);
+  return retval;
 }
 
 extern "C" int rados_pool_delete(rados_t cluster, const char *pool_name)
 {
+  tracepoint(librados, rados_pool_delete_enter, cluster, pool_name);
   librados::RadosClient *client = (librados::RadosClient *)cluster;
-  return client->pool_delete(pool_name);
+  int retval = client->pool_delete(pool_name);
+  tracepoint(librados, rados_pool_delete_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_ioctx_pool_set_auid(rados_ioctx_t io, uint64_t auid)
 {
+  tracepoint(librados, rados_ioctx_pool_set_auid_enter, io, auid);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
-  return ctx->pool_change_auid(auid);
+  int retval = ctx->pool_change_auid(auid);
+  tracepoint(librados, rados_ioctx_pool_set_auid_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_ioctx_pool_get_auid(rados_ioctx_t io, uint64_t *auid)
 {
+  tracepoint(librados, rados_ioctx_pool_get_auid_enter, io);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
-  return ctx->client->pool_get_auid(ctx->get_id(), (unsigned long long *)auid);
+  int retval = ctx->client->pool_get_auid(ctx->get_id(), (unsigned long long *)auid);
+  tracepoint(librados, rados_ioctx_pool_get_auid_exit, retval, *auid);
+  return retval;
 }
 
 extern "C" int rados_ioctx_pool_requires_alignment(rados_ioctx_t io)
 {
+  tracepoint(librados, rados_ioctx_pool_requires_alignment_enter, io);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
-  return ctx->client->pool_requires_alignment(ctx->get_id());
+  int retval = ctx->client->pool_requires_alignment(ctx->get_id());
+  tracepoint(librados, rados_ioctx_pool_requires_alignment_exit, retval);
+  return retval;
 }
 
 extern "C" uint64_t rados_ioctx_pool_required_alignment(rados_ioctx_t io)
 {
+  tracepoint(librados, rados_ioctx_pool_required_alignment_enter, io);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
-  return ctx->client->pool_required_alignment(ctx->get_id());
+  uint64_t retval = ctx->client->pool_required_alignment(ctx->get_id());
+  tracepoint(librados, rados_ioctx_pool_required_alignment_exit, retval);
+  return retval;
 }
 
 extern "C" void rados_ioctx_locator_set_key(rados_ioctx_t io, const char *key)
 {
+  tracepoint(librados, rados_ioctx_locator_set_key_enter, io, key);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   if (key)
     ctx->oloc.key = key;
   else
     ctx->oloc.key = "";
+  tracepoint(librados, rados_ioctx_locator_set_key_exit);
 }
 
 extern "C" void rados_ioctx_set_namespace(rados_ioctx_t io, const char *nspace)
 {
+  tracepoint(librados, rados_ioctx_set_namespace_enter, io, nspace);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   if (nspace)
     ctx->oloc.nspace = nspace;
   else
     ctx->oloc.nspace = "";
+  tracepoint(librados, rados_ioctx_set_namespace_exit);
 }
 
 extern "C" rados_t rados_ioctx_get_cluster(rados_ioctx_t io)
 {
+  tracepoint(librados, rados_ioctx_get_cluster_enter, io);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
-  return (rados_t)ctx->client;
+  rados_t retval = (rados_t)ctx->client;
+  tracepoint(librados, rados_ioctx_get_cluster_exit, retval);
+  return retval;
 }
 
 extern "C" int64_t rados_ioctx_get_id(rados_ioctx_t io)
 {
+  tracepoint(librados, rados_ioctx_get_id_enter, io);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
-  return ctx->get_id();
+  int64_t retval = ctx->get_id();
+  tracepoint(librados, rados_ioctx_get_id_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_ioctx_get_pool_name(rados_ioctx_t io, char *s, unsigned maxlen)
 {
+  tracepoint(librados, rados_ioctx_get_pool_name_enter, io, maxlen);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
-  if (ctx->pool_name.length() >= maxlen)
+  std::string pool_name;
+
+  int err = ctx->client->pool_get_name(ctx->get_id(), &pool_name);
+  if (err) {
+    tracepoint(librados, rados_ioctx_get_pool_name_exit, err, "");
+    return err;
+  }
+  if (pool_name.length() >= maxlen) {
+    tracepoint(librados, rados_ioctx_get_pool_name_exit, -ERANGE, "");
     return -ERANGE;
-  strcpy(s, ctx->pool_name.c_str());
-  return ctx->pool_name.length();
+  }
+  strcpy(s, pool_name.c_str());
+  int retval = pool_name.length();
+  tracepoint(librados, rados_ioctx_get_pool_name_exit, retval, s);
+  return retval;
 }
 
 // snaps
 
 extern "C" int rados_ioctx_snap_create(rados_ioctx_t io, const char *snapname)
 {
+  tracepoint(librados, rados_ioctx_snap_create_enter, io, snapname);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
-  return ctx->snap_create(snapname);
+  int retval = ctx->snap_create(snapname);
+  tracepoint(librados, rados_ioctx_snap_create_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_ioctx_snap_remove(rados_ioctx_t io, const char *snapname)
 {
+  tracepoint(librados, rados_ioctx_snap_remove_enter, io, snapname);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
-  return ctx->snap_remove(snapname);
+  int retval = ctx->snap_remove(snapname);
+  tracepoint(librados, rados_ioctx_snap_remove_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_ioctx_snap_rollback(rados_ioctx_t io, const char *oid,
 			      const char *snapname)
 {
+  tracepoint(librados, rados_ioctx_snap_rollback_enter, io, oid, snapname);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
-  return ctx->rollback(oid, snapname);
+  int retval = ctx->rollback(oid, snapname);
+  tracepoint(librados, rados_ioctx_snap_rollback_exit, retval);
+  return retval;
 }
 
 // Deprecated name kept for backward compatibility
@@ -2522,132 +3145,158 @@ extern "C" int rados_rollback(rados_ioctx_t io, const char *oid,
 extern "C" int rados_ioctx_selfmanaged_snap_create(rados_ioctx_t io,
 					     uint64_t *snapid)
 {
+  tracepoint(librados, rados_ioctx_selfmanaged_snap_create_enter, io);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
-  return ctx->selfmanaged_snap_create(snapid);
+  int retval = ctx->selfmanaged_snap_create(snapid);
+  tracepoint(librados, rados_ioctx_selfmanaged_snap_create_exit, retval, *snapid);
+  return retval;
 }
 
 extern "C" int rados_ioctx_selfmanaged_snap_remove(rados_ioctx_t io,
 					     uint64_t snapid)
 {
+  tracepoint(librados, rados_ioctx_selfmanaged_snap_remove_enter, io, snapid);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
-  return ctx->selfmanaged_snap_remove(snapid);
+  int retval = ctx->selfmanaged_snap_remove(snapid);
+  tracepoint(librados, rados_ioctx_selfmanaged_snap_remove_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_ioctx_selfmanaged_snap_rollback(rados_ioctx_t io,
 						     const char *oid,
 						     uint64_t snapid)
 {
+  tracepoint(librados, rados_ioctx_selfmanaged_snap_rollback_enter, io, oid, snapid);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
-  return ctx->selfmanaged_snap_rollback_object(oid, ctx->snapc, snapid);
+  int retval = ctx->selfmanaged_snap_rollback_object(oid, ctx->snapc, snapid);
+  tracepoint(librados, rados_ioctx_selfmanaged_snap_rollback_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_ioctx_snap_list(rados_ioctx_t io, rados_snap_t *snaps,
 				    int maxlen)
 {
+  tracepoint(librados, rados_ioctx_snap_list_enter, io, maxlen);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   vector<uint64_t> snapvec;
   int r = ctx->snap_list(&snapvec);
-  if (r < 0)
+  if (r < 0) {
+    tracepoint(librados, rados_ioctx_snap_list_exit, r, snaps, 0);
     return r;
-  if ((int)snapvec.size() <= maxlen) {
-    for (unsigned i=0; i<snapvec.size(); i++)
-      snaps[i] = snapvec[i];
-    return snapvec.size();
   }
-  return -ERANGE;
+  if ((int)snapvec.size() <= maxlen) {
+    for (unsigned i=0; i<snapvec.size(); i++) {
+      snaps[i] = snapvec[i];
+    }
+    int retval = snapvec.size();
+    tracepoint(librados, rados_ioctx_snap_list_exit, retval, snaps, retval);
+    return retval;
+  }
+  int retval = -ERANGE;
+  tracepoint(librados, rados_ioctx_snap_list_exit, retval, snaps, 0);
+  return retval;
 }
 
 extern "C" int rados_ioctx_snap_lookup(rados_ioctx_t io, const char *name,
 				      rados_snap_t *id)
 {
+  tracepoint(librados, rados_ioctx_snap_lookup_enter, io, name);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
-  return ctx->snap_lookup(name, (uint64_t *)id);
+  int retval = ctx->snap_lookup(name, (uint64_t *)id);
+  tracepoint(librados, rados_ioctx_snap_lookup_exit, retval, *id);
+  return retval;
 }
 
 extern "C" int rados_ioctx_snap_get_name(rados_ioctx_t io, rados_snap_t id,
 					char *name, int maxlen)
 {
+  tracepoint(librados, rados_ioctx_snap_get_name_enter, io, id, maxlen);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   std::string sname;
   int r = ctx->snap_get_name(id, &sname);
-  if (r < 0)
+  if (r < 0) {
+    tracepoint(librados, rados_ioctx_snap_get_name_exit, r, "");
     return r;
-  if ((int)sname.length() >= maxlen)
-    return -ERANGE;
+  }
+  if ((int)sname.length() >= maxlen) {
+    int retval = -ERANGE;
+    tracepoint(librados, rados_ioctx_snap_get_name_exit, retval, "");
+    return retval;
+  }
   strncpy(name, sname.c_str(), maxlen);
+  tracepoint(librados, rados_ioctx_snap_get_name_exit, 0, name);
   return 0;
 }
 
 extern "C" int rados_ioctx_snap_get_stamp(rados_ioctx_t io, rados_snap_t id, time_t *t)
 {
+  tracepoint(librados, rados_ioctx_snap_get_stamp_enter, io, id);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
-  return ctx->snap_get_stamp(id, t);
+  int retval = ctx->snap_get_stamp(id, t);
+  tracepoint(librados, rados_ioctx_snap_get_stamp_exit, retval, *t);
+  return retval;
 }
 
 extern "C" int rados_getxattr(rados_ioctx_t io, const char *o, const char *name,
 			      char *buf, size_t len)
 {
+  tracepoint(librados, rados_getxattr_enter, io, o, name, len);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   int ret;
   object_t oid(o);
   bufferlist bl;
+  bl.push_back(buffer::create_static(len, buf));
   ret = ctx->getxattr(oid, name, bl);
   if (ret >= 0) {
-    if (bl.length() > len)
+    if (bl.length() > len) {
+      tracepoint(librados, rados_getxattr_exit, -ERANGE, buf, 0);
       return -ERANGE;
-    bl.copy(0, bl.length(), buf);
+    }
+    if (bl.c_str() !=  buf)
+      bl.copy(0, bl.length(), buf);
     ret = bl.length();
   }
 
+  tracepoint(librados, rados_getxattr_exit, ret, buf, ret);
   return ret;
 }
-
-class RadosXattrsIter {
-public:
-  RadosXattrsIter()
-    : val(NULL)
-  {
-    i = attrset.end();
-  }
-  ~RadosXattrsIter()
-  {
-    free(val);
-    val = NULL;
-  }
-  std::map<std::string, bufferlist> attrset;
-  std::map<std::string, bufferlist>::iterator i;
-  char *val;
-};
 
 extern "C" int rados_getxattrs(rados_ioctx_t io, const char *oid,
 			       rados_xattrs_iter_t *iter)
 {
-  RadosXattrsIter *it = new RadosXattrsIter();
-  if (!it)
+  tracepoint(librados, rados_getxattrs_enter, io, oid);
+  librados::RadosXattrsIter *it = new librados::RadosXattrsIter();
+  if (!it) {
+    tracepoint(librados, rados_getxattrs_exit, -ENOMEM, NULL);
     return -ENOMEM;
+  }
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   object_t obj(oid);
   int ret = ctx->getxattrs(obj, it->attrset);
   if (ret) {
     delete it;
+    tracepoint(librados, rados_getxattrs_exit, ret, NULL);
     return ret;
   }
   it->i = it->attrset.begin();
 
-  RadosXattrsIter **iret = (RadosXattrsIter**)iter;
+  librados::RadosXattrsIter **iret = (librados::RadosXattrsIter**)iter;
   *iret = it;
   *iter = it;
+  tracepoint(librados, rados_getxattrs_exit, 0, *iter);
   return 0;
 }
 
 extern "C" int rados_getxattrs_next(rados_xattrs_iter_t iter,
 				    const char **name, const char **val, size_t *len)
 {
-  RadosXattrsIter *it = static_cast<RadosXattrsIter*>(iter);
+  tracepoint(librados, rados_getxattrs_next_enter, iter);
+  librados::RadosXattrsIter *it = static_cast<librados::RadosXattrsIter*>(iter);
   if (it->i == it->attrset.end()) {
     *name = NULL;
     *val = NULL;
     *len = 0;
+    tracepoint(librados, rados_getxattrs_next_exit, 0, NULL, NULL, 0);
     return 0;
   }
   free(it->val);
@@ -2656,86 +3305,117 @@ extern "C" int rados_getxattrs_next(rados_xattrs_iter_t iter,
   bufferlist &bl(it->i->second);
   size_t bl_len = bl.length();
   it->val = (char*)malloc(bl_len);
-  if (!it->val)
+  if (!it->val) {
+    tracepoint(librados, rados_getxattrs_next_exit, -ENOMEM, *name, NULL, 0);
     return -ENOMEM;
+  }
   memcpy(it->val, bl.c_str(), bl_len);
   *val = it->val;
   *len = bl_len;
   ++it->i;
+  tracepoint(librados, rados_getxattrs_next_exit, 0, *name, *val, *len);
   return 0;
 }
 
 extern "C" void rados_getxattrs_end(rados_xattrs_iter_t iter)
 {
-  RadosXattrsIter *it = static_cast<RadosXattrsIter*>(iter);
+  tracepoint(librados, rados_getxattrs_end_enter, iter);
+  librados::RadosXattrsIter *it = static_cast<librados::RadosXattrsIter*>(iter);
   delete it;
+  tracepoint(librados, rados_getxattrs_end_exit);
 }
 
 extern "C" int rados_setxattr(rados_ioctx_t io, const char *o, const char *name, const char *buf, size_t len)
 {
+  tracepoint(librados, rados_setxattr_enter, io, o, name, buf, len);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   object_t oid(o);
   bufferlist bl;
   bl.append(buf, len);
-  return ctx->setxattr(oid, name, bl);
+  int retval = ctx->setxattr(oid, name, bl);
+  tracepoint(librados, rados_setxattr_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_rmxattr(rados_ioctx_t io, const char *o, const char *name)
 {
+  tracepoint(librados, rados_rmxattr_enter, io, o, name);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   object_t oid(o);
-  return ctx->rmxattr(oid, name);
+  int retval = ctx->rmxattr(oid, name);
+  tracepoint(librados, rados_rmxattr_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_stat(rados_ioctx_t io, const char *o, uint64_t *psize, time_t *pmtime)
 {
+  tracepoint(librados, rados_stat_enter, io, o);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   object_t oid(o);
-  return ctx->stat(oid, psize, pmtime);
+  int retval = ctx->stat(oid, psize, pmtime);
+  tracepoint(librados, rados_stat_exit, retval, psize, pmtime);
+  return retval;
 }
 
 extern "C" int rados_tmap_update(rados_ioctx_t io, const char *o, const char *cmdbuf, size_t cmdbuflen)
 {
+  tracepoint(librados, rados_tmap_update_enter, io, o, cmdbuf, cmdbuflen);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   object_t oid(o);
   bufferlist cmdbl;
   cmdbl.append(cmdbuf, cmdbuflen);
-  return ctx->tmap_update(oid, cmdbl);
+  int retval = ctx->tmap_update(oid, cmdbl);
+  tracepoint(librados, rados_tmap_update_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_tmap_put(rados_ioctx_t io, const char *o, const char *buf, size_t buflen)
 {
+  tracepoint(librados, rados_tmap_put_enter, io, o, buf, buflen);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   object_t oid(o);
   bufferlist bl;
   bl.append(buf, buflen);
-  return ctx->tmap_put(oid, bl);
+  int retval = ctx->tmap_put(oid, bl);
+  tracepoint(librados, rados_tmap_put_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_tmap_get(rados_ioctx_t io, const char *o, char *buf, size_t buflen)
 {
+  tracepoint(librados, rados_tmap_get_enter, io, o, buflen);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   object_t oid(o);
   bufferlist bl;
   int r = ctx->tmap_get(oid, bl);
-  if (r < 0)
+  if (r < 0) {
+    tracepoint(librados, rados_tmap_get_exit, r, buf, 0);
     return r;
-  if (bl.length() > buflen)
+  }
+  if (bl.length() > buflen) {
+    tracepoint(librados, rados_tmap_get_exit, -ERANGE, buf, 0);
     return -ERANGE;
+  }
   bl.copy(0, bl.length(), buf);
-  return bl.length();
+  int retval = bl.length();
+  tracepoint(librados, rados_tmap_get_exit, retval, buf, retval);
+  return retval;
 }
 
 extern "C" int rados_tmap_to_omap(rados_ioctx_t io, const char *o, bool nullok)
 {
+  tracepoint(librados, rados_tmap_to_omap_enter, io, o, nullok);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   object_t oid(o);
-  return ctx->tmap_to_omap(oid, nullok);
+  int retval = ctx->tmap_to_omap(oid, nullok);
+  tracepoint(librados, rados_tmap_to_omap_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_exec(rados_ioctx_t io, const char *o, const char *cls, const char *method,
                          const char *inbuf, size_t in_len, char *buf, size_t out_len)
 {
+  tracepoint(librados, rados_exec_enter, io, o, cls, method, inbuf, in_len, out_len);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   object_t oid(o);
   bufferlist inbl, outbl;
@@ -2744,53 +3424,175 @@ extern "C" int rados_exec(rados_ioctx_t io, const char *o, const char *cls, cons
   ret = ctx->exec(oid, cls, method, inbl, outbl);
   if (ret >= 0) {
     if (outbl.length()) {
-      if (outbl.length() > out_len)
+      if (outbl.length() > out_len) {
+	tracepoint(librados, rados_exec_exit, -ERANGE, buf, 0);
 	return -ERANGE;
+      }
       outbl.copy(0, outbl.length(), buf);
       ret = outbl.length();   // hrm :/
     }
   }
+  tracepoint(librados, rados_exec_exit, ret, buf, ret);
   return ret;
 }
 
 /* list objects */
 
-extern "C" int rados_objects_list_open(rados_ioctx_t io, rados_list_ctx_t *listh)
+extern "C" int rados_nobjects_list_open(rados_ioctx_t io, rados_list_ctx_t *listh)
 {
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
+
+  // Let's do it the old way for backward compatbility if not using ANY_NSPACES
+  if (ctx->oloc.nspace != librados::all_nspaces)
+    return rados_objects_list_open(io, listh);
+
+  tracepoint(librados, rados_nobjects_list_open_enter, io);
+
+  Objecter::NListContext *h = new Objecter::NListContext;
+  h->pool_id = ctx->poolid;
+  h->pool_snap_seq = ctx->snap_seq;
+  h->nspace = ctx->oloc.nspace;	// After dropping compatibility need nspace
+  *listh = (void *)new librados::ObjListCtx(ctx, h);
+  tracepoint(librados, rados_nobjects_list_open_exit, 0, *listh);
+  return 0;
+}
+
+extern "C" void rados_nobjects_list_close(rados_list_ctx_t h)
+{
+  tracepoint(librados, rados_nobjects_list_close_enter, h);
+  librados::ObjListCtx *lh = (librados::ObjListCtx *)h;
+  delete lh;
+  tracepoint(librados, rados_nobjects_list_close_exit);
+}
+
+extern "C" uint32_t rados_nobjects_list_seek(rados_list_ctx_t listctx,
+					    uint32_t pos)
+{
+  librados::ObjListCtx *lh = (librados::ObjListCtx *)listctx;
+
+  // Let's do it the old way for backward compatbility if not using ANY_NSPACES
+  if (!lh->new_request)
+    return rados_objects_list_seek(listctx, pos);
+
+  tracepoint(librados, rados_nobjects_list_seek_enter, listctx, pos);
+  uint32_t r = lh->ctx->nlist_seek(lh->nlc, pos);
+  tracepoint(librados, rados_nobjects_list_seek_exit, r);
+  return r;
+}
+
+extern "C" uint32_t rados_nobjects_list_get_pg_hash_position(
+  rados_list_ctx_t listctx)
+{
+  librados::ObjListCtx *lh = (librados::ObjListCtx *)listctx;
+  if (!lh->new_request)
+    return rados_objects_list_get_pg_hash_position(listctx);
+
+  tracepoint(librados, rados_nobjects_list_get_pg_hash_position_enter, listctx);
+  uint32_t retval = lh->nlc->get_pg_hash_position();
+  tracepoint(librados, rados_nobjects_list_get_pg_hash_position_exit, retval);
+  return retval;
+}
+
+// Deprecated, but using it for compatibility with older OSDs
+extern "C" int rados_objects_list_open(rados_ioctx_t io, rados_list_ctx_t *listh)
+{
+  tracepoint(librados, rados_objects_list_open_enter, io);
+  librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
+  if (ctx->oloc.nspace == librados::all_nspaces)
+    return -EINVAL;
   Objecter::ListContext *h = new Objecter::ListContext;
   h->pool_id = ctx->poolid;
   h->pool_snap_seq = ctx->snap_seq;
   h->nspace = ctx->oloc.nspace;
   *listh = (void *)new librados::ObjListCtx(ctx, h);
+  tracepoint(librados, rados_objects_list_open_exit, 0, *listh);
   return 0;
 }
 
+// Deprecated, but using it for compatibility with older OSDs
 extern "C" void rados_objects_list_close(rados_list_ctx_t h)
 {
+  tracepoint(librados, rados_objects_list_close_enter, h);
   librados::ObjListCtx *lh = (librados::ObjListCtx *)h;
   delete lh;
+  tracepoint(librados, rados_objects_list_close_exit);
 }
 
 extern "C" uint32_t rados_objects_list_seek(rados_list_ctx_t listctx,
 					    uint32_t pos)
 {
+  tracepoint(librados, rados_objects_list_seek_enter, listctx, pos);
   librados::ObjListCtx *lh = (librados::ObjListCtx *)listctx;
   uint32_t r = lh->ctx->list_seek(lh->lc, pos);
+  tracepoint(librados, rados_objects_list_seek_exit, r);
   return r;
 }
 
 extern "C" uint32_t rados_objects_list_get_pg_hash_position(
   rados_list_ctx_t listctx)
 {
+  tracepoint(librados, rados_objects_list_get_pg_hash_position_enter, listctx);
   librados::ObjListCtx *lh = (librados::ObjListCtx *)listctx;
-  return lh->lc->get_pg_hash_position();
+  uint32_t retval = lh->lc->get_pg_hash_position();
+  tracepoint(librados, rados_objects_list_get_pg_hash_position_exit, retval);
+  return retval;
 }
 
+extern "C" int rados_nobjects_list_next(rados_list_ctx_t listctx, const char **entry, const char **key, const char **nspace)
+{
+  tracepoint(librados, rados_nobjects_list_next_enter, listctx);
+  librados::ObjListCtx *lh = (librados::ObjListCtx *)listctx;
+  if (!lh->new_request) {
+    int retval = rados_objects_list_next(listctx, entry, key);
+    // Let's return nspace as you would expect even when asking
+    // for a specific one, since you know what it must be.
+    if (retval == 0 && nspace)
+      *nspace = lh->ctx->oloc.nspace.c_str();
+    return retval;
+  }
+  Objecter::NListContext *h = lh->nlc;
+
+  // if the list is non-empty, this method has been called before
+  if (!h->list.empty())
+    // so let's kill the previously-returned object
+    h->list.pop_front();
+
+  if (h->list.empty()) {
+    int ret = lh->ctx->nlist(lh->nlc, RADOS_LIST_MAX_ENTRIES);
+    if (ret < 0) {
+      tracepoint(librados, rados_nobjects_list_next_exit, ret, NULL, NULL, NULL);
+      return ret;
+    }
+    if (h->list.empty()) {
+      tracepoint(librados, rados_nobjects_list_next_exit, -ENOENT, NULL, NULL, NULL);
+      return -ENOENT;
+    }
+  }
+
+  *entry = h->list.front().oid.c_str();
+
+  if (key) {
+    if (h->list.front().locator.size())
+      *key = h->list.front().locator.c_str();
+    else
+      *key = NULL;
+  }
+  if (nspace)
+    *nspace = h->list.front().nspace.c_str();
+  tracepoint(librados, rados_nobjects_list_next_exit, 0, *entry, key, nspace);
+  return 0;
+}
+
+// DEPRECATED
 extern "C" int rados_objects_list_next(rados_list_ctx_t listctx, const char **entry, const char **key)
 {
+  tracepoint(librados, rados_objects_list_next_enter, listctx);
   librados::ObjListCtx *lh = (librados::ObjListCtx *)listctx;
   Objecter::ListContext *h = lh->lc;
+
+  // Calling wrong interface after rados_nobjects_list_open()
+  if (lh->new_request)
+    return -EINVAL;
 
   // if the list is non-empty, this method has been called before
   if (!h->list.empty())
@@ -2799,10 +3601,14 @@ extern "C" int rados_objects_list_next(rados_list_ctx_t listctx, const char **en
 
   if (h->list.empty()) {
     int ret = lh->ctx->list(lh->lc, RADOS_LIST_MAX_ENTRIES);
-    if (ret < 0)
+    if (ret < 0) {
+      tracepoint(librados, rados_objects_list_next_exit, ret, NULL, NULL);
       return ret;
-    if (h->list.empty())
+    }
+    if (h->list.empty()) {
+      tracepoint(librados, rados_objects_list_next_exit, -ENOENT, NULL, NULL);
       return -ENOENT;
+    }
   }
 
   *entry = h->list.front().first.name.c_str();
@@ -2813,6 +3619,7 @@ extern "C" int rados_objects_list_next(rados_list_ctx_t listctx, const char **en
     else
       *key = NULL;
   }
+  tracepoint(librados, rados_objects_list_next_exit, 0, *entry, key);
   return 0;
 }
 
@@ -2826,135 +3633,194 @@ extern "C" int rados_aio_create_completion(void *cb_arg,
 					   rados_callback_t cb_safe,
 					   rados_completion_t *pc)
 {
+  tracepoint(librados, rados_aio_create_completion_enter, cb_arg, cb_complete, cb_safe);
   librados::AioCompletionImpl *c = new librados::AioCompletionImpl;
   if (cb_complete)
     c->set_complete_callback(cb_arg, cb_complete);
   if (cb_safe)
     c->set_safe_callback(cb_arg, cb_safe);
   *pc = c;
+  tracepoint(librados, rados_aio_create_completion_exit, 0, *pc);
   return 0;
 }
 
 extern "C" int rados_aio_wait_for_complete(rados_completion_t c)
 {
-  return ((librados::AioCompletionImpl*)c)->wait_for_complete();
+  tracepoint(librados, rados_aio_wait_for_complete_enter, c);
+  int retval = ((librados::AioCompletionImpl*)c)->wait_for_complete();
+  tracepoint(librados, rados_aio_wait_for_complete_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_aio_wait_for_safe(rados_completion_t c)
 {
-  return ((librados::AioCompletionImpl*)c)->wait_for_safe();
+  tracepoint(librados, rados_aio_wait_for_safe_enter, c);
+  int retval = ((librados::AioCompletionImpl*)c)->wait_for_safe();
+  tracepoint(librados, rados_aio_wait_for_safe_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_aio_is_complete(rados_completion_t c)
 {
-  return ((librados::AioCompletionImpl*)c)->is_complete();
+  tracepoint(librados, rados_aio_is_complete_enter, c);
+  int retval = ((librados::AioCompletionImpl*)c)->is_complete();
+  tracepoint(librados, rados_aio_is_complete_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_aio_is_safe(rados_completion_t c)
 {
-  return ((librados::AioCompletionImpl*)c)->is_safe();
+  tracepoint(librados, rados_aio_is_safe_enter, c);
+  int retval = ((librados::AioCompletionImpl*)c)->is_safe();
+  tracepoint(librados, rados_aio_is_safe_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_aio_wait_for_complete_and_cb(rados_completion_t c)
 {
-  return ((librados::AioCompletionImpl*)c)->wait_for_complete_and_cb();
+  tracepoint(librados, rados_aio_wait_for_complete_and_cb_enter, c);
+  int retval = ((librados::AioCompletionImpl*)c)->wait_for_complete_and_cb();
+  tracepoint(librados, rados_aio_wait_for_complete_and_cb_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_aio_wait_for_safe_and_cb(rados_completion_t c)
 {
-  return ((librados::AioCompletionImpl*)c)->wait_for_safe_and_cb();
+  tracepoint(librados, rados_aio_wait_for_safe_and_cb_enter, c);
+  int retval = ((librados::AioCompletionImpl*)c)->wait_for_safe_and_cb();
+  tracepoint(librados, rados_aio_wait_for_safe_and_cb_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_aio_is_complete_and_cb(rados_completion_t c)
 {
-  return ((librados::AioCompletionImpl*)c)->is_complete_and_cb();
+  tracepoint(librados, rados_aio_is_complete_and_cb_enter, c);
+  int retval = ((librados::AioCompletionImpl*)c)->is_complete_and_cb();
+  tracepoint(librados, rados_aio_is_complete_and_cb_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_aio_is_safe_and_cb(rados_completion_t c)
 {
-  return ((librados::AioCompletionImpl*)c)->is_safe_and_cb();
+  tracepoint(librados, rados_aio_is_safe_and_cb_enter, c);
+  int retval = ((librados::AioCompletionImpl*)c)->is_safe_and_cb();
+  tracepoint(librados, rados_aio_is_safe_and_cb_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_aio_get_return_value(rados_completion_t c)
 {
-  return ((librados::AioCompletionImpl*)c)->get_return_value();
+  tracepoint(librados, rados_aio_get_return_value_enter, c);
+  int retval = ((librados::AioCompletionImpl*)c)->get_return_value();
+  tracepoint(librados, rados_aio_get_return_value_exit, retval);
+  return retval;
 }
 
 extern "C" uint64_t rados_aio_get_version(rados_completion_t c)
 {
-  return ((librados::AioCompletionImpl*)c)->get_version();
+  tracepoint(librados, rados_aio_get_version_enter, c);
+  uint64_t retval = ((librados::AioCompletionImpl*)c)->get_version();
+  tracepoint(librados, rados_aio_get_version_exit, retval);
+  return retval;
 }
 
 extern "C" void rados_aio_release(rados_completion_t c)
 {
+  tracepoint(librados, rados_aio_release_enter, c);
   ((librados::AioCompletionImpl*)c)->put();
+  tracepoint(librados, rados_aio_release_exit);
 }
 
 extern "C" int rados_aio_read(rados_ioctx_t io, const char *o,
 			       rados_completion_t completion,
 			       char *buf, size_t len, uint64_t off)
 {
+  tracepoint(librados, rados_aio_read_enter, io, o, completion, len, off);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   object_t oid(o);
-  return ctx->aio_read(oid, (librados::AioCompletionImpl*)completion,
+  int retval = ctx->aio_read(oid, (librados::AioCompletionImpl*)completion,
 		       buf, len, off, ctx->snap_seq);
+  tracepoint(librados, rados_aio_read_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_aio_write(rados_ioctx_t io, const char *o,
 				rados_completion_t completion,
 				const char *buf, size_t len, uint64_t off)
 {
+  tracepoint(librados, rados_aio_write_enter, io, o, completion, buf, len, off);
+  if (len > UINT_MAX/2)
+    return -E2BIG;
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   object_t oid(o);
   bufferlist bl;
   bl.append(buf, len);
-  return ctx->aio_write(oid, (librados::AioCompletionImpl*)completion,
+  int retval = ctx->aio_write(oid, (librados::AioCompletionImpl*)completion,
 			bl, len, off);
+  tracepoint(librados, rados_aio_write_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_aio_append(rados_ioctx_t io, const char *o,
 				rados_completion_t completion,
 				const char *buf, size_t len)
 {
+  tracepoint(librados, rados_aio_append_enter, io, o, completion, buf, len);
+  if (len > UINT_MAX/2)
+    return -E2BIG;
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   object_t oid(o);
   bufferlist bl;
   bl.append(buf, len);
-  return ctx->aio_append(oid, (librados::AioCompletionImpl*)completion,
+  int retval = ctx->aio_append(oid, (librados::AioCompletionImpl*)completion,
 			 bl, len);
+  tracepoint(librados, rados_aio_append_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_aio_write_full(rados_ioctx_t io, const char *o,
 				    rados_completion_t completion,
 				    const char *buf, size_t len)
 {
+  tracepoint(librados, rados_aio_write_full_enter, io, o, completion, buf, len);
+  if (len > UINT_MAX/2)
+    return -E2BIG;
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   object_t oid(o);
   bufferlist bl;
   bl.append(buf, len);
-  return ctx->aio_write_full(oid, (librados::AioCompletionImpl*)completion, bl);
+  int retval = ctx->aio_write_full(oid, (librados::AioCompletionImpl*)completion, bl);
+  tracepoint(librados, rados_aio_write_full_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_aio_remove(rados_ioctx_t io, const char *o,
 				rados_completion_t completion)
 {
+  tracepoint(librados, rados_aio_remove_enter, io, o, completion);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   object_t oid(o);
-  return ctx->aio_remove(oid, (librados::AioCompletionImpl*)completion);
+  int retval = ctx->aio_remove(oid, (librados::AioCompletionImpl*)completion);
+  tracepoint(librados, rados_aio_remove_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_aio_flush_async(rados_ioctx_t io,
 				     rados_completion_t completion)
 {
+  tracepoint(librados, rados_aio_flush_async_enter, io, completion);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   ctx->flush_aio_writes_async((librados::AioCompletionImpl*)completion);
+  tracepoint(librados, rados_aio_flush_async_exit, 0);
   return 0;
 }
 
 extern "C" int rados_aio_flush(rados_ioctx_t io)
 {
+  tracepoint(librados, rados_aio_flush_enter, io);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   ctx->flush_aio_writes();
+  tracepoint(librados, rados_aio_flush_exit, 0);
   return 0;
 }
 
@@ -2962,12 +3828,20 @@ extern "C" int rados_aio_stat(rados_ioctx_t io, const char *o,
 			      rados_completion_t completion,
 			      uint64_t *psize, time_t *pmtime)
 {
+  tracepoint(librados, rados_aio_stat_enter, io, o, completion);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   object_t oid(o);
-  return ctx->aio_stat(oid, (librados::AioCompletionImpl*)completion, 
+  int retval = ctx->aio_stat(oid, (librados::AioCompletionImpl*)completion,
 		       psize, pmtime);
+  tracepoint(librados, rados_aio_stat_exit, retval);
+  return retval;
 }
 
+extern "C" int rados_aio_cancel(rados_ioctx_t io, rados_completion_t completion)
+{
+  librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
+  return ctx->aio_cancel((librados::AioCompletionImpl*)completion);
+}
 
 struct C_WatchCB : public librados::WatchCtx {
   rados_watchcb_t wcb;
@@ -2978,26 +3852,93 @@ struct C_WatchCB : public librados::WatchCtx {
   }
 };
 
-int rados_watch(rados_ioctx_t io, const char *o, uint64_t ver, uint64_t *handle,
-                rados_watchcb_t watchcb, void *arg)
+extern "C" int rados_watch(rados_ioctx_t io, const char *o, uint64_t ver,
+			   uint64_t *handle,
+			   rados_watchcb_t watchcb, void *arg)
 {
+  tracepoint(librados, rados_watch_enter, io, o, ver, watchcb, arg);
   uint64_t *cookie = handle;
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   object_t oid(o);
   C_WatchCB *wc = new C_WatchCB(watchcb, arg);
-  return ctx->watch(oid, ver, cookie, wc);
+  int retval = ctx->watch(oid, cookie, wc, NULL);
+  tracepoint(librados, rados_watch_exit, retval, *handle);
+  return retval;
 }
 
-int rados_unwatch(rados_ioctx_t io, const char *o, uint64_t handle)
+struct C_WatchCB2 : public librados::WatchCtx2 {
+  rados_watchcb2_t wcb;
+  rados_watcherrcb_t errcb;
+  void *arg;
+  C_WatchCB2(rados_watchcb2_t _wcb,
+	     rados_watcherrcb_t _errcb,
+	     void *_arg) : wcb(_wcb), errcb(_errcb), arg(_arg) {}
+  void handle_notify(uint64_t notify_id,
+		     uint64_t cookie,
+		     uint64_t notifier_gid,
+		     bufferlist& bl) {
+    wcb(arg, notify_id, cookie, notifier_gid, bl.c_str(), bl.length());
+  }
+  void handle_error(uint64_t cookie, int err) {
+    if (errcb)
+      errcb(arg, cookie, err);
+  }
+};
+
+extern "C" int rados_watch2(rados_ioctx_t io, const char *o, uint64_t *handle,
+			    rados_watchcb2_t watchcb,
+			    rados_watcherrcb_t watcherrcb,
+			    void *arg)
 {
+  tracepoint(librados, rados_watch2_enter, io, o, handle, watchcb, arg);
+  int ret;
+  if (!watchcb || !o || !handle) {
+    ret = -EINVAL;
+  } else {
+    uint64_t *cookie = handle;
+    librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
+    object_t oid(o);
+    C_WatchCB2 *wc = new C_WatchCB2(watchcb, watcherrcb, arg);
+    ret = ctx->watch(oid, cookie, NULL, wc);
+  }
+  tracepoint(librados, rados_watch_exit, ret, handle ? *handle : 0);
+  return ret;
+}
+
+extern "C" int rados_unwatch(rados_ioctx_t io, const char *o, uint64_t handle)
+{
+  tracepoint(librados, rados_unwatch_enter, io, o, handle);
   uint64_t cookie = handle;
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
-  object_t oid(o);
-  return ctx->unwatch(oid, cookie);
+  int retval = ctx->unwatch(cookie);
+  tracepoint(librados, rados_unwatch_exit, retval);
+  return retval;
 }
 
-int rados_notify(rados_ioctx_t io, const char *o, uint64_t ver, const char *buf, int buf_len)
+extern "C" int rados_unwatch2(rados_ioctx_t io, uint64_t handle)
 {
+  tracepoint(librados, rados_unwatch2_enter, io, handle);
+  uint64_t cookie = handle;
+  librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
+  int retval = ctx->unwatch(cookie);
+  tracepoint(librados, rados_unwatch2_exit, retval);
+  return retval;
+}
+
+extern "C" int rados_watch_check(rados_ioctx_t io, uint64_t handle)
+{
+  tracepoint(librados, rados_watch_check_enter, io, handle);
+  uint64_t cookie = handle;
+  librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
+  int retval = ctx->watch_check(cookie);
+  tracepoint(librados, rados_watch_check_exit, retval);
+  return retval;
+}
+
+extern "C" int rados_notify(rados_ioctx_t io, const char *o,
+			    uint64_t ver, const char *buf, int buf_len)
+{
+  tracepoint(librados, rados_notify_enter, io, o, ver, buf, buf_len);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   object_t oid(o);
   bufferlist bl;
@@ -3006,16 +3947,68 @@ int rados_notify(rados_ioctx_t io, const char *o, uint64_t ver, const char *buf,
     memcpy(p.c_str(), buf, buf_len);
     bl.push_back(p);
   }
-  return ctx->notify(oid, ver, bl);
+  int retval = ctx->notify(oid, bl, 0, NULL, NULL, NULL);
+  tracepoint(librados, rados_notify_exit, retval);
+  return retval;
+}
+
+extern "C" int rados_notify2(rados_ioctx_t io, const char *o,
+			     const char *buf, int buf_len,
+			     uint64_t timeout_ms,
+			     char **reply_buffer,
+			     size_t *reply_buffer_len)
+{
+  tracepoint(librados, rados_notify2_enter, io, o, buf, buf_len, timeout_ms);
+  librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
+  object_t oid(o);
+  bufferlist bl;
+  if (buf) {
+    bufferptr p = buffer::create(buf_len);
+    memcpy(p.c_str(), buf, buf_len);
+    bl.push_back(p);
+  }
+  int ret = ctx->notify(oid, bl, timeout_ms, NULL, reply_buffer, reply_buffer_len);
+  tracepoint(librados, rados_notify2_exit, ret);
+  return ret;
+}
+
+extern "C" int rados_notify_ack(rados_ioctx_t io, const char *o,
+				uint64_t notify_id, uint64_t handle,
+				const char *buf, int buf_len)
+{
+  tracepoint(librados, rados_notify_ack_enter, io, o, notify_id, handle, buf, buf_len);
+  librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
+  object_t oid(o);
+  bufferlist bl;
+  if (buf) {
+    bufferptr p = buffer::create(buf_len);
+    memcpy(p.c_str(), buf, buf_len);
+    bl.push_back(p);
+  }
+  ctx->notify_ack(oid, notify_id, handle, bl);
+  tracepoint(librados, rados_notify_ack_exit, 0);
+  return 0;
+}
+
+extern "C" int rados_watch_flush(rados_t cluster)
+{
+  tracepoint(librados, rados_watch_flush_enter, cluster);
+  librados::RadosClient *client = (librados::RadosClient *)cluster;
+  int retval = client->watch_flush();
+  tracepoint(librados, rados_watch_flush_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_set_alloc_hint(rados_ioctx_t io, const char *o,
                                     uint64_t expected_object_size,
                                     uint64_t expected_write_size)
 {
+  tracepoint(librados, rados_set_alloc_hint_enter, io, o, expected_object_size, expected_write_size);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   object_t oid(o);
-  return ctx->set_alloc_hint(oid, expected_object_size, expected_write_size);
+  int retval = ctx->set_alloc_hint(oid, expected_object_size, expected_write_size);
+  tracepoint(librados, rados_set_alloc_hint_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_lock_exclusive(rados_ioctx_t io, const char * o,
@@ -3023,10 +4016,13 @@ extern "C" int rados_lock_exclusive(rados_ioctx_t io, const char * o,
 			  const char * desc, struct timeval * duration,
 			  uint8_t flags)
 {
+  tracepoint(librados, rados_lock_exclusive_enter, io, o, name, cookie, desc, duration, flags);
   librados::IoCtx ctx;
   librados::IoCtx::from_rados_ioctx_t(io, ctx);
 
-  return ctx.lock_exclusive(o, name, cookie, desc, duration, flags);
+  int retval = ctx.lock_exclusive(o, name, cookie, desc, duration, flags);
+  tracepoint(librados, rados_lock_exclusive_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_lock_shared(rados_ioctx_t io, const char * o,
@@ -3034,19 +4030,24 @@ extern "C" int rados_lock_shared(rados_ioctx_t io, const char * o,
 			  const char * tag, const char * desc,
 			  struct timeval * duration, uint8_t flags)
 {
+  tracepoint(librados, rados_lock_shared_enter, io, o, name, cookie, tag, desc, duration, flags);
   librados::IoCtx ctx;
   librados::IoCtx::from_rados_ioctx_t(io, ctx);
 
-  return ctx.lock_shared(o, name, cookie, tag, desc, duration, flags);
+  int retval = ctx.lock_shared(o, name, cookie, tag, desc, duration, flags);
+  tracepoint(librados, rados_lock_shared_exit, retval);
+  return retval;
 }
 extern "C" int rados_unlock(rados_ioctx_t io, const char *o, const char *name,
 			    const char *cookie)
 {
+  tracepoint(librados, rados_unlock_enter, io, o, name, cookie);
   librados::IoCtx ctx;
   librados::IoCtx::from_rados_ioctx_t(io, ctx);
 
-  return ctx.unlock(o, name, cookie);
-
+  int retval = ctx.unlock(o, name, cookie);
+  tracepoint(librados, rados_unlock_exit, retval);
+  return retval;
 }
 
 extern "C" ssize_t rados_list_lockers(rados_ioctx_t io, const char *o,
@@ -3056,6 +4057,7 @@ extern "C" ssize_t rados_list_lockers(rados_ioctx_t io, const char *o,
 				      char *cookies, size_t *cookies_len,
 				      char *addrs, size_t *addrs_len)
 {
+  tracepoint(librados, rados_list_lockers_enter, io, o, name, *tag_len, *clients_len, *cookies_len, *addrs_len);
   librados::IoCtx ctx;
   librados::IoCtx::from_rados_ioctx_t(io, ctx);
   std::string name_str = name;
@@ -3064,8 +4066,10 @@ extern "C" ssize_t rados_list_lockers(rados_ioctx_t io, const char *o,
   int tmp_exclusive;
   std::list<librados::locker_t> lockers;
   int r = ctx.list_lockers(oid, name_str, &tmp_exclusive, &tag_str, &lockers);
-  if (r < 0)
+  if (r < 0) {
+    tracepoint(librados, rados_list_lockers_exit, r, *exclusive, "", *tag_len, *clients_len, *cookies_len, *addrs_len);
 	  return r;
+  }
 
   size_t clients_total = 0;
   size_t cookies_total = 0;
@@ -3085,8 +4089,10 @@ extern "C" ssize_t rados_list_lockers(rados_ioctx_t io, const char *o,
   *cookies_len = cookies_total;
   *addrs_len = addrs_total;
   *tag_len = tag_str.length() + 1;
-  if (too_short)
+  if (too_short) {
+    tracepoint(librados, rados_list_lockers_exit, -ERANGE, *exclusive, "", *tag_len, *clients_len, *cookies_len, *addrs_len);
     return -ERANGE;
+  }
 
   strcpy(tag, tag_str.c_str());
   char *clients_p = clients;
@@ -3094,10 +4100,11 @@ extern "C" ssize_t rados_list_lockers(rados_ioctx_t io, const char *o,
   char *addrs_p = addrs;
   for (it = lockers.begin(); it != lockers.end(); ++it) {
     strcpy(clients_p, it->client.c_str());
-    clients_p += it->client.length() + 1;
     strcpy(cookies_p, it->cookie.c_str());
-    cookies_p += it->cookie.length() + 1;
     strcpy(addrs_p, it->address.c_str());
+    tracepoint(librados, rados_list_lockers_locker, clients_p, cookies_p, addrs_p);
+    clients_p += it->client.length() + 1;
+    cookies_p += it->cookie.length() + 1;
     addrs_p += it->address.length() + 1;
   }
   if (tmp_exclusive)
@@ -3105,37 +4112,58 @@ extern "C" ssize_t rados_list_lockers(rados_ioctx_t io, const char *o,
   else
     *exclusive = 0;
 
-  return lockers.size();
+  int retval = lockers.size();
+  tracepoint(librados, rados_list_lockers_exit, retval, *exclusive, tag, *tag_len, *clients_len, *cookies_len, *addrs_len);
+  return retval;
 }
 
 extern "C" int rados_break_lock(rados_ioctx_t io, const char *o,
 				const char *name, const char *client,
 				const char *cookie)
 {
+  tracepoint(librados, rados_break_lock_enter, io, o, name, client, cookie);
   librados::IoCtx ctx;
   librados::IoCtx::from_rados_ioctx_t(io, ctx);
 
-  return ctx.break_lock(o, name, client, cookie);
+  int retval = ctx.break_lock(o, name, client, cookie);
+  tracepoint(librados, rados_break_lock_exit, retval);
+  return retval;
 }
 
 extern "C" rados_write_op_t rados_create_write_op()
 {
-  return new (std::nothrow)::ObjectOperation;
+  tracepoint(librados, rados_create_write_op_enter);
+  rados_write_op_t retval = new (std::nothrow)::ObjectOperation;
+  tracepoint(librados, rados_create_write_op_exit, retval);
+  return retval;
 }
 
 extern "C" void rados_release_write_op(rados_write_op_t write_op)
 {
+  tracepoint(librados, rados_release_write_op_enter, write_op);
   delete (::ObjectOperation*)write_op;
+  tracepoint(librados, rados_release_write_op_exit);
 }
 
 extern "C" void rados_write_op_set_flags(rados_write_op_t write_op, int flags)
 {
+  tracepoint(librados, rados_write_op_set_flags_enter, write_op, flags);
   set_op_flags((::ObjectOperation *)write_op, flags);
+  tracepoint(librados, rados_write_op_set_flags_exit);
+}
+
+extern "C" void rados_write_op_assert_version(rados_write_op_t write_op, uint64_t ver)
+{
+  tracepoint(librados, rados_write_op_assert_version_enter, write_op, ver);
+  ((::ObjectOperation *)write_op)->assert_version(ver);
+  tracepoint(librados, rados_write_op_assert_version_exit);
 }
 
 extern "C" void rados_write_op_assert_exists(rados_write_op_t write_op)
 {
+  tracepoint(librados, rados_write_op_assert_exists_enter, write_op);
   ((::ObjectOperation *)write_op)->stat(NULL, (utime_t *)NULL, NULL);
+  tracepoint(librados, rados_write_op_assert_exists_exit);
 }
 
 extern "C" void rados_write_op_cmpxattr(rados_write_op_t write_op,
@@ -3144,12 +4172,14 @@ extern "C" void rados_write_op_cmpxattr(rados_write_op_t write_op,
 				       const char *value,
 				       size_t value_len)
 {
+  tracepoint(librados, rados_write_op_cmpxattr_enter, write_op, name, comparison_operator, value, value_len);
   bufferlist bl;
   bl.append(value, value_len);
   ((::ObjectOperation *)write_op)->cmpxattr(name,
 					    comparison_operator,
 					    CEPH_OSD_CMPXATTR_MODE_STRING,
 					    bl);
+  tracepoint(librados, rados_write_op_cmpxattr_exit);
 }
 
 static void rados_c_omap_cmp(ObjectOperation *op,
@@ -3173,8 +4203,10 @@ extern "C" void rados_write_op_omap_cmp(rados_write_op_t write_op,
 					size_t val_len,
 					int *prval)
 {
+  tracepoint(librados, rados_write_op_omap_cmp_enter, write_op, key, comparison_operator, val, val_len, prval);
   rados_c_omap_cmp((::ObjectOperation *)write_op, key, comparison_operator,
 		   val, val_len, prval);
+  tracepoint(librados, rados_write_op_omap_cmp_exit);
 }
 
 extern "C" void rados_write_op_setxattr(rados_write_op_t write_op,
@@ -3182,28 +4214,30 @@ extern "C" void rados_write_op_setxattr(rados_write_op_t write_op,
 				       const char *value,
 				       size_t value_len)
 {
+  tracepoint(librados, rados_write_op_setxattr_enter, write_op, name, value, value_len);
   bufferlist bl;
   bl.append(value, value_len);
   ((::ObjectOperation *)write_op)->setxattr(name, bl);
+  tracepoint(librados, rados_write_op_setxattr_exit);
 }
 
 extern "C" void rados_write_op_rmxattr(rados_write_op_t write_op,
                                        const char *name)
 {
+  tracepoint(librados, rados_write_op_rmxattr_enter, write_op, name);
   bufferlist bl;
   ((::ObjectOperation *)write_op)->rmxattr(name);
+  tracepoint(librados, rados_write_op_rmxattr_exit);
 }
 
 extern "C" void rados_write_op_create(rados_write_op_t write_op,
                                       int exclusive,
-				      const char* category)
+				      const char* category) // unused
 {
+  tracepoint(librados, rados_write_op_create_enter, write_op, exclusive);
   ::ObjectOperation *oo = (::ObjectOperation *) write_op;
-  if(category) {
-    oo->create(exclusive, category);
-  } else {
-    oo->create(!!exclusive);
-  }
+  oo->create(!!exclusive);
+  tracepoint(librados, rados_write_op_create_exit);
 }
 
 extern "C" void rados_write_op_write(rados_write_op_t write_op,
@@ -3211,45 +4245,57 @@ extern "C" void rados_write_op_write(rados_write_op_t write_op,
 				     size_t len,
                                      uint64_t offset)
 {
+  tracepoint(librados, rados_write_op_write_enter, write_op, buffer, len, offset);
   bufferlist bl;
   bl.append(buffer,len);
   ((::ObjectOperation *)write_op)->write(offset, bl);
+  tracepoint(librados, rados_write_op_write_exit);
 }
 
 extern "C" void rados_write_op_write_full(rados_write_op_t write_op,
 				          const char *buffer,
 				          size_t len)
 {
+  tracepoint(librados, rados_write_op_write_full_enter, write_op, buffer, len);
   bufferlist bl;
   bl.append(buffer,len);
   ((::ObjectOperation *)write_op)->write_full(bl);
+  tracepoint(librados, rados_write_op_write_full_exit);
 }
 
 extern "C" void rados_write_op_append(rados_write_op_t write_op,
 				      const char *buffer,
 				      size_t len)
 {
+  tracepoint(librados, rados_write_op_append_enter, write_op, buffer, len);
   bufferlist bl;
   bl.append(buffer,len);
   ((::ObjectOperation *)write_op)->append(bl);
+  tracepoint(librados, rados_write_op_append_exit);
 }
 
 extern "C" void rados_write_op_remove(rados_write_op_t write_op)
 {
+  tracepoint(librados, rados_write_op_remove_enter, write_op);
   ((::ObjectOperation *)write_op)->remove();
+  tracepoint(librados, rados_write_op_remove_exit);
 }
 
 extern "C" void rados_write_op_truncate(rados_write_op_t write_op,
 				        uint64_t offset)
 {
+  tracepoint(librados, rados_write_op_truncate_enter, write_op, offset);
   ((::ObjectOperation *)write_op)->truncate(offset);
+  tracepoint(librados, rados_write_op_truncate_exit);
 }
 
 extern "C" void rados_write_op_zero(rados_write_op_t write_op,
 				    uint64_t offset,
 				    uint64_t len)
 {
+  tracepoint(librados, rados_write_op_zero_enter, write_op, offset, len);
   ((::ObjectOperation *)write_op)->zero(offset, len);
+  tracepoint(librados, rados_write_op_zero_exit);
 }
 
 extern "C" void rados_write_op_exec(rados_write_op_t write_op,
@@ -3259,9 +4305,11 @@ extern "C" void rados_write_op_exec(rados_write_op_t write_op,
 				    size_t in_len,
 				    int *prval)
 {
+  tracepoint(librados, rados_write_op_exec_enter, write_op, cls, method, in_buf, in_len, prval);
   bufferlist inbl;
   inbl.append(in_buf, in_len);
   ((::ObjectOperation *)write_op)->call(cls, method, inbl, NULL, NULL, prval);
+  tracepoint(librados, rados_write_op_exec_exit);
 }
 
 extern "C" void rados_write_op_omap_set(rados_write_op_t write_op,
@@ -3270,34 +4318,46 @@ extern "C" void rados_write_op_omap_set(rados_write_op_t write_op,
 					const size_t *lens,
 					size_t num)
 {
+  tracepoint(librados, rados_write_op_omap_set_enter, write_op, num);
   std::map<std::string, bufferlist> entries;
   for (size_t i = 0; i < num; ++i) {
+    tracepoint(librados, rados_write_op_omap_set_entry, keys[i], vals[i], lens[i]);
     bufferlist bl(lens[i]);
     bl.append(vals[i], lens[i]);
     entries[keys[i]] = bl;
   }
   ((::ObjectOperation *)write_op)->omap_set(entries);
+  tracepoint(librados, rados_write_op_omap_set_exit);
 }
 
 extern "C" void rados_write_op_omap_rm_keys(rados_write_op_t write_op,
 					    char const* const* keys,
 					    size_t keys_len)
 {
+  tracepoint(librados, rados_write_op_omap_rm_keys_enter, write_op, keys_len);
+  for(size_t i = 0; i < keys_len; i++) {
+    tracepoint(librados, rados_write_op_omap_rm_keys_entry, keys[i]);
+  }
   std::set<std::string> to_remove(keys, keys + keys_len);
   ((::ObjectOperation *)write_op)->omap_rm_keys(to_remove);
+  tracepoint(librados, rados_write_op_omap_rm_keys_exit);
 }
 
 extern "C" void rados_write_op_omap_clear(rados_write_op_t write_op)
 {
+  tracepoint(librados, rados_write_op_omap_clear_enter, write_op);
   ((::ObjectOperation *)write_op)->omap_clear();
+  tracepoint(librados, rados_write_op_omap_clear_exit);
 }
 
 extern "C" void rados_write_op_set_alloc_hint(rados_write_op_t write_op,
                                             uint64_t expected_object_size,
                                             uint64_t expected_write_size)
 {
+  tracepoint(librados, rados_write_op_set_alloc_hint_enter, write_op, expected_object_size, expected_write_size);
   ((::ObjectOperation *)write_op)->set_alloc_hint(expected_object_size,
                                                   expected_write_size);
+  tracepoint(librados, rados_write_op_set_alloc_hint_exit);
 }
 
 extern "C" int rados_write_op_operate(rados_write_op_t write_op,
@@ -3306,10 +4366,13 @@ extern "C" int rados_write_op_operate(rados_write_op_t write_op,
 				      time_t *mtime,
 				      int flags)
 {
+  tracepoint(librados, rados_write_op_operate_enter, write_op, io, oid, mtime, flags);
   object_t obj(oid);
   ::ObjectOperation *oo = (::ObjectOperation *) write_op;
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
-  return ctx->operate(obj, oo, mtime, flags);
+  int retval = ctx->operate(obj, oo, mtime, translate_flags(flags));
+  tracepoint(librados, rados_write_op_operate_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_aio_write_op_operate(rados_write_op_t write_op,
@@ -3319,31 +4382,50 @@ extern "C" int rados_aio_write_op_operate(rados_write_op_t write_op,
 					  time_t *mtime,
 					  int flags)
 {
+  tracepoint(librados, rados_aio_write_op_operate_enter, write_op, io, completion, oid, mtime, flags);
   object_t obj(oid);
   ::ObjectOperation *oo = (::ObjectOperation *) write_op;
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   librados::AioCompletionImpl *c = (librados::AioCompletionImpl*)completion;
-  return ctx->aio_operate(obj, oo, c, ctx->snapc, flags);
+  int retval = ctx->aio_operate(obj, oo, c, ctx->snapc, translate_flags(flags));
+  tracepoint(librados, rados_aio_write_op_operate_exit, retval);
+  return retval;
 }
 
 extern "C" rados_read_op_t rados_create_read_op()
 {
-  return new (std::nothrow)::ObjectOperation;
+  tracepoint(librados, rados_create_read_op_enter);
+  rados_read_op_t retval = new (std::nothrow)::ObjectOperation;
+  tracepoint(librados, rados_create_read_op_exit, retval);
+  return retval;
 }
 
 extern "C" void rados_release_read_op(rados_read_op_t read_op)
 {
+  tracepoint(librados, rados_release_read_op_enter, read_op);
   delete (::ObjectOperation *)read_op;
+  tracepoint(librados, rados_release_read_op_exit);
 }
 
 extern "C" void rados_read_op_set_flags(rados_read_op_t read_op, int flags)
 {
+  tracepoint(librados, rados_read_op_set_flags_enter, read_op, flags);
   set_op_flags((::ObjectOperation *)read_op, flags);
+  tracepoint(librados, rados_read_op_set_flags_exit);
+}
+
+extern "C" void rados_read_op_assert_version(rados_read_op_t read_op, uint64_t ver)
+{
+  tracepoint(librados, rados_read_op_assert_version_enter, read_op, ver);
+  ((::ObjectOperation *)read_op)->assert_version(ver);
+  tracepoint(librados, rados_read_op_assert_version_exit);
 }
 
 extern "C" void rados_read_op_assert_exists(rados_read_op_t read_op)
 {
+  tracepoint(librados, rados_read_op_assert_exists_enter, read_op);
   ((::ObjectOperation *)read_op)->stat(NULL, (utime_t *)NULL, NULL);
+  tracepoint(librados, rados_read_op_assert_exists_exit);
 }
 
 extern "C" void rados_read_op_cmpxattr(rados_read_op_t read_op,
@@ -3352,12 +4434,14 @@ extern "C" void rados_read_op_cmpxattr(rados_read_op_t read_op,
 				       const char *value,
 				       size_t value_len)
 {
+  tracepoint(librados, rados_read_op_cmpxattr_enter, read_op, name, comparison_operator, value, value_len);
   bufferlist bl;
   bl.append(value, value_len);
   ((::ObjectOperation *)read_op)->cmpxattr(name,
 					   comparison_operator,
 					   CEPH_OSD_CMPXATTR_MODE_STRING,
 					   bl);
+  tracepoint(librados, rados_read_op_cmpxattr_exit);
 }
 
 extern "C" void rados_read_op_omap_cmp(rados_read_op_t read_op,
@@ -3367,8 +4451,10 @@ extern "C" void rados_read_op_omap_cmp(rados_read_op_t read_op,
 				       size_t val_len,
 				       int *prval)
 {
+  tracepoint(librados, rados_read_op_omap_cmp_enter, read_op, key, comparison_operator, val, val_len, prval);
   rados_c_omap_cmp((::ObjectOperation *)read_op, key, comparison_operator,
 		   val, val_len, prval);
+  tracepoint(librados, rados_read_op_omap_cmp_exit);
 }
 
 extern "C" void rados_read_op_stat(rados_read_op_t read_op,
@@ -3376,7 +4462,9 @@ extern "C" void rados_read_op_stat(rados_read_op_t read_op,
 				   time_t *pmtime,
 				   int *prval)
 {
+  tracepoint(librados, rados_read_op_stat_enter, read_op, psize, pmtime, prval);
   ((::ObjectOperation *)read_op)->stat(psize, pmtime, prval);
+  tracepoint(librados, rados_read_op_stat_exit);
 }
 
 class C_bl_to_buf : public Context {
@@ -3413,9 +4501,11 @@ extern "C" void rados_read_op_read(rados_read_op_t read_op,
 				   size_t *bytes_read,
 				   int *prval)
 {
+  tracepoint(librados, rados_read_op_read_enter, read_op, offset, len, buf, bytes_read, prval);
   C_bl_to_buf *ctx = new C_bl_to_buf(buf, len, bytes_read, prval);
   ctx->out_bl.push_back(buffer::create_static(len, buf));
   ((::ObjectOperation *)read_op)->read(offset, len, &ctx->out_bl, prval, ctx);
+  tracepoint(librados, rados_read_op_read_exit);
 }
 
 class C_out_buffer : public Context {
@@ -3441,11 +4531,13 @@ extern "C" void rados_read_op_exec(rados_read_op_t read_op,
 				   size_t *out_len,
 				   int *prval)
 {
+  tracepoint(librados, rados_read_op_exec_enter, read_op, cls, method, in_buf, in_len, out_buf, out_len, prval);
   bufferlist inbl;
   inbl.append(in_buf, in_len);
   C_out_buffer *ctx = new C_out_buffer(out_buf, out_len);
   ((::ObjectOperation *)read_op)->call(cls, method, inbl, &ctx->out_bl, ctx,
 				       prval);
+  tracepoint(librados, rados_read_op_exec_exit);
 }
 
 extern "C" void rados_read_op_exec_user_buf(rados_read_op_t read_op,
@@ -3458,11 +4550,13 @@ extern "C" void rados_read_op_exec_user_buf(rados_read_op_t read_op,
 					    size_t *used_len,
 					    int *prval)
 {
+  tracepoint(librados, rados_read_op_exec_user_buf_enter, read_op, cls, method, in_buf, in_len, out_buf, out_len, used_len, prval);
   C_bl_to_buf *ctx = new C_bl_to_buf(out_buf, out_len, used_len, prval);
   bufferlist inbl;
   inbl.append(in_buf, in_len);
   ((::ObjectOperation *)read_op)->call(cls, method, inbl, &ctx->out_bl, ctx,
 				       prval);
+  tracepoint(librados, rados_read_op_exec_user_buf_exit);
 }
 
 struct RadosOmapIter {
@@ -3480,9 +4574,9 @@ public:
 };
 
 class C_XattrsIter : public Context {
-  RadosXattrsIter *iter;
+  librados::RadosXattrsIter *iter;
 public:
-  C_XattrsIter(RadosXattrsIter *iter) : iter(iter) {}
+  C_XattrsIter(librados::RadosXattrsIter *iter) : iter(iter) {}
   void finish(int r) {
     iter->i = iter->attrset.begin();
   }
@@ -3492,10 +4586,12 @@ extern "C" void rados_read_op_getxattrs(rados_read_op_t read_op,
 					rados_xattrs_iter_t *iter,
 					int *prval)
 {
-  RadosXattrsIter *xattrs_iter = new RadosXattrsIter;
+  tracepoint(librados, rados_read_op_getxattrs_enter, read_op, prval);
+  librados::RadosXattrsIter *xattrs_iter = new librados::RadosXattrsIter;
   ((::ObjectOperation *)read_op)->getxattrs(&xattrs_iter->attrset, prval);
   ((::ObjectOperation *)read_op)->add_handler(new C_XattrsIter(xattrs_iter));
   *iter = xattrs_iter;
+  tracepoint(librados, rados_read_op_getxattrs_exit, *iter);
 }
 
 extern "C" void rados_read_op_omap_get_vals(rados_read_op_t read_op,
@@ -3505,6 +4601,7 @@ extern "C" void rados_read_op_omap_get_vals(rados_read_op_t read_op,
 					    rados_omap_iter_t *iter,
 					    int *prval)
 {
+  tracepoint(librados, rados_read_op_omap_get_vals_enter, read_op, start_after, filter_prefix, max_return, prval);
   RadosOmapIter *omap_iter = new RadosOmapIter;
   const char *start = start_after ? start_after : "";
   const char *filter = filter_prefix ? filter_prefix : "";
@@ -3515,6 +4612,7 @@ extern "C" void rados_read_op_omap_get_vals(rados_read_op_t read_op,
 						prval);
   ((::ObjectOperation *)read_op)->add_handler(new C_OmapIter(omap_iter));
   *iter = omap_iter;
+  tracepoint(librados, rados_read_op_omap_get_vals_exit, *iter);
 }
 
 struct C_OmapKeysIter : public Context {
@@ -3537,12 +4635,14 @@ extern "C" void rados_read_op_omap_get_keys(rados_read_op_t read_op,
 					    rados_omap_iter_t *iter,
 					    int *prval)
 {
+  tracepoint(librados, rados_read_op_omap_get_keys_enter, read_op, start_after, max_return, prval);
   RadosOmapIter *omap_iter = new RadosOmapIter;
   C_OmapKeysIter *ctx = new C_OmapKeysIter(omap_iter);
   ((::ObjectOperation *)read_op)->omap_get_keys(start_after ? start_after : "",
 						max_return, &ctx->keys, prval);
   ((::ObjectOperation *)read_op)->add_handler(ctx);
   *iter = omap_iter;
+  tracepoint(librados, rados_read_op_omap_get_keys_exit, *iter);
 }
 
 extern "C" void rados_read_op_omap_get_vals_by_keys(rados_read_op_t read_op,
@@ -3551,6 +4651,7 @@ extern "C" void rados_read_op_omap_get_vals_by_keys(rados_read_op_t read_op,
 						    rados_omap_iter_t *iter,
 						    int *prval)
 {
+  tracepoint(librados, rados_read_op_omap_get_vals_by_keys_enter, read_op, keys, keys_len, iter, prval);
   std::set<std::string> to_get(keys, keys + keys_len);
 
   RadosOmapIter *omap_iter = new RadosOmapIter;
@@ -3559,6 +4660,7 @@ extern "C" void rados_read_op_omap_get_vals_by_keys(rados_read_op_t read_op,
 							prval);
   ((::ObjectOperation *)read_op)->add_handler(new C_OmapIter(omap_iter));
   *iter = omap_iter;
+  tracepoint(librados, rados_read_op_omap_get_vals_by_keys_exit, *iter);
 }
 
 extern "C" int rados_omap_get_next(rados_omap_iter_t iter,
@@ -3566,11 +4668,13 @@ extern "C" int rados_omap_get_next(rados_omap_iter_t iter,
 				   char **val,
 				   size_t *len)
 {
-  RadosOmapIter *it = (RadosOmapIter *)iter;
+  tracepoint(librados, rados_omap_get_next_enter, iter);
+  RadosOmapIter *it = static_cast<RadosOmapIter *>(iter);
   if (it->i == it->values.end()) {
     *key = NULL;
     *val = NULL;
     *len = 0;
+    tracepoint(librados, rados_omap_get_next_exit, 0, key, val, len);
     return 0;
   }
   if (key)
@@ -3580,13 +4684,16 @@ extern "C" int rados_omap_get_next(rados_omap_iter_t iter,
   if (len)
     *len = it->i->second.length();
   ++it->i;
+  tracepoint(librados, rados_omap_get_next_exit, 0, key, val, len);
   return 0;
 }
 
 extern "C" void rados_omap_get_end(rados_omap_iter_t iter)
 {
-  RadosOmapIter *it = (RadosOmapIter *)iter;
+  tracepoint(librados, rados_omap_get_end_enter, iter);
+  RadosOmapIter *it = static_cast<RadosOmapIter *>(iter);
   delete it;
+  tracepoint(librados, rados_omap_get_end_exit);
 }
 
 extern "C" int rados_read_op_operate(rados_read_op_t read_op,
@@ -3594,9 +4701,13 @@ extern "C" int rados_read_op_operate(rados_read_op_t read_op,
 				     const char *oid,
 				     int flags)
 {
+  tracepoint(librados, rados_read_op_operate_enter, read_op, io, oid, flags);
   object_t obj(oid);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
-  return ctx->operate_read(obj, (::ObjectOperation *)read_op, NULL, flags);
+  int retval = ctx->operate_read(obj, (::ObjectOperation *)read_op, NULL,
+				 translate_flags(flags));
+  tracepoint(librados, rados_read_op_operate_exit, retval);
+  return retval;
 }
 
 extern "C" int rados_aio_read_op_operate(rados_read_op_t read_op,
@@ -3605,9 +4716,73 @@ extern "C" int rados_aio_read_op_operate(rados_read_op_t read_op,
 					 const char *oid,
 					 int flags)
 {
+  tracepoint(librados, rados_aio_read_op_operate_enter, read_op, io, completion, oid, flags);
   object_t obj(oid);
   librados::IoCtxImpl *ctx = (librados::IoCtxImpl *)io;
   librados::AioCompletionImpl *c = (librados::AioCompletionImpl*)completion;
-  return ctx->aio_operate_read(obj, (::ObjectOperation *)read_op,
-			       c, flags, NULL);
+  int retval = ctx->aio_operate_read(obj, (::ObjectOperation *)read_op,
+				     c, translate_flags(flags), NULL);
+  tracepoint(librados, rados_aio_read_op_operate_exit, retval);
+  return retval;
+}
+
+
+///////////////////////////// ListObject //////////////////////////////
+librados::ListObject::ListObject() : impl(NULL)
+{
+}
+
+librados::ListObject::ListObject(librados::ListObjectImpl *i): impl(i)
+{
+}
+
+librados::ListObject::ListObject(const ListObject& rhs)
+{
+  if (rhs.impl == NULL) {
+    impl = NULL;
+    return;
+  }
+  impl = new ListObjectImpl();
+  *impl = *(rhs.impl);
+}
+
+librados::ListObject& librados::ListObject::operator=(const ListObject& rhs)
+{
+  if (rhs.impl == NULL) {
+    delete impl;
+    impl = NULL;
+    return *this;
+  }
+  if (impl == NULL)
+    impl = new ListObjectImpl();
+  *impl = *(rhs.impl);
+  return *this;
+}
+
+librados::ListObject::~ListObject()
+{
+  if (impl)
+    delete impl;
+  impl = NULL;
+}
+
+const std::string& librados::ListObject::get_nspace() const
+{
+  return impl->get_nspace();
+}
+
+const std::string& librados::ListObject::get_oid() const
+{
+  return impl->get_oid();
+}
+
+const std::string& librados::ListObject::get_locator() const
+{
+  return impl->get_locator();
+}
+
+std::ostream& librados::operator<<(std::ostream& out, const librados::ListObject& lop)
+{
+  out << *(lop.impl);
+  return out;
 }

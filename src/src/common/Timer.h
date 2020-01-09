@@ -17,6 +17,7 @@
 
 #include "Cond.h"
 #include "Mutex.h"
+#include "RWLock.h"
 
 #include <map>
 
@@ -92,4 +93,5 @@ public:
   void cancel_all_events();
 
 };
+
 #endif

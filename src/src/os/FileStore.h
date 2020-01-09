@@ -57,20 +57,11 @@ static const __SWORD_TYPE BTRFS_SUPER_MAGIC(0x9123683E);
 # ifndef XFS_SUPER_MAGIC
 static const __SWORD_TYPE XFS_SUPER_MAGIC(0x58465342);
 # endif
-#endif
-
 #ifndef ZFS_SUPER_MAGIC
 static const __SWORD_TYPE ZFS_SUPER_MAGIC(0x2fc12fc1);
 #endif
+#endif
 
-
-enum fs_types {
-  FS_TYPE_NONE = 0,
-  FS_TYPE_XFS,
-  FS_TYPE_BTRFS,
-  FS_TYPE_ZFS,
-  FS_TYPE_OTHER
-};
 
 class FileStoreBackend;
 
@@ -79,6 +70,7 @@ class FileStoreBackend;
 class FSSuperblock {
 public:
   CompatSet compat_features;
+  string omap_backend;
 
   FSSuperblock() { }
 
@@ -91,18 +83,20 @@ WRITE_CLASS_ENCODER(FSSuperblock)
 
 inline ostream& operator<<(ostream& out, const FSSuperblock& sb)
 {
-  return out << "sb(" << sb.compat_features << ")";
+  return out << "sb(" << sb.compat_features << "): "
+             << sb.omap_backend;
 }
 
 class FileStore : public JournalingObjectStore,
                   public md_config_obs_t
 {
-  static const uint32_t target_version = 3;
+  static const uint32_t target_version = 4;
 public:
   uint32_t get_target_version() {
     return target_version;
   }
 
+  bool need_journal() { return true; }
   int peek_journal_fsid(uuid_d *fsid);
 
   struct FSPerfTracker {
@@ -126,6 +120,7 @@ public:
 private:
   string internal_name;         ///< internal name, used to name the perfcounter instance
   string basedir, journalpath;
+  osflagbits_t generic_flags;
   std::string current_fn;
   std::string current_op_seq_fn;
   std::string omap_dir;
@@ -135,8 +130,9 @@ private:
 
   int fsid_fd, op_fd, basedir_fd, current_fd;
 
-  FileStoreBackend *generic_backend;
   FileStoreBackend *backend;
+
+  void create_backend(long f_type);
 
   deque<uint64_t> snaps;
 
@@ -163,7 +159,6 @@ private:
   Mutex lock;
   bool force_sync;
   Cond sync_cond;
-  uint64_t sync_epoch;
 
   Mutex sync_entry_timeo_lock;
   SafeTimer timer;
@@ -327,7 +322,6 @@ private:
 
   friend ostream& operator<<(ostream& out, const OpSequencer& s);
 
-  Mutex fdcache_lock;
   FDCache fdcache;
   WBThrottle wbthrottle;
 
@@ -382,14 +376,14 @@ private:
   void op_queue_release_throttle(Op *o);
   void _journaled_ahead(OpSequencer *osr, Op *o, Context *ondisk);
   friend struct C_JournaledAhead;
-  int write_version_stamp();
 
   int open_journal();
 
   PerfCounters *logger;
 
 public:
-  int lfn_find(coll_t cid, const ghobject_t& oid, IndexedPath *path);
+  int lfn_find(const ghobject_t& oid, const Index& index, 
+                                  IndexedPath *path = NULL);
   int lfn_truncate(coll_t cid, const ghobject_t& oid, off_t length);
   int lfn_stat(coll_t cid, const ghobject_t& oid, struct stat *buf);
   int lfn_open(
@@ -397,30 +391,43 @@ public:
     const ghobject_t& oid,
     bool create,
     FDRef *outfd,
-    IndexedPath *path = 0,
     Index *index = 0);
+
   void lfn_close(FDRef fd);
   int lfn_link(coll_t c, coll_t newcid, const ghobject_t& o, const ghobject_t& newoid) ;
   int lfn_unlink(coll_t cid, const ghobject_t& o, const SequencerPosition &spos,
 		 bool force_clear_omap=false);
 
 public:
-  FileStore(const std::string &base, const std::string &jdev, const char *internal_name = "filestore", bool update_to=false);
+  FileStore(const std::string &base, const std::string &jdev,
+    osflagbits_t flags = 0,
+    const char *internal_name = "filestore", bool update_to=false);
   ~FileStore();
 
   int _detect_fs();
   int _sanity_check_fs();
   
   bool test_mount_in_use();
-  int version_stamp_is_valid(uint32_t *version);
-  int update_version_stamp();
   int read_op_seq(uint64_t *seq);
   int write_op_seq(int, uint64_t seq);
   int mount();
   int umount();
-  int get_max_object_name_length();
+  unsigned get_max_object_name_length() {
+    // not safe for all file systems, btw!  use the tunable to limit this.
+    return 4096;
+  }
+  unsigned get_max_attr_name_length() {
+    // xattr limit is 128; leave room for our prefixes (user.ceph._),
+    // some margin, and cap at 100
+    return 100;
+  }
   int mkfs();
   int mkjournal();
+
+  int write_version_stamp();
+  int version_stamp_is_valid(uint32_t *version);
+  int update_version_stamp();
+  int upgrade();
 
   /**
    * set_allow_sharded_objects()
@@ -437,6 +444,8 @@ public:
    * return value: true if set_allow_sharded_objects() called, otherwise false
    */
   bool get_allow_sharded_objects();
+
+  void collect_metadata(map<string,string> *pm);
 
   int statfs(struct statfs *buf);
 
@@ -515,12 +524,13 @@ public:
     uint64_t offset,
     size_t len,
     bufferlist& bl,
+    uint32_t op_flags = 0,
     bool allow_eio = false);
   int fiemap(coll_t cid, const ghobject_t& oid, uint64_t offset, size_t len, bufferlist& bl);
 
   int _touch(coll_t cid, const ghobject_t& oid);
-  int _write(coll_t cid, const ghobject_t& oid, uint64_t offset, size_t len, const bufferlist& bl,
-      bool replica = false);
+  int _write(coll_t cid, const ghobject_t& oid, uint64_t offset, size_t len,
+	      const bufferlist& bl, uint32_t fadvise_flags = 0);
   int _zero(coll_t cid, const ghobject_t& oid, uint64_t offset, size_t len);
   int _truncate(coll_t cid, const ghobject_t& oid, uint64_t size);
   int _clone(coll_t cid, const ghobject_t& oldoid, const ghobject_t& newoid,
@@ -529,16 +539,17 @@ public:
 		   uint64_t srcoff, uint64_t len, uint64_t dstoff,
 		   const SequencerPosition& spos);
   int _do_clone_range(int from, int to, uint64_t srcoff, uint64_t len, uint64_t dstoff);
+  int _do_sparse_copy_range(int from, int to, uint64_t srcoff, uint64_t len, uint64_t dstoff);
   int _do_copy_range(int from, int to, uint64_t srcoff, uint64_t len, uint64_t dstoff);
   int _remove(coll_t cid, const ghobject_t& oid, const SequencerPosition &spos);
 
   int _fgetattr(int fd, const char *name, bufferptr& bp);
-  int _fgetattrs(int fd, map<string,bufferptr>& aset, bool user_only);
+  int _fgetattrs(int fd, map<string,bufferptr>& aset);
   int _fsetattrs(int fd, map<string, bufferptr> &aset);
 
   void _start_sync();
 
-  void start_sync();
+  void do_force_sync();
   void start_sync(Context *onsafe);
   void sync();
   void _flush_op_queue();
@@ -566,7 +577,7 @@ public:
 
   // attrs
   int getattr(coll_t cid, const ghobject_t& oid, const char *name, bufferptr &bp);
-  int getattrs(coll_t cid, const ghobject_t& oid, map<string,bufferptr>& aset, bool user_only = false);
+  int getattrs(coll_t cid, const ghobject_t& oid, map<string,bufferptr>& aset);
 
   int _setattrs(coll_t cid, const ghobject_t& oid, map<string,bufferptr>& aset,
 		const SequencerPosition &spos);
@@ -584,8 +595,6 @@ public:
   int _collection_setattrs(coll_t cid, map<string,bufferptr> &aset);
   int _collection_remove_recursive(const coll_t &cid,
 				   const SequencerPosition &spos);
-  int _collection_rename(const coll_t &cid, const coll_t &ncid,
-			 const SequencerPosition& spos);
 
   // collections
   int list_collections(vector<coll_t>& ls);
@@ -618,6 +627,19 @@ public:
   int _create_collection(coll_t c);
   int _create_collection(coll_t c, const SequencerPosition &spos);
   int _destroy_collection(coll_t c);
+  /**
+   * Give an expected number of objects hint to the collection.
+   *
+   * @param c                 - collection id.
+   * @param pg_num            - pg number of the pool this collection belongs to
+   * @param expected_num_objs - expected number of objects in this collection
+   * @param spos              - sequence position
+   *
+   * @Return 0 on success, an error code otherwise
+   */
+  int _collection_hint_expected_num_objs(coll_t c, uint32_t pg_num,
+      uint64_t expected_num_objs,
+      const SequencerPosition &spos);
   int _collection_add(coll_t c, coll_t ocid, const ghobject_t& oid,
 		      const SequencerPosition& spos);
   int _collection_move_rename(coll_t oldcid, const ghobject_t& oldoid,
@@ -665,7 +687,7 @@ private:
   double m_filestore_max_sync_interval;
   double m_filestore_min_sync_interval;
   bool m_filestore_fail_eio;
-  bool m_filestore_replica_fadvise;
+  bool m_filestore_fadvise;
   int do_update;
   bool m_journal_dio, m_journal_aio, m_journal_force_aio;
   std::string m_osd_rollback_to_cluster_snap;
@@ -681,7 +703,7 @@ private:
   bool m_filestore_sloppy_crc;
   int m_filestore_sloppy_crc_block_size;
   uint64_t m_filestore_max_alloc_hint_size;
-  enum fs_types m_fs_type;
+  long m_fs_type;
 
   //Determined xattr handling based on fs type
   void set_xattr_limits_via_conf();
@@ -709,6 +731,7 @@ private:
   int read_superblock();
 
   friend class FileStoreBackend;
+  friend class TestFileStore;
 };
 
 ostream& operator<<(ostream& out, const FileStore::OpSequencer& s);
@@ -738,14 +761,23 @@ protected:
     return filestore->current_fn;
   }
   int _copy_range(int from, int to, uint64_t srcoff, uint64_t len, uint64_t dstoff) {
-    return filestore->_do_copy_range(from, to, srcoff, len, dstoff);
+    if (has_fiemap()) {
+      return filestore->_do_sparse_copy_range(from, to, srcoff, len, dstoff);
+    } else {
+      return filestore->_do_copy_range(from, to, srcoff, len, dstoff);
+    }
   }
   int get_crc_block_size() {
     return filestore->m_filestore_sloppy_crc_block_size;
   }
+
 public:
   FileStoreBackend(FileStore *fs) : filestore(fs) {}
-  virtual ~FileStoreBackend() {};
+  virtual ~FileStoreBackend() {}
+
+  static FileStoreBackend *create(long f_type, FileStore *fs);
+
+  virtual const char *get_name() = 0;
   virtual int detect_features() = 0;
   virtual int create_current() = 0;
   virtual bool can_checkpoint() = 0;

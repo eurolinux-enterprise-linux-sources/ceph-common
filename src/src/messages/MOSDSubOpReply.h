@@ -81,8 +81,8 @@ public:
     } else {
       from = pg_shard_t(
 	get_source().num(),
-	ghobject_t::NO_SHARD);
-      pgid.shard = ghobject_t::NO_SHARD;
+	shard_id_t::NO_SHARD);
+      pgid.shard = shard_id_t::NO_SHARD;
     }
   }
   virtual void encode_payload(uint64_t features) {
@@ -144,7 +144,7 @@ private:
   ~MOSDSubOpReply() {}
 
 public:
-  const char *get_type_name() const { return "osd_op_reply"; }
+  const char *get_type_name() const { return "osd_subop_reply"; }
   
   void print(ostream& out) const {
     out << "osd_sub_op_reply(" << reqid

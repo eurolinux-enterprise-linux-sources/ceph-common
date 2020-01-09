@@ -92,6 +92,16 @@ int LevelDBStore::do_open(ostream &out, bool create_if_missing)
   return 0;
 }
 
+int LevelDBStore::_test_init(const string& dir)
+{
+  leveldb::Options options;
+  options.create_if_missing = true;
+  leveldb::DB *db;
+  leveldb::Status status = leveldb::DB::Open(options, dir, &db);
+  delete db;
+  return status.ok() ? 0 : -EIO;
+}
+
 LevelDBStore::~LevelDBStore()
 {
   close();
@@ -144,7 +154,6 @@ void LevelDBStore::LevelDBTransactionImpl::set(
   const bufferlist &to_set_bl)
 {
   buffers.push_back(to_set_bl);
-  buffers.rbegin()->rebuild();
   bufferlist &bl = *(buffers.rbegin());
   string key = combine_strings(prefix, k);
   keys.push_back(key);

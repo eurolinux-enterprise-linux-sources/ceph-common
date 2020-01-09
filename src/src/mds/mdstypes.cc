@@ -4,6 +4,9 @@
 #include "mdstypes.h"
 #include "common/Formatter.h"
 
+const mds_gid_t MDS_GID_NONE = mds_gid_t(0);
+const mds_rank_t MDS_RANK_NONE = mds_rank_t(-1);
+
 void dump(const ceph_file_layout& l, Formatter *f)
 {
   f->dump_unsigned("stripe_unit", l.fl_stripe_unit);
@@ -85,12 +88,16 @@ ostream& operator<<(ostream &out, const frag_info_t &f)
 
 void nest_info_t::encode(bufferlist &bl) const
 {
-  ENCODE_START(2, 2, bl);
+  ENCODE_START(3, 2, bl);
   ::encode(version, bl);
   ::encode(rbytes, bl);
   ::encode(rfiles, bl);
   ::encode(rsubdirs, bl);
-  ::encode(ranchors, bl);
+  {
+    // removed field
+    int64_t ranchors = 0;
+    ::encode(ranchors, bl);
+  }
   ::encode(rsnaprealms, bl);
   ::encode(rctime, bl);
   ENCODE_FINISH(bl);
@@ -98,12 +105,15 @@ void nest_info_t::encode(bufferlist &bl) const
 
 void nest_info_t::decode(bufferlist::iterator &bl)
 {
-  DECODE_START_LEGACY_COMPAT_LEN(2, 2, 2, bl);
+  DECODE_START_LEGACY_COMPAT_LEN(3, 2, 2, bl);
   ::decode(version, bl);
   ::decode(rbytes, bl);
   ::decode(rfiles, bl);
   ::decode(rsubdirs, bl);
-  ::decode(ranchors, bl);
+  {
+    int64_t ranchors;
+    ::decode(ranchors, bl);
+  }
   ::decode(rsnaprealms, bl);
   ::decode(rctime, bl);
   DECODE_FINISH(bl);
@@ -115,7 +125,6 @@ void nest_info_t::dump(Formatter *f) const
   f->dump_unsigned("rbytes", rbytes);
   f->dump_unsigned("rfiles", rfiles);
   f->dump_unsigned("rsubdirs", rsubdirs);
-  f->dump_unsigned("ranchors", ranchors);
   f->dump_unsigned("rsnaprealms", rsnaprealms);
   f->dump_stream("rctime") << rctime;
 }
@@ -128,7 +137,6 @@ void nest_info_t::generate_test_instances(list<nest_info_t*>& ls)
   ls.back()->rbytes = 2;
   ls.back()->rfiles = 3;
   ls.back()->rsubdirs = 4;
-  ls.back()->ranchors = 5;
   ls.back()->rsnaprealms = 6;
   ls.back()->rctime = utime_t(7, 8);
 }
@@ -142,8 +150,6 @@ ostream& operator<<(ostream &out, const nest_info_t &n)
     out << " rc" << n.rctime;
   if (n.rbytes)
     out << " b" << n.rbytes;
-  if (n.ranchors)
-    out << " a" << n.ranchors;
   if (n.rsnaprealms)
     out << " sr" << n.rsnaprealms;
   if (n.rfiles || n.rsubdirs)
@@ -152,6 +158,31 @@ ostream& operator<<(ostream &out, const nest_info_t &n)
   return out;
 }
 
+/*
+ * quota_info_t
+ */
+void quota_info_t::dump(Formatter *f) const
+{
+  f->dump_int("max_bytes", max_bytes);
+  f->dump_int("max_files", max_files);
+}
+
+void quota_info_t::generate_test_instances(list<quota_info_t *>& ls)
+{
+  ls.push_back(new quota_info_t);
+  ls.push_back(new quota_info_t);
+  ls.back()->max_bytes = 16;
+  ls.back()->max_files = 16;
+}
+
+ostream& operator<<(ostream &out, const quota_info_t &n)
+{
+  out << "quota("
+      << "max_bytes = " << n.max_bytes
+      << " max_files = " << n.max_files
+      << ")";
+  return out;
+}
 
 /*
  * client_writeable_range_t
@@ -204,7 +235,7 @@ ostream& operator<<(ostream& out, const client_writeable_range_t& r)
  */
 void inode_t::encode(bufferlist &bl) const
 {
-  ENCODE_START(10, 6, bl);
+  ENCODE_START(11, 6, bl);
 
   ::encode(ino, bl);
   ::encode(rdev, bl);
@@ -215,7 +246,11 @@ void inode_t::encode(bufferlist &bl) const
   ::encode(gid, bl);
 
   ::encode(nlink, bl);
-  ::encode(anchored, bl);
+  {
+    // removed field
+    bool anchored = 0;
+    ::encode(anchored, bl);
+  }
 
   ::encode(dir_layout, bl);
   ::encode(layout, bl);
@@ -242,12 +277,14 @@ void inode_t::encode(bufferlist &bl) const
   ::encode(inline_version, bl);
   ::encode(inline_data, bl);
 
+  ::encode(quota, bl);
+
   ENCODE_FINISH(bl);
 }
 
 void inode_t::decode(bufferlist::iterator &p)
 {
-  DECODE_START_LEGACY_COMPAT_LEN(10, 6, 6, p);
+  DECODE_START_LEGACY_COMPAT_LEN(11, 6, 6, p);
 
   ::decode(ino, p);
   ::decode(rdev, p);
@@ -258,7 +295,10 @@ void inode_t::decode(bufferlist::iterator &p)
   ::decode(gid, p);
 
   ::decode(nlink, p);
-  ::decode(anchored, p);
+  {
+    bool anchored;
+    ::decode(anchored, p);
+  }
 
   if (struct_v >= 4)
     ::decode(dir_layout, p);
@@ -307,6 +347,8 @@ void inode_t::decode(bufferlist::iterator &p)
   }
   if (struct_v < 10)
     backtrace_version = 0; // force update backtrace
+  if (struct_v >= 11)
+    ::decode(quota, p);
 
   DECODE_FINISH(p);
 }
@@ -320,7 +362,6 @@ void inode_t::dump(Formatter *f) const
   f->dump_unsigned("uid", uid);
   f->dump_unsigned("gid", gid);
   f->dump_unsigned("nlink", nlink);
-  f->dump_unsigned("anchored", (int)anchored);
 
   f->open_object_section("dir_layout");
   ::dump(dir_layout, f);
@@ -381,6 +422,67 @@ void inode_t::generate_test_instances(list<inode_t*>& ls)
   // i am lazy.
 }
 
+int inode_t::compare(const inode_t &other, bool *divergent) const
+{
+  assert(ino == other.ino);
+  if (version == other.version) {
+    if (rdev != other.rdev ||
+        ctime != other.ctime ||
+        mode != other.mode ||
+        uid != other.uid ||
+        gid != other.gid ||
+        nlink != other.nlink ||
+        memcmp(&dir_layout, &other.dir_layout, sizeof(dir_layout)) ||
+        memcmp(&layout, &other.layout, sizeof(layout)) ||
+        old_pools != other.old_pools ||
+        size != other.size ||
+        max_size_ever != other.max_size_ever ||
+        truncate_seq != other.truncate_seq ||
+        truncate_size != other.truncate_size ||
+        truncate_from != other.truncate_from ||
+        truncate_pending != other.truncate_pending ||
+        mtime != other.mtime ||
+        atime != other.atime ||
+        time_warp_seq != other.time_warp_seq ||
+        !(*const_cast<bufferlist*>(&inline_data) ==
+            *const_cast<bufferlist*>(&other.inline_data)) ||
+        inline_version != other.inline_version ||
+        client_ranges != other.client_ranges ||
+        !(dirstat == other.dirstat) ||
+        !(rstat == other.rstat) ||
+        !(accounted_rstat == other.accounted_rstat) ||
+        file_data_version != other.file_data_version ||
+        xattr_version != other.xattr_version ||
+        backtrace_version != other.backtrace_version) {
+      *divergent = true;
+    }
+    return 0;
+  } else if (version > other.version) {
+    *divergent = !older_is_consistent(other);
+    return 1;
+  } else {
+    assert(version < other.version);
+    *divergent = !other.older_is_consistent(*this);
+    return -1;
+  }
+}
+
+bool inode_t::older_is_consistent(const inode_t &other) const
+{
+  if (max_size_ever < other.max_size_ever ||
+      truncate_seq < other.truncate_seq ||
+      time_warp_seq < other.time_warp_seq ||
+      inline_version < other.inline_version ||
+      dirstat.version < other.dirstat.version ||
+      rstat.version < other.rstat.version ||
+      accounted_rstat.version < other.accounted_rstat.version ||
+      file_data_version < other.file_data_version ||
+      xattr_version < other.xattr_version ||
+      backtrace_version < other.backtrace_version) {
+    return false;
+  }
+  return true;
+}
 
 /*
  * old_inode_t
@@ -542,17 +644,18 @@ void old_rstat_t::generate_test_instances(list<old_rstat_t*>& ls)
  */
 void session_info_t::encode(bufferlist& bl) const
 {
-  ENCODE_START(3, 3, bl);
+  ENCODE_START(4, 3, bl);
   ::encode(inst, bl);
   ::encode(completed_requests, bl);
   ::encode(prealloc_inos, bl);   // hacky, see below.
   ::encode(used_inos, bl);
+  ::encode(client_metadata, bl);
   ENCODE_FINISH(bl);
 }
 
 void session_info_t::decode(bufferlist::iterator& p)
 {
-  DECODE_START_LEGACY_COMPAT_LEN(3, 2, 2, p);
+  DECODE_START_LEGACY_COMPAT_LEN(4, 2, 2, p);
   ::decode(inst, p);
   if (struct_v <= 2) {
     set<ceph_tid_t> s;
@@ -568,6 +671,9 @@ void session_info_t::decode(bufferlist::iterator& p)
   ::decode(used_inos, p);
   prealloc_inos.insert(used_inos);
   used_inos.clear();
+  if (struct_v >= 4) {
+    ::decode(client_metadata, p);
+  }
   DECODE_FINISH(p);
 }
 
@@ -607,6 +713,11 @@ void session_info_t::dump(Formatter *f) const
     f->close_section();
   }
   f->close_section();
+
+  for (map<string, string>::const_iterator i = client_metadata.begin();
+      i != client_metadata.end(); ++i) {
+    f->dump_string(i->first.c_str(), i->second);
+  }
 }
 
 void session_info_t::generate_test_instances(list<session_info_t*>& ls)

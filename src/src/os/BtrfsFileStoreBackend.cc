@@ -70,8 +70,7 @@ int BtrfsFileStoreBackend::detect_features()
   if (m_filestore_btrfs_clone_range) {
     int fd = ::openat(get_basedir_fd(), "clone_range_test", O_CREAT|O_WRONLY, 0600);
     if (fd >= 0) {
-      ::unlinkat(get_basedir_fd(), "clone_range_test", 0);
-      if (fd < 0) {
+      if (::unlinkat(get_basedir_fd(), "clone_range_test", 0) < 0) {
 	r = -errno;
 	dout(0) << "detect_feature: failed to unlink test file for CLONE_RANGE ioctl: "
 		<< cpp_strerror(r) << dendl;
@@ -376,7 +375,10 @@ int BtrfsFileStoreBackend::create_checkpoint(const string& name, uint64_t *trans
     memset(&async_args, 0, sizeof(async_args));
     async_args.fd = get_current_fd();
     async_args.flags = BTRFS_SUBVOL_CREATE_ASYNC;
-    strncpy(async_args.name, name.c_str(), sizeof(async_args.name));
+
+    size_t name_size = sizeof(async_args.name);
+    strncpy(async_args.name, name.c_str(), name_size);
+    async_args.name[name_size-1] = '\0';
 
     int r = ::ioctl(get_basedir_fd(), BTRFS_IOC_SNAP_CREATE_V2, &async_args);
     if (r < 0) {
@@ -390,7 +392,10 @@ int BtrfsFileStoreBackend::create_checkpoint(const string& name, uint64_t *trans
     struct btrfs_ioctl_vol_args vol_args;
     memset(&vol_args, 0, sizeof(vol_args));
     vol_args.fd = get_current_fd();
-    strcpy(vol_args.name, name.c_str());
+
+    size_t name_size = sizeof(vol_args.name);
+    strncpy(vol_args.name, name.c_str(), name_size);
+    vol_args.name[name_size-1] = '\0';
 
     int r = ::ioctl(get_basedir_fd(), BTRFS_IOC_SNAP_CREATE, &vol_args);
     if (r < 0) {

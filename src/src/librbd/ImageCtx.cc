@@ -6,11 +6,17 @@
 #include "common/dout.h"
 #include "common/errno.h"
 #include "common/perf_counters.h"
+#include "common/WorkQueue.h"
 
+#include "librbd/AsyncOperation.h"
+#include "librbd/AsyncRequest.h"
+#include "librbd/AsyncResizeRequest.h"
 #include "librbd/internal.h"
-#include "librbd/WatchCtx.h"
-
 #include "librbd/ImageCtx.h"
+#include "librbd/ImageWatcher.h"
+#include "librbd/ObjectMap.h"
+
+#include <boost/bind.hpp>
 
 #define dout_subsys ceph_subsys_rbd
 #undef dout_prefix
@@ -27,6 +33,23 @@ using librados::snap_t;
 using librados::IoCtx;
 
 namespace librbd {
+
+namespace {
+
+class ThreadPoolSingleton : public ThreadPool {
+public:
+  ThreadPoolSingleton(CephContext *cct)
+    : ThreadPool(cct, "librbd::thread_pool", cct->_conf->rbd_op_threads,
+                 "rbd_op_threads") {
+    start();
+  }
+  virtual ~ThreadPoolSingleton() {
+    stop();
+  }
+};
+
+} // anonymous namespace
+
   ImageCtx::ImageCtx(const string &image_name, const string &image_id,
 		     const char *snap, IoCtx& p, bool ro)
     : cct((CephContext*)p.cct()),
@@ -37,21 +60,28 @@ namespace librbd {
       flush_encountered(false),
       exclusive_locked(false),
       name(image_name),
-      wctx(NULL),
+      image_watcher(NULL),
       refresh_seq(0),
       last_refresh(0),
-      md_lock("librbd::ImageCtx::md_lock"),
-      cache_lock("librbd::ImageCtx::cache_lock"),
-      snap_lock("librbd::ImageCtx::snap_lock"),
-      parent_lock("librbd::ImageCtx::parent_lock"),
-      refresh_lock("librbd::ImageCtx::refresh_lock"),
+      owner_lock(unique_lock_name("librbd::ImageCtx::owner_lock", this)),
+      md_lock(unique_lock_name("librbd::ImageCtx::md_lock", this)),
+      cache_lock(unique_lock_name("librbd::ImageCtx::cache_lock", this)),
+      snap_lock(unique_lock_name("librbd::ImageCtx::snap_lock", this)),
+      parent_lock(unique_lock_name("librbd::ImageCtx::parent_lock", this)),
+      refresh_lock(unique_lock_name("librbd::ImageCtx::refresh_lock", this)),
+      object_map_lock(unique_lock_name("librbd::ImageCtx::object_map_lock", this)),
+      async_ops_lock(unique_lock_name("librbd::ImageCtx::async_ops_lock", this)),
+      copyup_list_lock(unique_lock_name("librbd::ImageCtx::copyup_list_lock", this)),
       extra_read_flags(0),
       old_format(true),
       order(0), size(0), features(0),
       format_string(NULL),
       id(image_id), parent(NULL),
-      stripe_unit(0), stripe_count(0),
-      object_cacher(NULL), writeback_handler(NULL), object_set(NULL)
+      stripe_unit(0), stripe_count(0), flags(0),
+      object_cacher(NULL), writeback_handler(NULL), object_set(NULL),
+      readahead(),
+      total_bytes_read(0), copyup_finisher(NULL),
+      object_map(*this), aio_work_queue(NULL), op_work_queue(NULL)
   {
     md_ctx.dup(p);
     data_ctx.dup(p);
@@ -96,6 +126,21 @@ namespace librbd {
       object_set->return_enoent = true;
       object_cacher->start();
     }
+
+    if (cct->_conf->rbd_clone_copy_on_read) {
+      copyup_finisher = new Finisher(cct);
+      copyup_finisher->start();
+    }
+
+    ThreadPoolSingleton *thread_pool_singleton;
+    cct->lookup_or_create_singleton_object<ThreadPoolSingleton>(
+      thread_pool_singleton, "librbd::thread_pool");
+    aio_work_queue = new ContextWQ("librbd::aio_work_queue",
+                                   cct->_conf->rbd_op_thread_timeout,
+                                   thread_pool_singleton);
+    op_work_queue = new ContextWQ("librbd::op_work_queue",
+                                  cct->_conf->rbd_op_thread_timeout,
+                                  thread_pool_singleton);
   }
 
   ImageCtx::~ImageCtx() {
@@ -112,7 +157,14 @@ namespace librbd {
       delete object_set;
       object_set = NULL;
     }
+    if (copyup_finisher != NULL) {
+      delete copyup_finisher;
+      copyup_finisher = NULL;
+    }
     delete[] format_string;
+
+    delete op_work_queue;
+    delete aio_work_queue;
   }
 
   int ImageCtx::init() {
@@ -158,15 +210,25 @@ namespace librbd {
     } else {
       header_oid = old_header_name(name);
     }
+
+    md_config_t *conf = cct->_conf;
+    readahead.set_trigger_requests(conf->rbd_readahead_trigger_requests);
+    readahead.set_max_readahead_size(conf->rbd_readahead_max_bytes);
     return 0;
   }
-  
+
   void ImageCtx::init_layout()
   {
     if (stripe_unit == 0 || stripe_count == 0) {
       stripe_unit = 1ull << order;
       stripe_count = 1;
     }
+
+    vector<uint64_t> alignments;
+    alignments.push_back(stripe_count << order); // object set (in file striping terminology)
+    alignments.push_back(stripe_unit * stripe_count); // stripe
+    alignments.push_back(stripe_unit); // stripe unit
+    readahead.set_alignments(alignments);
 
     memset(&layout, 0, sizeof(layout));
     layout.fl_stripe_unit = stripe_unit;
@@ -187,10 +249,9 @@ namespace librbd {
     if (object_cacher) {
       uint64_t obj = cct->_conf->rbd_cache_max_dirty_object;
       if (!obj) {
-        obj = cct->_conf->rbd_cache_size / (1ull << order);
-        obj = obj * 4 + 10;
+        obj = MIN(2000, MAX(10, cct->_conf->rbd_cache_size / 100 / sizeof(ObjectCacher::Object)));
       }
-      ldout(cct, 10) << " cache bytes " << cct->_conf->rbd_cache_size << " order " << (int)order
+      ldout(cct, 10) << " cache bytes " << cct->_conf->rbd_cache_size
 		     << " -> about " << obj << " objects" << dendl;
       object_cacher->set_max_objects(obj);
     }
@@ -232,6 +293,8 @@ namespace librbd {
     plb.add_u64_counter(l_librbd_snap_rollback, "snap_rollback");
     plb.add_u64_counter(l_librbd_notify, "notify");
     plb.add_u64_counter(l_librbd_resize, "resize");
+    plb.add_u64_counter(l_librbd_readahead, "readahead");
+    plb.add_u64_counter(l_librbd_readahead_bytes, "readahead_bytes");
 
     perfcounter = plb.create_perf_counters();
     cct->get_perfcounters_collection()->add(perfcounter);
@@ -261,12 +324,14 @@ namespace librbd {
 
   int ImageCtx::snap_set(string in_snap_name)
   {
-    map<string, SnapInfo>::iterator it = snaps_by_name.find(in_snap_name);
-    if (it != snaps_by_name.end()) {
+    assert(snap_lock.is_wlocked());
+    snap_t in_snap_id = get_snap_id(in_snap_name);
+    if (in_snap_id != CEPH_NOSNAP) {
+      snap_id = in_snap_id;
       snap_name = in_snap_name;
-      snap_id = it->second.id;
       snap_exists = true;
       data_ctx.snap_set_read(snap_id);
+      object_map.refresh(in_snap_id);
       return 0;
     }
     return -ENOENT;
@@ -274,48 +339,60 @@ namespace librbd {
 
   void ImageCtx::snap_unset()
   {
+    assert(snap_lock.is_wlocked());
     snap_id = CEPH_NOSNAP;
     snap_name = "";
     snap_exists = true;
     data_ctx.snap_set_read(snap_id);
+    object_map.refresh(CEPH_NOSNAP);
   }
 
   snap_t ImageCtx::get_snap_id(string in_snap_name) const
   {
-    map<string, SnapInfo>::const_iterator it = snaps_by_name.find(in_snap_name);
-    if (it != snaps_by_name.end())
-      return it->second.id;
+    assert(snap_lock.is_locked());
+    map<string, snap_t>::const_iterator it =
+      snap_ids.find(in_snap_name);
+    if (it != snap_ids.end())
+      return it->second;
     return CEPH_NOSNAP;
   }
 
-  int ImageCtx::get_snap_name(snapid_t in_snap_id, string *out_snap_name) const
+  const SnapInfo* ImageCtx::get_snap_info(snap_t in_snap_id) const
   {
-    map<string, SnapInfo>::const_iterator it;
+    assert(snap_lock.is_locked());
+    map<snap_t, SnapInfo>::const_iterator it =
+      snap_info.find(in_snap_id);
+    if (it != snap_info.end())
+      return &it->second;
+    return NULL;
+  }
 
-    for (it = snaps_by_name.begin(); it != snaps_by_name.end(); ++it) {
-      if (it->second.id == in_snap_id) {
-	*out_snap_name = it->first;
-	return 0;
-      }
+  int ImageCtx::get_snap_name(snap_t in_snap_id,
+			      string *out_snap_name) const
+  {
+    assert(snap_lock.is_locked());
+    const SnapInfo *info = get_snap_info(in_snap_id);
+    if (info) {
+      *out_snap_name = info->name;
+      return 0;
     }
     return -ENOENT;
   }
 
-  int ImageCtx::get_parent_spec(snapid_t in_snap_id, parent_spec *out_pspec)
+  int ImageCtx::get_parent_spec(snap_t in_snap_id,
+				parent_spec *out_pspec) const
   {
-    map<string, SnapInfo>::iterator it;
-
-    for (it = snaps_by_name.begin(); it != snaps_by_name.end(); ++it) {
-      if (it->second.id == in_snap_id) {
-	*out_pspec = it->second.parent.spec;
-	return 0;
-      }
+    const SnapInfo *info = get_snap_info(in_snap_id);
+    if (info) {
+      *out_pspec = info->parent.spec;
+      return 0;
     }
     return -ENOENT;
   }
 
   uint64_t ImageCtx::get_current_size() const
   {
+    assert(snap_lock.is_locked());
     return size;
   }
 
@@ -345,146 +422,191 @@ namespace librbd {
     return stripe_count * (1ull << order);
   }
 
-  uint64_t ImageCtx::get_num_objects() const
+  int ImageCtx::is_snap_protected(snap_t in_snap_id,
+				  bool *is_protected) const
   {
-    uint64_t period = get_stripe_period();
-    uint64_t num_periods = (size + period - 1) / period;
-    return num_periods * stripe_count;
-  }
-
-  int ImageCtx::is_snap_protected(string in_snap_name, bool *is_protected) const
-  {
-    map<string, SnapInfo>::const_iterator it = snaps_by_name.find(in_snap_name);
-    if (it != snaps_by_name.end()) {
+    assert(snap_lock.is_locked());
+    const SnapInfo *info = get_snap_info(in_snap_id);
+    if (info) {
       *is_protected =
-	(it->second.protection_status == RBD_PROTECTION_STATUS_PROTECTED);
+	(info->protection_status == RBD_PROTECTION_STATUS_PROTECTED);
       return 0;
     }
     return -ENOENT;
   }
 
-  int ImageCtx::is_snap_unprotected(string in_snap_name,
+  int ImageCtx::is_snap_unprotected(snap_t in_snap_id,
 				    bool *is_unprotected) const
   {
-    map<string, SnapInfo>::const_iterator it = snaps_by_name.find(in_snap_name);
-    if (it != snaps_by_name.end()) {
+    assert(snap_lock.is_locked());
+    const SnapInfo *info = get_snap_info(in_snap_id);
+    if (info) {
       *is_unprotected =
-	(it->second.protection_status == RBD_PROTECTION_STATUS_UNPROTECTED);
+	(info->protection_status == RBD_PROTECTION_STATUS_UNPROTECTED);
       return 0;
     }
     return -ENOENT;
   }
 
   void ImageCtx::add_snap(string in_snap_name, snap_t id, uint64_t in_size,
-			  uint64_t features,
-			  parent_info parent,
-			  uint8_t protection_status)
+			  uint64_t features, parent_info parent,
+			  uint8_t protection_status, uint64_t flags)
   {
+    assert(snap_lock.is_wlocked());
     snaps.push_back(id);
-    SnapInfo info(id, in_size, features, parent, protection_status);
-    snaps_by_name.insert(pair<string, SnapInfo>(in_snap_name, info));
+    SnapInfo info(in_snap_name, in_size, features, parent, protection_status,
+		  flags);
+    snap_info.insert(pair<snap_t, SnapInfo>(id, info));
+    snap_ids.insert(pair<string, snap_t>(in_snap_name, id));
   }
 
   uint64_t ImageCtx::get_image_size(snap_t in_snap_id) const
   {
+    assert(snap_lock.is_locked());
     if (in_snap_id == CEPH_NOSNAP) {
+      if (!async_resize_reqs.empty() &&
+          async_resize_reqs.front()->shrinking()) {
+        return async_resize_reqs.front()->get_image_size();
+      }
       return size;
     }
-    string in_snap_name;
-    int r = get_snap_name(in_snap_id, &in_snap_name);
-    if (r < 0)
-      return 0;
-    map<string, SnapInfo>::const_iterator p = snaps_by_name.find(in_snap_name);
-    if (p == snaps_by_name.end())
-      return 0;
-    return p->second.size;
+
+    const SnapInfo *info = get_snap_info(in_snap_id);
+    if (info) {
+      return info->size;
+    }
+    return 0;
   }
 
   int ImageCtx::get_features(snap_t in_snap_id, uint64_t *out_features) const
   {
+    assert(snap_lock.is_locked());
     if (in_snap_id == CEPH_NOSNAP) {
       *out_features = features;
       return 0;
     }
-    string in_snap_name;
-    int r = get_snap_name(in_snap_id, &in_snap_name);
-    if (r < 0)
-      return r;
-    map<string, SnapInfo>::const_iterator p = snaps_by_name.find(in_snap_name);
-    if (p == snaps_by_name.end())
-      return -ENOENT;
-    *out_features = p->second.features;
+    const SnapInfo *info = get_snap_info(in_snap_id);
+    if (info) {
+      *out_features = info->features;
+      return 0;
+    }
+    return -ENOENT;
+  }
+
+  bool ImageCtx::test_features(uint64_t test_features) const
+  {
+    RWLock::RLocker l(snap_lock);
+    uint64_t snap_features = 0;
+    get_features(snap_id, &snap_features);
+    return ((snap_features & test_features) == test_features);
+  }
+
+  int ImageCtx::get_flags(librados::snap_t _snap_id, uint64_t *_flags) const
+  {
+    assert(snap_lock.is_locked());
+    if (_snap_id == CEPH_NOSNAP) {
+      *_flags = flags;
+      return 0;
+    }
+    const SnapInfo *info = get_snap_info(_snap_id);
+    if (info) {
+      *_flags = info->flags;
+      return 0;
+    }
+    return -ENOENT;
+  }
+
+  bool ImageCtx::test_flags(uint64_t test_flags) const
+  {
+    RWLock::RLocker l(snap_lock);
+    uint64_t snap_flags;
+    get_flags(snap_id, &snap_flags);
+    return ((snap_flags & test_flags) == test_flags);
+  }
+
+  int ImageCtx::update_flags(snap_t in_snap_id, uint64_t flag, bool enabled)
+  {
+    assert(snap_lock.is_wlocked());
+    uint64_t *_flags;
+    if (in_snap_id == CEPH_NOSNAP) {
+      _flags = &flags;
+    } else {
+      map<snap_t, SnapInfo>::iterator it = snap_info.find(in_snap_id);
+      if (it == snap_info.end()) {
+        return -ENOENT;
+      }
+      _flags = &it->second.flags;
+    }
+
+    if (enabled) {
+      (*_flags) |= flag;
+    } else {
+      (*_flags) &= ~flag;
+    }
     return 0;
+  }
+
+  const parent_info* ImageCtx::get_parent_info(snap_t in_snap_id) const
+  {
+    assert(snap_lock.is_locked());
+    assert(parent_lock.is_locked());
+    if (in_snap_id == CEPH_NOSNAP)
+      return &parent_md;
+    const SnapInfo *info = get_snap_info(in_snap_id);
+    if (info)
+      return &info->parent;
+    return NULL;
   }
 
   int64_t ImageCtx::get_parent_pool_id(snap_t in_snap_id) const
   {
-    if (in_snap_id == CEPH_NOSNAP) {
-      return parent_md.spec.pool_id;
-    }
-    string in_snap_name;
-    int r = get_snap_name(in_snap_id, &in_snap_name);
-    if (r < 0)
-      return -1;
-    map<string, SnapInfo>::const_iterator p = snaps_by_name.find(in_snap_name);
-    if (p == snaps_by_name.end())
-      return -1;
-    return p->second.parent.spec.pool_id;
+    const parent_info *info = get_parent_info(in_snap_id);
+    if (info)
+      return info->spec.pool_id;
+    return -1;
   }
 
   string ImageCtx::get_parent_image_id(snap_t in_snap_id) const
   {
-    if (in_snap_id == CEPH_NOSNAP) {
-      return parent_md.spec.image_id;
-    }
-    string in_snap_name;
-    int r = get_snap_name(in_snap_id, &in_snap_name);
-    if (r < 0)
-      return "";
-    map<string, SnapInfo>::const_iterator p = snaps_by_name.find(in_snap_name);
-    if (p == snaps_by_name.end())
-      return "";
-    return p->second.parent.spec.image_id;
+    const parent_info *info = get_parent_info(in_snap_id);
+    if (info)
+      return info->spec.image_id;
+    return "";
   }
 
   uint64_t ImageCtx::get_parent_snap_id(snap_t in_snap_id) const
   {
-    if (in_snap_id == CEPH_NOSNAP) {
-      return parent_md.spec.snap_id;
-    }
-    string in_snap_name;
-    int r = get_snap_name(in_snap_id, &in_snap_name);
-    if (r < 0)
-      return CEPH_NOSNAP;
-    map<string, SnapInfo>::const_iterator p = snaps_by_name.find(in_snap_name);
-    if (p == snaps_by_name.end())
-      return CEPH_NOSNAP;
-    return p->second.parent.spec.snap_id;
+    const parent_info *info = get_parent_info(in_snap_id);
+    if (info)
+      return info->spec.snap_id;
+    return CEPH_NOSNAP;
   }
 
   int ImageCtx::get_parent_overlap(snap_t in_snap_id, uint64_t *overlap) const
   {
-    if (in_snap_id == CEPH_NOSNAP) {
-      *overlap = parent_md.overlap;
+    assert(snap_lock.is_locked());
+    if (in_snap_id == CEPH_NOSNAP && !async_resize_reqs.empty() &&
+        async_resize_reqs.front()->shrinking()) {
+      *overlap = async_resize_reqs.front()->get_parent_overlap();
       return 0;
     }
-    string in_snap_name;
-    int r = get_snap_name(in_snap_id, &in_snap_name);
-    if (r < 0)
-      return r;
-    map<string, SnapInfo>::const_iterator p = snaps_by_name.find(in_snap_name);
-    if (p == snaps_by_name.end())
-      return -ENOENT;
-    *overlap = p->second.parent.overlap;
-    return 0;
+
+    const parent_info *info = get_parent_info(in_snap_id);
+    if (info) {
+      *overlap = info->overlap;
+      return 0;
+    }
+    return -ENOENT;
   }
 
-  void ImageCtx::aio_read_from_cache(object_t o, bufferlist *bl, size_t len,
-				     uint64_t off, Context *onfinish) {
+  void ImageCtx::aio_read_from_cache(object_t o, uint64_t object_no,
+				     bufferlist *bl, size_t len,
+				     uint64_t off, Context *onfinish,
+				     int fadvise_flags) {
     snap_lock.get_read();
-    ObjectCacher::OSDRead *rd = object_cacher->prepare_read(snap_id, bl, 0);
+    ObjectCacher::OSDRead *rd = object_cacher->prepare_read(snap_id, bl, fadvise_flags);
     snap_lock.put_read();
-    ObjectExtent extent(o, 0 /* a lie */, off, len, 0);
+    ObjectExtent extent(o, object_no, off, len, 0);
     extent.oloc.pool = data_ctx.get_id();
     extent.buffer_extents.push_back(make_pair(0, len));
     rd->extents.push_back(extent);
@@ -495,11 +617,12 @@ namespace librbd {
       onfinish->complete(r);
   }
 
-  void ImageCtx::write_to_cache(object_t o, bufferlist& bl, size_t len,
-				uint64_t off, Context *onfinish) {
+  void ImageCtx::write_to_cache(object_t o, const bufferlist& bl, size_t len,
+				uint64_t off, Context *onfinish,
+				int fadvise_flags) {
     snap_lock.get_read();
     ObjectCacher::OSDWrite *wr = object_cacher->prepare_write(snapc, bl,
-							      utime_t(), 0);
+							      utime_t(), fadvise_flags);
     snap_lock.put_read();
     ObjectExtent extent(o, 0, off, len, 0);
     extent.oloc.pool = data_ctx.get_id();
@@ -509,23 +632,8 @@ namespace librbd {
     wr->extents.push_back(extent);
     {
       Mutex::Locker l(cache_lock);
-      object_cacher->writex(wr, object_set, cache_lock, onfinish);
+      object_cacher->writex(wr, object_set, onfinish);
     }
-  }
-
-  int ImageCtx::read_from_cache(object_t o, bufferlist *bl, size_t len,
-				uint64_t off) {
-    int r;
-    Mutex mylock("librbd::ImageCtx::read_from_cache");
-    Cond cond;
-    bool done;
-    Context *onfinish = new C_SafeCond(&mylock, &cond, &done, &r);
-    aio_read_from_cache(o, bl, len, off, onfinish);
-    mylock.Lock();
-    while (!done)
-      cond.Wait(mylock);
-    mylock.Unlock();
-    return r;
   }
 
   void ImageCtx::user_flushed() {
@@ -548,6 +656,7 @@ namespace librbd {
   }
 
   void ImageCtx::flush_cache_aio(Context *onfinish) {
+    assert(owner_lock.is_locked());
     cache_lock.Lock();
     object_cacher->flush_set(object_set, onfinish);
     cache_lock.Unlock();
@@ -571,52 +680,84 @@ namespace librbd {
   }
 
   void ImageCtx::shutdown_cache() {
-    md_lock.get_write();
-    invalidate_cache();
-    md_lock.put_write();
+    flush_async_operations();
+
+    RWLock::RLocker owner_locker(owner_lock);
+    invalidate_cache(true);
     object_cacher->stop();
   }
 
-  int ImageCtx::invalidate_cache() {
-    if (!object_cacher)
-      return 0;
+  int ImageCtx::invalidate_cache(bool purge_on_error) {
+    int result;
+    C_SaferCond ctx;
+    invalidate_cache(&ctx);
+    result = ctx.wait();
+
+    if (result && purge_on_error) {
+      cache_lock.Lock();
+      if (object_cacher != NULL) {
+	lderr(cct) << "invalidate cache met error " << cpp_strerror(result) << " !Purging cache..." << dendl;
+	object_cacher->purge_set(object_set);
+      }
+      cache_lock.Unlock();
+    }
+
+    return result;
+  }
+
+  void ImageCtx::invalidate_cache(Context *on_finish) {
+    if (object_cacher == NULL) {
+      op_work_queue->queue(on_finish, 0);
+      return;
+    }
+
     cache_lock.Lock();
     object_cacher->release_set(object_set);
     cache_lock.Unlock();
-    int r = flush_cache();
-    if (r)
+
+    flush_cache_aio(new FunctionContext(boost::bind(
+      &ImageCtx::invalidate_cache_completion, this, _1, on_finish)));
+  }
+
+  void ImageCtx::invalidate_cache_completion(int r, Context *on_finish) {
+    assert(cache_lock.is_locked());
+    if (r == -EBLACKLISTED) {
+      lderr(cct) << "Blacklisted during flush!  Purging cache..." << dendl;
+      object_cacher->purge_set(object_set);
+    } else if (r != 0) {
       lderr(cct) << "flush_cache returned " << r << dendl;
-    cache_lock.Lock();
-    bool unclean = object_cacher->release_set(object_set);
-    cache_lock.Unlock();
-    if (unclean) {
+    }
+
+    loff_t unclean = object_cacher->release_set(object_set);
+    if (unclean == 0) {
+      r = 0;
+    } else {
       lderr(cct) << "could not release all objects from cache: "
                  << unclean << " bytes remain" << dendl;
-      return -EBUSY;
+      r = -EBUSY;
     }
-    return r;
+
+    op_work_queue->queue(on_finish, r);
   }
 
   void ImageCtx::clear_nonexistence_cache() {
+    assert(cache_lock.is_locked());
     if (!object_cacher)
       return;
-    cache_lock.Lock();
     object_cacher->clear_nonexistence(object_set);
-    cache_lock.Unlock();
   }
 
   int ImageCtx::register_watch() {
-    assert(!wctx);
-    wctx = new WatchCtx(this);
-    return md_ctx.watch(header_oid, 0, &(wctx->cookie), wctx);
+    assert(image_watcher == NULL);
+    image_watcher = new ImageWatcher(*this);
+    return image_watcher->register_watch();
   }
 
   void ImageCtx::unregister_watch() {
-    assert(wctx);
-    wctx->invalidate();
-    md_ctx.unwatch(header_oid, wctx->cookie);
-    delete wctx;
-    wctx = NULL;
+    assert(image_watcher != NULL);
+    image_watcher->unregister_watch();
+    delete image_watcher;
+    image_watcher = NULL;
   }
 
   size_t ImageCtx::parent_io_len(uint64_t offset, size_t length,
@@ -655,5 +796,39 @@ namespace librbd {
 		   << ", object overlap " << len
 		   << " from image extents " << objectx << dendl;
     return len;
- }
+  }
+
+  void ImageCtx::flush_async_operations() {
+    C_SaferCond ctx;
+    flush_async_operations(&ctx);
+    ctx.wait();
+  }
+
+  void ImageCtx::flush_async_operations(Context *on_finish) {
+    Mutex::Locker l(async_ops_lock);
+    if (async_ops.empty()) {
+      op_work_queue->queue(on_finish, 0);
+      return;
+    }
+
+    ldout(cct, 20) << "flush async operations: " << on_finish << " "
+                   << "count=" << async_ops.size() << dendl;
+    async_ops.front()->add_flush_context(on_finish);
+  }
+
+  void ImageCtx::cancel_async_requests() {
+    Mutex::Locker l(async_ops_lock);
+    ldout(cct, 10) << "canceling async requests: count="
+                   << async_requests.size() << dendl;
+
+    for (xlist<AsyncRequest*>::iterator it = async_requests.begin();
+         !it.end(); ++it) {
+      ldout(cct, 10) << "canceling async request: " << *it << dendl;
+      (*it)->cancel();
+    }
+
+    while (!async_requests.empty()) {
+      async_requests_cond.Wait(async_ops_lock);
+    }
+  }
 }

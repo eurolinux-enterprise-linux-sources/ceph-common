@@ -20,8 +20,8 @@
 #include "../CInode.h"
 #include "../CDir.h"
 #include "../CDentry.h"
+#include "../LogSegment.h"
 
-#include "include/triple.h"
 #include "include/interval_set.h"
 
 class MDS;
@@ -69,12 +69,11 @@ public:
     fragtree_t dirfragtree;
     map<string,bufferptr> xattrs;
     string symlink;
+    snapid_t oldest_snap;
     bufferlist snapbl;
     __u8 state;
     typedef map<snapid_t, old_inode_t> old_inodes_t;
     old_inodes_t old_inodes;
-
-    bufferlist _enc;
 
     fullbit(const fullbit& o);
     const fullbit& operator=(const fullbit& o);
@@ -82,28 +81,18 @@ public:
     fullbit(const string& d, snapid_t df, snapid_t dl, 
 	    version_t v, const inode_t& i, const fragtree_t &dft, 
 	    const map<string,bufferptr> &xa, const string& sym,
-	    const bufferlist &sbl, __u8 st,
+	    snapid_t os, const bufferlist &sbl, __u8 st,
 	    const old_inodes_t *oi = NULL) :
-      //dn(d), dnfirst(df), dnlast(dl), dnv(v), 
-      //inode(i), dirfragtree(dft), xattrs(xa), symlink(sym), snapbl(sbl), dirty(dr) 
-      _enc(1024)
+      dn(d), dnfirst(df), dnlast(dl), dnv(v), inode(i), xattrs(xa),
+      oldest_snap(os), state(st)
     {
-      ::encode(d, _enc);
-      ::encode(df, _enc);
-      ::encode(dl, _enc);
-      ::encode(v, _enc);
-      ::encode(i, _enc);
-      ::encode(xa, _enc);
       if (i.is_symlink())
-	::encode(sym, _enc);
-      if (i.is_dir()) {
-	::encode(dft, _enc);
-	::encode(sbl, _enc);
-      }
-      ::encode(st, _enc);
-      ::encode(oi ? true : false, _enc);
+	symlink = sym;
+      if (i.is_dir())
+	dirfragtree = dft;
       if (oi)
-	::encode(*oi, _enc);
+	old_inodes = *oi;
+      snapbl = sbl;
     }
     fullbit(bufferlist::iterator &p) {
       decode(p);
@@ -153,19 +142,8 @@ public:
     unsigned char d_type;
     bool dirty;
 
-    bufferlist _enc;
-
     remotebit(const string& d, snapid_t df, snapid_t dl, version_t v, inodeno_t i, unsigned char dt, bool dr) : 
-      //dn(d), dnfirst(df), dnlast(dl), dnv(v), ino(i), d_type(dt), dirty(dr) { }
-      _enc(256) {
-      ::encode(d, _enc);
-      ::encode(df, _enc);
-      ::encode(dl, _enc);
-      ::encode(v, _enc);
-      ::encode(i, _enc);
-      ::encode(dt, _enc);
-      ::encode(dr, _enc);
-    }
+      dn(d), dnfirst(df), dnlast(dl), dnv(v), ino(i), d_type(dt), dirty(dr) { }
     remotebit(bufferlist::iterator &p) { decode(p); }
     remotebit(): dnfirst(0), dnlast(0), dnv(0), ino(0),
 	d_type('\0'), dirty(false) {}
@@ -191,17 +169,8 @@ public:
     version_t dnv;
     bool dirty;
 
-    bufferlist _enc;
-
     nullbit(const string& d, snapid_t df, snapid_t dl, version_t v, bool dr) : 
-      //dn(d), dnfirst(df), dnlast(dl), dnv(v), dirty(dr) { }
-      _enc(128) {
-      ::encode(d, _enc);
-      ::encode(df, _enc);
-      ::encode(dl, _enc);
-      ::encode(v, _enc);
-      ::encode(dr, _enc);
-    }
+      dn(d), dnfirst(df), dnlast(dl), dnv(v), dirty(dr) { }
     nullbit(bufferlist::iterator &p) { decode(p); }
     nullbit(): dnfirst(0), dnlast(0), dnv(0), dirty(false) {}
 
@@ -234,10 +203,10 @@ public:
 
   private:
     mutable bufferlist dnbl;
-    bool dn_decoded;
-    list<ceph::shared_ptr<fullbit> >   dfull;
-    list<remotebit> dremote;
-    list<nullbit>   dnull;
+    mutable bool dn_decoded;
+    mutable list<ceph::shared_ptr<fullbit> > dfull;
+    mutable list<remotebit> dremote;
+    mutable list<nullbit> dnull;
 
   public:
     dirlump() : state(0), nfull(0), nremote(0), nnull(0), dn_decoded(true) { }
@@ -253,9 +222,13 @@ public:
     bool is_dirty_dft() { return state & STATE_DIRTYDFT; }
     void mark_dirty_dft() { state |= STATE_DIRTYDFT; }
 
-    list<ceph::shared_ptr<fullbit> >   &get_dfull()   { return dfull; }
-    list<remotebit> &get_dremote() { return dremote; }
-    list<nullbit>   &get_dnull()   { return dnull; }
+    const list<ceph::shared_ptr<fullbit> > &get_dfull()   const { return dfull; }
+    const list<remotebit>                  &get_dremote() const { return dremote; }
+    const list<nullbit>                    &get_dnull()   const { return dnull; }
+
+    void add_dnull(nullbit const &n)                   { dnull.push_back(n); };
+    void add_dfull(ceph::shared_ptr<fullbit> const &p) { dfull.push_back(p); };
+    void add_dremote(remotebit const &r)               { dremote.push_back(r); };
 
     void print(dirfrag_t dirfrag, ostream& out) {
       out << "dirlump " << dirfrag << " v " << fnode.version
@@ -295,7 +268,7 @@ public:
       ::encode(dremote, dnbl);
       ::encode(dnull, dnbl);
     }
-    void _decode_bits() { 
+    void _decode_bits() const { 
       if (dn_decoded) return;
       bufferlist::iterator p = dnbl.begin();
       ::decode(dfull, p);
@@ -311,12 +284,11 @@ public:
   };
   WRITE_CLASS_ENCODER(dirlump)
 
-private:
   // my lumps.  preserve the order we added them in a list.
   list<dirfrag_t>         lump_order;
   map<dirfrag_t, dirlump> lump_map;
   list<ceph::shared_ptr<fullbit> > roots;
-
+public:
   list<pair<__u8,version_t> > table_tids;  // tableclient transactions
 
   inodeno_t opened_ino;
@@ -334,9 +306,11 @@ private:
 
   // inodes i've truncated
   list<inodeno_t> truncate_start;        // start truncate 
-  map<inodeno_t,uint64_t> truncate_finish;  // finished truncate (started in segment blah)
+  map<inodeno_t, log_segment_seq_t> truncate_finish;  // finished truncate (started in segment blah)
 
+public:
   vector<inodeno_t> destroyed_inodes;
+private:
 
   // idempotent op(s)
   list<pair<metareqid_t,uint64_t> > client_reqs;
@@ -344,11 +318,16 @@ private:
  public:
   void encode(bufferlist& bl) const;
   void decode(bufferlist::iterator& bl);
+  void get_inodes(std::set<inodeno_t> &inodes) const;
+  void get_paths(std::vector<std::string> &paths) const;
+  void get_dentries(std::map<dirfrag_t, std::set<std::string> > &dentries) const;
+  entity_name_t get_client_name() const {return client_name;}
+
   void dump(Formatter *f) const;
   static void generate_test_instances(list<EMetaBlob*>& ls);
   // soft stateadd
   uint64_t last_subtree_map;
-  uint64_t my_offset;
+  uint64_t event_seq;
 
   // for replay, in certain cases
   //LogSegment *_segment;
@@ -396,6 +375,8 @@ private:
   void add_truncate_finish(inodeno_t ino, uint64_t segoff) {
     truncate_finish[ino] = segoff;
   }
+  
+  bool rewrite_truncate_finish(MDS const *mds, std::map<uint64_t, uint64_t> const &old_to_new);
 
   void add_destroyed_inode(inodeno_t ino) {
     destroyed_inodes.push_back(ino);
@@ -407,10 +388,10 @@ private:
   void add_null_dentry(dirlump& lump, CDentry *dn, bool dirty) {
     // add the dir
     lump.nnull++;
-    lump.get_dnull().push_back(nullbit(dn->get_name(), 
-				       dn->first, dn->last,
-				       dn->get_projected_version(), 
-				       dirty));
+    lump.add_dnull(nullbit(dn->get_name(), 
+			   dn->first, dn->last,
+			   dn->get_projected_version(), 
+			   dirty));
   }
 
   void add_remote_dentry(CDentry *dn, bool dirty) {
@@ -426,11 +407,11 @@ private:
       rdt = dn->get_projected_linkage()->get_remote_d_type();
     }
     lump.nremote++;
-    lump.get_dremote().push_back(remotebit(dn->get_name(), 
-					   dn->first, dn->last,
-					   dn->get_projected_version(), 
-					   rino, rdt,
-					   dirty));
+    lump.add_dremote(remotebit(dn->get_name(), 
+			       dn->first, dn->last,
+                               dn->get_projected_version(), 
+                               rino, rdt,
+                               dirty));
   }
 
   // return remote pointer to to-be-journaled inode
@@ -447,27 +428,27 @@ private:
       in = dn->get_projected_linkage()->get_inode();
 
     // make note of where this inode was last journaled
-    in->last_journaled = my_offset;
+    in->last_journaled = event_seq;
     //cout << "journaling " << in->inode.ino << " at " << my_offset << std::endl;
 
-    inode_t *pi = in->get_projected_inode();
+    const inode_t *pi = in->get_projected_inode();
     if ((state & fullbit::STATE_DIRTY) && pi->is_backtrace_updated())
       state |= fullbit::STATE_DIRTYPARENT;
 
     bufferlist snapbl;
-    sr_t *sr = in->get_projected_srnode();
+    const sr_t *sr = in->get_projected_srnode();
     if (sr)
       sr->encode(snapbl);
 
     lump.nfull++;
-    lump.get_dfull().push_back(ceph::shared_ptr<fullbit>(new fullbit(dn->get_name(), 
-									 dn->first, dn->last,
-									 dn->get_projected_version(), 
-									 *pi, in->dirfragtree,
-									 *in->get_projected_xattrs(),
-									 in->symlink, snapbl,
-									 state,
-									 &in->old_inodes)));
+    lump.add_dfull(ceph::shared_ptr<fullbit>(new fullbit(dn->get_name(),
+							 dn->first, dn->last,
+							 dn->get_projected_version(),
+							 *pi, in->dirfragtree,
+							 *in->get_projected_xattrs(),
+							 in->symlink,
+							 in->oldest_snap, snapbl,
+							 state, &in->old_inodes)));
   }
 
   // convenience: primary or remote?  figure it out.
@@ -498,9 +479,9 @@ private:
     add_primary_dentry(dn, 0, dirty, dirty_parent, dirty_pool);
   }
 
-  void add_root(bool dirty, CInode *in, inode_t *pi=0, fragtree_t *pdft=0, bufferlist *psnapbl=0,
+  void add_root(bool dirty, CInode *in, const inode_t *pi=0, fragtree_t *pdft=0, bufferlist *psnapbl=0,
 		    map<string,bufferptr> *px=0) {
-    in->last_journaled = my_offset;
+    in->last_journaled = event_seq;
     //cout << "journaling " << in->inode.ino << " at " << my_offset << std::endl;
 
     if (!pi) pi = in->get_projected_inode();
@@ -522,9 +503,10 @@ private:
 
     string empty;
     roots.push_back(ceph::shared_ptr<fullbit>(new fullbit(empty, in->first, in->last, 0, *pi,
-							      *pdft, *px, in->symlink, snapbl,
-							      dirty ? fullbit::STATE_DIRTY : 0,
-							      &in->old_inodes)));
+							  *pdft, *px, in->symlink,
+							  in->oldest_snap, snapbl,
+							  dirty ? fullbit::STATE_DIRTY : 0,
+							  &in->old_inodes)));
   }
   
   dirlump& add_dir(CDir *dir, bool dirty, bool complete=false) {
@@ -544,7 +526,7 @@ private:
     return add_dir(dir->dirfrag(), dir->get_projected_fnode(), dir->get_projected_version(),
 		   dirty, false, false, false, dirtydft);
   }
-  dirlump& add_dir(dirfrag_t df, fnode_t *pf, version_t pv, bool dirty,
+  dirlump& add_dir(dirfrag_t df, const fnode_t *pf, version_t pv, bool dirty,
 		   bool complete=false, bool isnew=false,
 		   bool importing=false, bool dirty_dft=false) {
     if (lump_map.count(df) == 0)
@@ -565,6 +547,13 @@ private:
   static const int TO_ROOT = 1;
   
   void add_dir_context(CDir *dir, int mode = TO_AUTH_SUBTREE_ROOT);
+
+  bool empty() {
+    return roots.empty() && lump_order.empty() && table_tids.empty() &&
+	   truncate_start.empty() && truncate_finish.empty() &&
+	   destroyed_inodes.empty() && client_reqs.empty() &&
+	   opened_ino == 0 && inotablev == 0 && sessionmapv == 0;
+  }
 
   void print(ostream& out) const {
     out << "[metablob";

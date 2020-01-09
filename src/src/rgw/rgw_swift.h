@@ -1,3 +1,6 @@
+// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
+// vim: ts=8 sw=2 smarttab
+
 
 #ifndef CEPH_RGW_SWIFT_H
 #define CEPH_RGW_SWIFT_H
@@ -53,6 +56,7 @@ class RGWSwift {
   bool supports_keystone() {
     return !cct->_conf->rgw_keystone_url.empty();
   }
+  bool do_verify_swift_token(RGWRados *store, req_state *s);
 protected:
   int check_revoked();
 public:

@@ -11,6 +11,7 @@
 #include "include/utime.h"
 #include "include/rbd/librbd.hpp"
 
+#include "librbd/AsyncOperation.h"
 #include "librbd/ImageCtx.h"
 #include "librbd/internal.h"
 
@@ -49,7 +50,7 @@ namespace librbd {
     void *complete_arg;
     rbd_completion_t rbd_comp;
     int pending_count;   ///< number of requests
-    bool building;       ///< true if we are still building this completion
+    uint32_t blockers;
     int ref;
     bool released;
     ImageCtx *ictx;
@@ -61,10 +62,12 @@ namespace librbd {
     char *read_buf;
     size_t read_buf_len;
 
-    AioCompletion() : lock("AioCompletion::lock", true),
+    AsyncOperation async_op;
+
+    AioCompletion() : lock("AioCompletion::lock", true, false),
 		      done(false), rval(0), complete_cb(NULL),
 		      complete_arg(NULL), rbd_comp(NULL),
-		      pending_count(0), building(true),
+		      pending_count(0), blockers(1),
 		      ref(1), released(false), ictx(NULL),
 		      aio_type(AIO_TYPE_NONE),
 		      read_bl(NULL), read_buf(NULL), read_buf_len(0) {
@@ -72,13 +75,7 @@ namespace librbd {
     ~AioCompletion() {
     }
 
-    int wait_for_complete() {
-      lock.Lock();
-      while (!done)
-	cond.Wait(lock);
-      lock.Unlock();
-      return 0;
-    }
+    int wait_for_complete();
 
     void add_request() {
       lock.Lock();
@@ -92,34 +89,18 @@ namespace librbd {
     void finish_adding_requests(CephContext *cct);
 
     void init_time(ImageCtx *i, aio_type_t t) {
-      ictx = i;
-      aio_type = t;
-      start_time = ceph_clock_now(ictx->cct);
+      if (ictx == NULL) {
+        ictx = i;
+        aio_type = t;
+        start_time = ceph_clock_now(ictx->cct);
+
+	async_op.start_op(*ictx);
+      }
     }
 
-    void complete() {
-      utime_t elapsed;
-      assert(lock.is_locked());
-      elapsed = ceph_clock_now(ictx->cct) - start_time;
-      switch (aio_type) {
-      case AIO_TYPE_READ:
-	ictx->perfcounter->tinc(l_librbd_aio_rd_latency, elapsed); break;
-      case AIO_TYPE_WRITE:
-	ictx->perfcounter->tinc(l_librbd_aio_wr_latency, elapsed); break;
-      case AIO_TYPE_DISCARD:
-	ictx->perfcounter->tinc(l_librbd_aio_discard_latency, elapsed); break;
-      case AIO_TYPE_FLUSH:
-	ictx->perfcounter->tinc(l_librbd_aio_flush_latency, elapsed); break;
-      default:
-	lderr(ictx->cct) << "completed invalid aio_type: " << aio_type << dendl;
-	break;
-      }
-      if (complete_cb) {
-	complete_cb(rbd_comp, complete_arg);
-      }
-      done = true;
-      cond.Signal();
-    }
+    void fail(CephContext *cct, int r);
+
+    void complete(CephContext *cct);
 
     void set_complete_cb(void *cb_arg, callback_t cb) {
       complete_cb = cb;
@@ -128,17 +109,9 @@ namespace librbd {
 
     void complete_request(CephContext *cct, ssize_t r);
 
-    bool is_complete() {
-      Mutex::Locker l(lock);
-      return done;
-    }
+    bool is_complete();
 
-    ssize_t get_return_value() {
-      lock.Lock();
-      ssize_t r = rval;
-      lock.Unlock();
-      return r;
-    }
+    ssize_t get_return_value();
 
     void get() {
       lock.Lock();
@@ -162,6 +135,20 @@ namespace librbd {
       lock.Unlock();
       if (!n)
 	delete this;
+    }
+
+    void block() {
+      Mutex::Locker l(lock);
+      ++blockers;
+    }
+    void unblock(CephContext *cct) {
+      Mutex::Locker l(lock);
+      assert(blockers > 0);
+      --blockers;
+      if (pending_count == 0 && blockers == 0) {
+        finalize(cct, rval);
+        complete(cct);
+      }
     }
   };
 
@@ -196,11 +183,15 @@ namespace librbd {
 
   class C_CacheRead : public Context {
   public:
-    explicit C_CacheRead(AioRead *req) : m_req(req) {}
-    virtual ~C_CacheRead() {}
+    explicit C_CacheRead(ImageCtx *ictx, AioRead *req)
+      : m_image_ctx(*ictx), m_req(req), m_enqueued(false) {}
+    virtual void complete(int r);
+  protected:
     virtual void finish(int r);
   private:
+    ImageCtx &m_image_ctx;
     AioRead *m_req;
+    bool m_enqueued;
   };
 }
 

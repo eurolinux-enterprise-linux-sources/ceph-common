@@ -12,22 +12,21 @@
  *
  */
 
-#include "include/types.h"
-#include "include/atomic.h"
-
-#include "common/obj_bencher.h"
-#include "common/config.h"
-#include "common/debug.h"
-#include "common/ceph_argparse.h"
-#include "common/WorkQueue.h"
-#include "msg/Message.h"
-#include "global/global_init.h"
+#include <deque>
+#include <errno.h>
 
 #include "libs3.h"
 
-#include <deque>
+#include "common/ceph_argparse.h"
+#include "common/debug.h"
+#include "common/obj_bencher.h"
+#include "common/WorkQueue.h"
 
-#include <errno.h>
+#include "include/types.h"
+#include "include/atomic.h"
+
+#include "global/global_init.h"
+#include "msg/Message.h"
 
 #define DEFAULT_USER_AGENT "rest-bench"
 #define DEFAULT_BUCKET "rest-bench-bucket"
@@ -282,6 +281,11 @@ public:
     list_bucket_handler.listBucketCallback = list_bucket_callback;
 
   }
+  ~RESTDispatcher()
+  {
+    req_wq.drain();
+    m_tp.stop();
+  } 
   void process_context(req_context *ctx);
   void get_obj(req_context *ctx);
   void put_obj(req_context *ctx);
@@ -739,10 +743,6 @@ int main(int argc, const char **argv)
     }
   }
 
-  if (bucket.empty()) {
-    cerr << "rest-bench: bucket not specified" << std::endl;
-    usage_exit();
-  }
   if (args.empty())
     usage_exit();
   int operation = 0;
