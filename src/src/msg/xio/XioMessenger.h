@@ -28,7 +28,17 @@ extern "C" {
 #include "common/Mutex.h"
 #include "include/Spinlock.h"
 
-class XioMessenger : public SimplePolicyMessenger
+class XioInit {
+  /* safe to be called multiple times */
+  void package_init(CephContext *cct);
+
+protected:
+  XioInit(CephContext *cct) {
+    this->package_init(cct);
+  }
+};
+
+class XioMessenger : public SimplePolicyMessenger, XioInit
 {
 private:
   static atomic_t nInstances;
@@ -43,12 +53,17 @@ private:
   uint32_t special_handling;
   Mutex sh_mtx;
   Cond sh_cond;
+  bool need_addr;
+  bool did_bind;
+
+  /// approximately unique ID set by the Constructor for use in entity_addr_t
+  uint64_t nonce;
 
   friend class XioConnection;
 
 public:
   XioMessenger(CephContext *cct, entity_name_t name,
-	       string mname, uint64_t nonce,
+	       string mname, uint64_t nonce, uint64_t features,
 	       DispatchStrategy* ds = new QueueStrategy(1));
 
   virtual ~XioMessenger();
@@ -64,8 +79,6 @@ public:
   int _send_message(Message *m, Connection *con);
   int _send_message_impl(Message *m, XioConnection *xcon);
 
-  uint32_t get_magic() { return magic; }
-  void set_magic(int _magic) { magic = _magic; }
   uint32_t get_special_handling() { return special_handling; }
   void set_special_handling(int n) { special_handling = n; }
   int pool_hint(uint32_t size);
@@ -132,11 +145,21 @@ public:
   void ds_dispatch(Message *m)
     { dispatch_strategy->ds_dispatch(m); }
 
+  /**
+   * Tell the XioMessenger its full IP address.
+   *
+   * This is used by clients when connecting to other endpoints, and
+   * probably shouldn't be called by anybody else.
+   */
+  void learned_addr(const entity_addr_t& peer_addr_for_me);
+
+
 protected:
   virtual void ready()
     { }
 
 public:
+  uint64_t local_features;
 };
 
 #endif /* XIO_MESSENGER_H */

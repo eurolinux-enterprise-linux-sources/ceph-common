@@ -18,6 +18,7 @@
 #include "common/dout.h"
 #include "common/errno.h"
 #include "common/Formatter.h"
+#include "common/valgrind.h"
 
 #include <errno.h>
 #include <map>
@@ -180,6 +181,9 @@ void PerfCounters::set(int idx, uint64_t amt)
   perf_counter_data_any_d& data(m_data[idx - m_lower_bound - 1]);
   if (!(data.type & PERFCOUNTER_U64))
     return;
+
+  ANNOTATE_BENIGN_RACE_SIZED(&data.u64, sizeof(data.u64),
+                             "perf counter atomic");
   if (data.type & PERFCOUNTER_LONGRUNAVG) {
     data.avgcount.inc();
     data.u64.set(amt);
@@ -218,6 +222,25 @@ void PerfCounters::tinc(int idx, utime_t amt)
     data.avgcount2.inc();
   } else {
     data.u64.add(amt.to_nsec());
+  }
+}
+
+void PerfCounters::tinc(int idx, ceph::timespan amt)
+{
+  if (!m_cct->_conf->perf)
+    return;
+
+  assert(idx > m_lower_bound);
+  assert(idx < m_upper_bound);
+  perf_counter_data_any_d& data(m_data[idx - m_lower_bound - 1]);
+  if (!(data.type & PERFCOUNTER_TIME))
+    return;
+  if (data.type & PERFCOUNTER_LONGRUNAVG) {
+    data.avgcount.inc();
+    data.u64.add(amt.count());
+    data.avgcount2.inc();
+  } else {
+    data.u64.add(amt.count());
   }
 }
 
@@ -292,6 +315,18 @@ void PerfCounters::dump_formatted(Formatter *f, bool schema,
     if (schema) {
       f->open_object_section(d->name);
       f->dump_int("type", d->type);
+
+      if (d->description) {
+        f->dump_string("description", d->description);
+      } else {
+        f->dump_string("description", "");
+      }
+
+      if (d->nick != NULL) {
+        f->dump_string("nick", d->nick);
+      } else {
+        f->dump_string("nick", "");
+      }
       f->close_section();
     } else {
       if (d->type & PERFCOUNTER_LONGRUNAVG) {
@@ -356,32 +391,38 @@ PerfCountersBuilder::~PerfCountersBuilder()
   m_perf_counters = NULL;
 }
 
-void PerfCountersBuilder::add_u64_counter(int idx, const char *name)
+void PerfCountersBuilder::add_u64_counter(int idx, const char *name,
+    const char *description, const char *nick)
 {
-  add_impl(idx, name, PERFCOUNTER_U64 | PERFCOUNTER_COUNTER);
+  add_impl(idx, name, description, nick, PERFCOUNTER_U64 | PERFCOUNTER_COUNTER);
 }
 
-void PerfCountersBuilder::add_u64(int idx, const char *name)
+void PerfCountersBuilder::add_u64(int idx, const char *name,
+    const char *description, const char *nick)
 {
-  add_impl(idx, name, PERFCOUNTER_U64);
+  add_impl(idx, name, description, nick, PERFCOUNTER_U64);
 }
 
-void PerfCountersBuilder::add_u64_avg(int idx, const char *name)
+void PerfCountersBuilder::add_u64_avg(int idx, const char *name,
+    const char *description, const char *nick)
 {
-  add_impl(idx, name, PERFCOUNTER_U64 | PERFCOUNTER_LONGRUNAVG);
+  add_impl(idx, name, description, nick, PERFCOUNTER_U64 | PERFCOUNTER_LONGRUNAVG);
 }
 
-void PerfCountersBuilder::add_time(int idx, const char *name)
+void PerfCountersBuilder::add_time(int idx, const char *name,
+    const char *description, const char *nick)
 {
-  add_impl(idx, name, PERFCOUNTER_TIME);
+  add_impl(idx, name, description, nick, PERFCOUNTER_TIME);
 }
 
-void PerfCountersBuilder::add_time_avg(int idx, const char *name)
+void PerfCountersBuilder::add_time_avg(int idx, const char *name,
+    const char *description, const char *nick)
 {
-  add_impl(idx, name, PERFCOUNTER_TIME | PERFCOUNTER_LONGRUNAVG);
+  add_impl(idx, name, description, nick, PERFCOUNTER_TIME | PERFCOUNTER_LONGRUNAVG);
 }
 
-void PerfCountersBuilder::add_impl(int idx, const char *name, int ty)
+void PerfCountersBuilder::add_impl(int idx, const char *name,
+    const char *description, const char *nick, int ty)
 {
   assert(idx > m_perf_counters->m_lower_bound);
   assert(idx < m_perf_counters->m_upper_bound);
@@ -390,6 +431,8 @@ void PerfCountersBuilder::add_impl(int idx, const char *name, int ty)
     &data(vec[idx - m_perf_counters->m_lower_bound - 1]);
   assert(data.type == PERFCOUNTER_NONE);
   data.name = name;
+  data.description = description;
+  data.nick = nick;
   data.type = (enum perfcounter_type_d)ty;
 }
 

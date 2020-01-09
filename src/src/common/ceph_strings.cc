@@ -64,6 +64,7 @@ const char *ceph_mds_state_name(int s)
 		/* down and out */
 	case CEPH_MDS_STATE_DNE:        return "down:dne";
 	case CEPH_MDS_STATE_STOPPED:    return "down:stopped";
+	case CEPH_MDS_STATE_DAMAGED:   return "down:damaged";
 		/* up and out */
 	case CEPH_MDS_STATE_BOOT:       return "up:boot";
 	case CEPH_MDS_STATE_STANDBY:    return "up:standby";
@@ -96,6 +97,7 @@ const char *ceph_session_op_name(int op)
 	case CEPH_SESSION_RECALL_STATE: return "recall_state";
 	case CEPH_SESSION_FLUSHMSG: return "flushmsg";
 	case CEPH_SESSION_FLUSHMSG_ACK: return "flushmsg_ack";
+	case CEPH_SESSION_REJECT: return "reject";
 	}
 	return "???";
 }
@@ -128,12 +130,15 @@ const char *ceph_mds_op_name(int op)
 	case CEPH_MDS_OP_LSSNAP: return "lssnap";
 	case CEPH_MDS_OP_MKSNAP: return "mksnap";
 	case CEPH_MDS_OP_RMSNAP: return "rmsnap";
+	case CEPH_MDS_OP_RENAMESNAP: return "renamesnap";
 	case CEPH_MDS_OP_SETFILELOCK: return "setfilelock";
 	case CEPH_MDS_OP_GETFILELOCK: return "getfilelock";
 	case CEPH_MDS_OP_FRAGMENTDIR: return "fragmentdir";
 	case CEPH_MDS_OP_EXPORTDIR: return "exportdir";
-	case CEPH_MDS_OP_VALIDATE: return "validate_path";
 	case CEPH_MDS_OP_FLUSH: return "flush_path";
+	case CEPH_MDS_OP_ENQUEUE_SCRUB: return "enqueue_scrub";
+	case CEPH_MDS_OP_REPAIR_FRAGSTATS: return "repair_fragstats";
+	case CEPH_MDS_OP_REPAIR_INODESTATS: return "repair_inodestats";
 	}
 	return "???";
 }

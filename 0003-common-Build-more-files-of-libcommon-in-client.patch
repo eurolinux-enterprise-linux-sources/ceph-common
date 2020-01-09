@@ -1,0 +1,39 @@
+From 19d71786dfc63b4dcde744d4a0b3bfcc69617ebb Mon Sep 17 00:00:00 2001
+From: Boris Ranto <branto@redhat.com>
+Date: Tue, 21 Feb 2017 15:10:34 +0100
+Subject: [PATCH] common: Build more files of libcommon in client
+
+Signed-off-by: Boris Ranto <branto@redhat.com>
+---
+ src/common/Makefile.am | 10 +++-------
+ 1 file changed, 3 insertions(+), 7 deletions(-)
+
+diff --git a/src/common/Makefile.am b/src/common/Makefile.am
+index 86df75d..79c5df7 100644
+--- a/src/common/Makefile.am
++++ b/src/common/Makefile.am
+@@ -78,18 +78,14 @@ libcommon_internal_la_SOURCES = \
+ 	common/TracepointProvider.cc \
+ 	common/PluginRegistry.cc \
+ 	common/scrub_types.cc \
+-	common/blkdev.cc
+-
+-common/PluginRegistry.cc: ./ceph_ver.h
+-
+-if ENABLE_SERVER
+-libcommon_internal_la_SOURCES += \
++	common/blkdev.cc \
+ 	common/xattr.c \
+ 	common/ipaddr.cc \
+ 	common/ceph_json.cc \
+ 	common/util.cc \
+ 	common/pick_address.cc
+-endif
++
++common/PluginRegistry.cc: ./ceph_ver.h
+ 
+ if LINUX
+ libcommon_internal_la_SOURCES += \
+-- 
+2.9.3
+

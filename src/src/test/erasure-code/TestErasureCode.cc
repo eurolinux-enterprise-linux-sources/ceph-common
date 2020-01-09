@@ -15,11 +15,13 @@
  */
 
 #include <errno.h>
+#include <stdlib.h>
 
 #include "global/global_init.h"
 #include "erasure-code/ErasureCode.h"
 #include "common/ceph_argparse.h"
 #include "global/global_context.h"
+#include "common/config.h"
 #include "gtest/gtest.h"
 
 class ErasureCodeTest : public ErasureCode {
@@ -32,6 +34,10 @@ public:
   ErasureCodeTest(unsigned int _k, unsigned int _m, unsigned int _chunk_size) :
     k(_k), m(_m), chunk_size(_chunk_size) {}
   virtual ~ErasureCodeTest() {}
+
+  virtual int init(ErasureCodeProfile &profile, ostream *ss) {
+    return 0;
+  }
 
   virtual unsigned int get_chunk_count() const { return k + m; }
   virtual unsigned int get_data_chunk_count() const { return k; }
@@ -136,10 +142,10 @@ TEST(ErasureCodeTest, encode_misaligned_non_contiguous)
   map<int, bufferlist> encoded;
 
   ASSERT_FALSE(in.is_contiguous());
-  ASSERT_TRUE(in.buffers().front().is_aligned(ErasureCode::SIMD_ALIGN));
-  ASSERT_FALSE(in.buffers().front().is_n_align_sized(chunk_size));
-  ASSERT_TRUE(in.buffers().back().is_aligned(ErasureCode::SIMD_ALIGN));
-  ASSERT_FALSE(in.buffers().back().is_n_align_sized(chunk_size));
+  ASSERT_TRUE(in.front().is_aligned(ErasureCode::SIMD_ALIGN));
+  ASSERT_FALSE(in.front().is_n_align_sized(chunk_size));
+  ASSERT_TRUE(in.back().is_aligned(ErasureCode::SIMD_ALIGN));
+  ASSERT_FALSE(in.back().is_n_align_sized(chunk_size));
   ASSERT_EQ(0, erasure_code.encode(want_to_encode, in, &encoded));
   for (unsigned int i = 0; i < erasure_code.get_chunk_count(); i++) {
     ASSERT_TRUE(encoded[i].is_aligned(ErasureCode::SIMD_ALIGN));
@@ -154,6 +160,10 @@ int main(int argc, char **argv)
 
   global_init(NULL, args, CEPH_ENTITY_TYPE_CLIENT, CODE_ENVIRONMENT_UTILITY, 0);
   common_init_finish(g_ceph_context);
+
+  const char* env = getenv("CEPH_LIB");
+  string directory(env ? env : "lib");
+  g_conf->set_val("erasure_code_dir", directory, false, false);
 
   ::testing::InitGoogleTest(&argc, argv);
   return RUN_ALL_TESTS();

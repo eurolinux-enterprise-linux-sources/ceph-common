@@ -41,7 +41,12 @@
 void JournalTool::usage()
 {
   std::cout << "Usage: \n"
-    << "  cephfs-journal-tool [options] journal [inspect|import|export|reset]\n"
+    << "  cephfs-journal-tool [options] journal <command>\n"
+    << "    <command>:\n"
+    << "      inspect\n"
+    << "      import <path>\n"
+    << "      export <path>\n"
+    << "      reset [--force]\n"
     << "  cephfs-journal-tool [options] header <get|set <field> <value>\n"
     << "  cephfs-journal-tool [options] event <effect> <selector> <output>\n"
     << "    <selector>:\n"
@@ -55,7 +60,7 @@ void JournalTool::usage()
     << "    <output>: [summary|binary|json] [--path <path>]\n"
     << "\n"
     << "Options:\n"
-    << "  --rank=<int>  Journal rank (default 0)\n";
+    << "  --rank=<str>  Journal rank (default 0)\n";
 
   generic_client_usage();
 }
@@ -77,14 +82,17 @@ int JournalTool::main(std::vector<const char*> &argv)
   }
 
   std::vector<const char*>::iterator arg = argv.begin();
+
   std::string rank_str;
-  if(ceph_argparse_witharg(argv, arg, &rank_str, "--rank", (char*)NULL)) {
-    std::string rank_err;
-    rank = strict_strtol(rank_str.c_str(), 10, &rank_err);
-    if (!rank_err.empty()) {
-        derr << "Bad rank '" << rank_str << "'" << dendl;
-        usage();
-    }
+  if(!ceph_argparse_witharg(argv, arg, &rank_str, "--rank", (char*)NULL)) {
+    // Default: act on rank 0.  Will give the user an error if they
+    // try invoking this way when they have more than one filesystem.
+    rank_str = "0";
+  }
+
+  r = role_selector.parse(*fsmap, rank_str);
+  if (r != 0) {
+    return r;
   }
 
   std::string mode;
@@ -106,7 +114,9 @@ int JournalTool::main(std::vector<const char*> &argv)
   dout(4) << "JournalTool: connecting to RADOS..." << dendl;
   rados.connect();
  
-  int const pool_id = mdsmap->get_metadata_pool();
+  auto fs = fsmap->get_filesystem(role_selector.get_ns());
+  assert(fs != nullptr);
+  int const pool_id = fs->mds_map.get_metadata_pool();
   dout(4) << "JournalTool: resolving pool " << pool_id << dendl;
   std::string pool_name;
   r = rados.pool_reverse_lookup(pool_id, &pool_name);
@@ -121,18 +131,27 @@ int JournalTool::main(std::vector<const char*> &argv)
 
   // Execution
   // =========
-  dout(4) << "Executing for rank " << rank << dendl;
-  if (mode == std::string("journal")) {
-    return main_journal(argv);
-  } else if (mode == std::string("header")) {
-    return main_header(argv);
-  } else if (mode == std::string("event")) {
-    return main_event(argv);
-  } else {
-    derr << "Bad command '" << mode << "'" << dendl;
-    usage();
-    return -EINVAL;
+  for (auto role : role_selector.get_roles()) {
+    rank = role.rank;
+    dout(4) << "Executing for rank " << rank << dendl;
+    if (mode == std::string("journal")) {
+      r = main_journal(argv);
+    } else if (mode == std::string("header")) {
+      r = main_header(argv);
+    } else if (mode == std::string("event")) {
+      r = main_event(argv);
+    } else {
+      derr << "Bad command '" << mode << "'" << dendl;
+      usage();
+      return -EINVAL;
+    }
+
+    if (r != 0) {
+      return r;
+    }
   }
+
+  return r;
 }
 
 
@@ -155,7 +174,21 @@ int JournalTool::main_journal(std::vector<const char*> &argv)
       return -EINVAL;
     }
   } else if (command == "reset") {
-      return journal_reset();
+    bool force = false;
+    if (argv.size() == 2) {
+      if (std::string(argv[1]) == "--force") {
+        force = true;
+      } else {
+        std::cerr << "Unknown argument " << argv[1] << std::endl;
+        usage();
+        return -EINVAL;
+      }
+    } else if (argv.size() > 2) {
+      std::cerr << "Too many arguments!" << std::endl;
+      usage();
+      return -EINVAL;
+    }
+    return journal_reset(force);
   } else {
     derr << "Bad journal command '" << command << "'" << dendl;
     return -EINVAL;
@@ -509,7 +542,7 @@ int JournalTool::journal_export(std::string const &path, bool import)
    */
   {
     Dumper dumper;
-    r = dumper.init(rank);
+    r = dumper.init(mds_role_t(role_selector.get_ns(), rank));
     if (r < 0) {
       derr << "dumper::init failed: " << cpp_strerror(r) << dendl;
       return r;
@@ -529,7 +562,7 @@ int JournalTool::journal_export(std::string const &path, bool import)
 /**
  * Truncate journal and insert EResetJournal
  */
-int JournalTool::journal_reset()
+int JournalTool::journal_reset(bool hard)
 {
   int r = 0;
   Resetter resetter;
@@ -538,7 +571,12 @@ int JournalTool::journal_reset()
     derr << "resetter::init failed: " << cpp_strerror(r) << dendl;
     return r;
   }
-  resetter.reset(rank);
+
+  if (hard) {
+    r = resetter.reset_hard(mds_role_t(role_selector.get_ns(), rank));
+  } else {
+    r = resetter.reset(mds_role_t(role_selector.get_ns(), rank));
+  }
   resetter.shutdown();
 
   return r;
@@ -931,7 +969,7 @@ int JournalTool::replay_offline(EMetaBlob const &metablob, bool const dry_run)
     inode_bl.clear();
     std::string magic = CEPH_FS_ONDISK_MAGIC;
     ::encode(magic, inode_bl);
-    inode.encode(inode_bl);
+    inode.encode(inode_bl, CEPH_FEATURES_SUPPORTED_DEFAULT);
 
     if (!dry_run) {
       r = io.write_full(root_oid.name, inode_bl);
@@ -1014,7 +1052,7 @@ int JournalTool::replay_offline(EMetaBlob const &metablob, bool const dry_run)
       inode.snap_blob = fb.snapbl;
       inode.symlink = fb.symlink;
       inode.old_inodes = fb.old_inodes;
-      inode.encode_bare(dentry_bl);
+      inode.encode_bare(dentry_bl, CEPH_FEATURES_SUPPORTED_DEFAULT);
       
       vals[key] = dentry_bl;
       if (!dry_run) {
@@ -1066,7 +1104,7 @@ int JournalTool::erase_region(JournalScanner const &js, uint64_t const pos, uint
   // is needed inside the ENoOp to make up the difference.
   bufferlist tmp;
   ENoOp enoop(0);
-  enoop.encode_with_header(tmp);
+  enoop.encode_with_header(tmp, CEPH_FEATURES_SUPPORTED_DEFAULT);
 
   dout(4) << "erase_region " << pos << " len=" << length << dendl;
 
@@ -1082,7 +1120,7 @@ int JournalTool::erase_region(JournalScanner const &js, uint64_t const pos, uint
   // Serialize an ENoOp with the correct amount of padding
   enoop = ENoOp(padding);
   bufferlist entry;
-  enoop.encode_with_header(entry);
+  enoop.encode_with_header(entry, CEPH_FEATURES_SUPPORTED_DEFAULT);
   JournalStream stream(JOURNAL_FORMAT_RESILIENT);
 
   // Serialize region of log stream
@@ -1097,7 +1135,7 @@ int JournalTool::erase_region(JournalScanner const &js, uint64_t const pos, uint
   uint32_t object_size = g_conf->mds_log_segment_size;
   if (object_size == 0) {
     // Default layout object size
-    object_size = g_default_file_layout.fl_object_size;
+    object_size = file_layout_t::get_default().object_size;
   }
 
   uint64_t write_offset = pos;
@@ -1155,9 +1193,9 @@ void JournalTool::encode_fullbit_as_inode(
 
   // Serialize InodeStore
   if (bare) {
-    new_inode.encode_bare(*out_bl);
+    new_inode.encode_bare(*out_bl, CEPH_FEATURES_SUPPORTED_DEFAULT);
   } else {
-    new_inode.encode(*out_bl);
+    new_inode.encode(*out_bl, CEPH_FEATURES_SUPPORTED_DEFAULT);
   }
 }
 
@@ -1180,8 +1218,9 @@ int JournalTool::consume_inos(const std::set<inodeno_t> &inos)
   int r = 0;
 
   // InoTable is a per-MDS structure, so iterate over assigned ranks
+  auto fs = fsmap->get_filesystem(role_selector.get_ns());
   std::set<mds_rank_t> in_ranks;
-  mdsmap->get_mds_set(in_ranks);
+  fs->mds_map.get_mds_set(in_ranks);
 
   for (std::set<mds_rank_t>::iterator rank_i = in_ranks.begin();
       rank_i != in_ranks.end(); ++rank_i)

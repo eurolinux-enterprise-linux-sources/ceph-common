@@ -121,6 +121,7 @@ public:
   osd_stat_t osd_sum;
   mutable epoch_t min_last_epoch_clean;
   ceph::unordered_map<int,int> blocked_by_sum;
+  ceph::unordered_map<int,set<pg_t> > pg_by_osd;
 
   utime_t stamp;
 
@@ -180,8 +181,8 @@ public:
 
  public:
 
-  set<pg_t> creating_pgs;   // lru: front = new additions, back = recently pinged
-  map<int,set<pg_t> > creating_pgs_by_osd;
+  set<pg_t> creating_pgs;
+  map<int,map<epoch_t,set<pg_t> > > creating_pgs_by_osd_epoch;
 
   // Bits that use to be enum StuckPG
   static const int STUCK_INACTIVE = (1<<0);
@@ -232,6 +233,14 @@ public:
     stamp = s;
   }
 
+  size_t get_num_pg_by_osd(int osd) const {
+    ceph::unordered_map<int,set<pg_t> >::const_iterator p = pg_by_osd.find(osd);
+    if (p == pg_by_osd.end())
+      return 0;
+    else
+      return p->second.size();
+  }
+
   pool_stat_t get_pg_pool_sum_stat(int64_t pool) const {
     ceph::unordered_map<int,pool_stat_t>::const_iterator p =
       pg_pool_sum.find(pool);
@@ -249,8 +258,11 @@ public:
   void redo_full_sets();
   void register_nearfull_status(int osd, const osd_stat_t& s);
   void calc_stats();
-  void stat_pg_add(const pg_t &pgid, const pg_stat_t &s, bool sumonly=false);
-  void stat_pg_sub(const pg_t &pgid, const pg_stat_t &s, bool sumonly=false);
+  void stat_pg_add(const pg_t &pgid, const pg_stat_t &s,
+		   bool sameosds=false);
+  void stat_pg_sub(const pg_t &pgid, const pg_stat_t &s,
+		   bool sameosds=false);
+  void stat_pg_update(const pg_t pgid, pg_stat_t &prev, bufferlist::iterator& blp);
   void stat_osd_add(const osd_stat_t &s);
   void stat_osd_sub(const osd_stat_t &s);
   
@@ -270,8 +282,9 @@ public:
   void dump_pg_stats_plain(ostream& ss,
 			   const ceph::unordered_map<pg_t, pg_stat_t>& pg_stats,
 			   bool brief) const;
-  void get_stuck_stats(int types, utime_t cutoff,
+  void get_stuck_stats(int types, const utime_t cutoff,
 		       ceph::unordered_map<pg_t, pg_stat_t>& stuck_pgs) const;
+  bool get_stuck_counts(const utime_t cutoff, map<string, int>& note) const;
   void dump_stuck(Formatter *f, int types, utime_t cutoff) const;
   void dump_stuck_plain(ostream& ss, int types, utime_t cutoff) const;
 
@@ -322,6 +335,25 @@ public:
    */
   void pool_client_io_rate_summary(Formatter *f, ostream *out,
                                    uint64_t poolid) const;
+  /**
+   * Obtain a formatted/plain output for cache tier IO, source from stats for a
+   * given @p delta_sum pool over a given @p delta_stamp period of time.
+   */
+  void cache_io_rate_summary(Formatter *f, ostream *out,
+                             const pool_stat_t& delta_sum,
+                             utime_t delta_stamp) const;
+  /**
+   * Obtain a formatted/plain output for the overall cache tier IO, which is
+   * calculated resorting to @p pg_sum_delta and @p stamp_delta.
+   */
+  void overall_cache_io_rate_summary(Formatter *f, ostream *out) const;
+  /**
+   * Obtain a formatted/plain output for cache tier IO over a given pool
+   * with id @p pool_id.  We will then obtain pool-specific data
+   * from @p per_pool_sum_delta.
+   */
+  void pool_cache_io_rate_summary(Formatter *f, ostream *out,
+                                  uint64_t poolid) const;
 
   void print_summary(Formatter *f, ostream *out) const;
   void print_oneline_summary(Formatter *f, ostream *out) const;

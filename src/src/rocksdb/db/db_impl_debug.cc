@@ -7,33 +7,16 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the LICENSE file. See the AUTHORS file for names of contributors.
 
-#ifndef ROCKSDB_LITE
+#ifndef NDEBUG
 
 #include "db/db_impl.h"
+#include "util/thread_status_updater.h"
 
 namespace rocksdb {
 
-void DBImpl::TEST_PurgeObsoleteteWAL() { PurgeObsoleteWALFiles(); }
-
 uint64_t DBImpl::TEST_GetLevel0TotalSize() {
-  MutexLock l(&mutex_);
-  return default_cf_handle_->cfd()->current()->NumLevelBytes(0);
-}
-
-Iterator* DBImpl::TEST_NewInternalIterator(ColumnFamilyHandle* column_family) {
-  ColumnFamilyData* cfd;
-  if (column_family == nullptr) {
-    cfd = default_cf_handle_->cfd();
-  } else {
-    auto cfh = reinterpret_cast<ColumnFamilyHandleImpl*>(column_family);
-    cfd = cfh->cfd();
-  }
-
-  mutex_.Lock();
-  SuperVersion* super_version = cfd->GetSuperVersion()->Ref();
-  mutex_.Unlock();
-  ReadOptions roptions;
-  return NewInternalIterator(roptions, cfd, super_version);
+  InstrumentedMutexLock l(&mutex_);
+  return default_cf_handle_->cfd()->current()->storage_info()->NumLevelBytes(0);
 }
 
 int64_t DBImpl::TEST_MaxNextLevelOverlappingBytes(
@@ -45,8 +28,8 @@ int64_t DBImpl::TEST_MaxNextLevelOverlappingBytes(
     auto cfh = reinterpret_cast<ColumnFamilyHandleImpl*>(column_family);
     cfd = cfh->cfd();
   }
-  MutexLock l(&mutex_);
-  return cfd->current()->MaxNextLevelOverlappingBytes();
+  InstrumentedMutexLock l(&mutex_);
+  return cfd->current()->storage_info()->MaxNextLevelOverlappingBytes();
 }
 
 void DBImpl::TEST_GetFilesMetaData(
@@ -54,10 +37,11 @@ void DBImpl::TEST_GetFilesMetaData(
     std::vector<std::vector<FileMetaData>>* metadata) {
   auto cfh = reinterpret_cast<ColumnFamilyHandleImpl*>(column_family);
   auto cfd = cfh->cfd();
-  MutexLock l(&mutex_);
+  InstrumentedMutexLock l(&mutex_);
   metadata->resize(NumberLevels());
   for (int level = 0; level < NumberLevels(); level++) {
-    const std::vector<FileMetaData*>& files = cfd->current()->files_[level];
+    const std::vector<FileMetaData*>& files =
+        cfd->current()->storage_info()->LevelFiles(level);
 
     (*metadata)[level].clear();
     for (const auto& f : files) {
@@ -67,12 +51,13 @@ void DBImpl::TEST_GetFilesMetaData(
 }
 
 uint64_t DBImpl::TEST_Current_Manifest_FileNo() {
-  return versions_->ManifestFileNumber();
+  return versions_->manifest_file_number();
 }
 
 Status DBImpl::TEST_CompactRange(int level, const Slice* begin,
                                  const Slice* end,
-                                 ColumnFamilyHandle* column_family) {
+                                 ColumnFamilyHandle* column_family,
+                                 bool disallow_trivial_move) {
   ColumnFamilyData* cfd;
   if (column_family == nullptr) {
     cfd = default_cf_handle_->cfd();
@@ -81,10 +66,12 @@ Status DBImpl::TEST_CompactRange(int level, const Slice* begin,
     cfd = cfh->cfd();
   }
   int output_level =
-      (cfd->options()->compaction_style == kCompactionStyleUniversal)
+      (cfd->ioptions()->compaction_style == kCompactionStyleUniversal ||
+       cfd->ioptions()->compaction_style == kCompactionStyleFIFO)
           ? level
           : level + 1;
-  return RunManualCompaction(cfd, level, output_level, begin, end);
+  return RunManualCompaction(cfd, level, output_level, 0, begin, end,
+                             disallow_trivial_move);
 }
 
 Status DBImpl::TEST_FlushMemTable(bool wait) {
@@ -111,22 +98,61 @@ Status DBImpl::TEST_WaitForCompact() {
   // wait for compact. It actually waits for scheduled compaction
   // OR flush to finish.
 
-  MutexLock l(&mutex_);
+  InstrumentedMutexLock l(&mutex_);
   while ((bg_compaction_scheduled_ || bg_flush_scheduled_) && bg_error_.ok()) {
     bg_cv_.Wait();
   }
   return bg_error_;
 }
 
-Status DBImpl::TEST_ReadFirstRecord(const WalFileType type,
-                                    const uint64_t number,
-                                    SequenceNumber* sequence) {
-  return ReadFirstRecord(type, number, sequence);
+void DBImpl::TEST_LockMutex() {
+  mutex_.Lock();
 }
 
-Status DBImpl::TEST_ReadFirstLine(const std::string& fname,
-                                  SequenceNumber* sequence) {
-  return ReadFirstLine(fname, sequence);
+void DBImpl::TEST_UnlockMutex() {
+  mutex_.Unlock();
 }
+
+void* DBImpl::TEST_BeginWrite() {
+  auto w = new WriteThread::Writer();
+  write_thread_.EnterUnbatched(w, &mutex_);
+  return reinterpret_cast<void*>(w);
+}
+
+void DBImpl::TEST_EndWrite(void* w) {
+  auto writer = reinterpret_cast<WriteThread::Writer*>(w);
+  write_thread_.ExitUnbatched(writer);
+  delete writer;
+}
+
+size_t DBImpl::TEST_LogsToFreeSize() {
+  InstrumentedMutexLock l(&mutex_);
+  return logs_to_free_.size();
+}
+
+uint64_t DBImpl::TEST_LogfileNumber() {
+  InstrumentedMutexLock l(&mutex_);
+  return logfile_number_;
+}
+
+Status DBImpl::TEST_GetAllImmutableCFOptions(
+    std::unordered_map<std::string, const ImmutableCFOptions*>* iopts_map) {
+  std::vector<std::string> cf_names;
+  std::vector<const ImmutableCFOptions*> iopts;
+  {
+    InstrumentedMutexLock l(&mutex_);
+    for (auto cfd : *versions_->GetColumnFamilySet()) {
+      cf_names.push_back(cfd->GetName());
+      iopts.push_back(cfd->ioptions());
+    }
+  }
+  iopts_map->clear();
+  for (size_t i = 0; i < cf_names.size(); ++i) {
+    iopts_map->insert({cf_names[i], iopts[i]});
+  }
+
+  return Status::OK();
+}
+
 }  // namespace rocksdb
-#endif  // ROCKSDB_LITE
+#endif  // NDEBUG

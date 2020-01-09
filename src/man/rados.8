@@ -1,35 +1,8 @@
 .\" Man page generated from reStructuredText.
 .
-.TH "RADOS" "8" "May 29, 2014" "dev" "Ceph"
+.TH "RADOS" "8" "December 09, 2016" "dev" "Ceph"
 .SH NAME
 rados \- rados object storage utility
-.
-.nr rst2man-indent-level 0
-.
-.de1 rstReportMargin
-\\$1 \\n[an-margin]
-level \\n[rst2man-indent-level]
-level margin: \\n[rst2man-indent\\n[rst2man-indent-level]]
--
-\\n[rst2man-indent0]
-\\n[rst2man-indent1]
-\\n[rst2man-indent2]
-..
-.de1 INDENT
-.\" .rstReportMargin pre:
-. RS \\$1
-. nr rst2man-indent\\n[rst2man-indent-level] \\n[an-margin]
-. nr rst2man-indent-level +1
-.\" .rstReportMargin post:
-..
-.de UNINDENT
-. RE
-.\" indent \\n[an-margin]
-.\" old: \\n[rst2man-indent\\n[rst2man-indent-level]]
-.nr rst2man-indent-level -1
-.\" new: \\n[rst2man-indent\\n[rst2man-indent-level]]
-.in \\n[rst2man-indent\\n[rst2man-indent-level]]u
-..
 .
 .nr rst2man-indent-level 0
 .
@@ -104,6 +77,17 @@ Use ceph.conf configuration file instead of the default
 .B \-m monaddress[:port]
 Connect to specified monitor (instead of looking through ceph.conf).
 .UNINDENT
+.INDENT 0.0
+.TP
+.B \-b block_size
+Set the block size for put/get ops and for write benchmarking.
+.UNINDENT
+.INDENT 0.0
+.TP
+.B \-\-striper
+Uses the striping API of rados rather than the default one.
+Available for stat, get, put, truncate, rm, ls and all xattr related operation
+.UNINDENT
 .SH GLOBAL COMMANDS
 .INDENT 0.0
 .TP
@@ -132,6 +116,9 @@ Write object name to the cluster with contents from infile.
 .B \fBrm\fP \fIname\fP
 Remove object name.
 .TP
+.B \fBlistwatchers\fP \fIname\fP
+List the watchers of object name.
+.TP
 .B \fBls\fP \fIoutfile\fP
 List objects in given pool and write to outfile.
 .TP
@@ -153,7 +140,12 @@ Benchmark for \fIseconds\fP\&. The mode can be \fIwrite\fP, \fIseq\fP, or
 sequential or random. Before running one of the reading benchmarks,
 run a write benchmark with the \fI\-\-no\-cleanup\fP option. The default
 object size is 4 MB, and the default number of simulated threads
-(parallel writes) is 16.
+(parallel writes) is 16. The \fI\-\-run\-name <label>\fP option is useful
+for benchmarking a workload test from multiple clients. The \fI<label>\fP
+is an arbitrary object name. It is "benchmark_last_metadata" by
+default, and is used as the underlying object name for "read" and
+"write" ops.
+Note: \-b \fIobjsize\fP option is valid only in \fIwrite\fP mode.
 .UNINDENT
 .sp
 \fBcleanup\fP
@@ -256,7 +248,7 @@ rados \-p foo \-s mysnap get myobject blah.txt.old
 .UNINDENT
 .SH AVAILABILITY
 .sp
-\fBrados\fP is part of Ceph, a massively scalable, open-source, distributed storage system. Please refer to
+\fBrados\fP is part of Ceph, a massively scalable, open\-source, distributed storage system. Please refer to
 the Ceph documentation at \fI\%http://ceph.com/docs\fP for more information.
 .SH SEE ALSO
 .sp

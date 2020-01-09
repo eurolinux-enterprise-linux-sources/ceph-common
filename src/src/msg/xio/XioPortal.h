@@ -16,6 +16,8 @@
 #ifndef XIO_PORTAL_H
 #define XIO_PORTAL_H
 
+#include <string>
+
 extern "C" {
 #include "libxio.h"
 }
@@ -67,7 +69,7 @@ private:
 
     inline Lane* get_lane(XioConnection *xcon)
       {
-	return &qlane[((uint64_t) xcon) % nlanes];
+	return &qlane[(((uint64_t) xcon) / 16) % nlanes];
       }
 
     void enq(XioConnection *xcon, XioSubmit* xs)
@@ -129,7 +131,7 @@ private:
   friend class XioMessenger;
 
 public:
-  XioPortal(Messenger *_msgr) :
+  explicit XioPortal(Messenger *_msgr) :
   msgr(_msgr), ctx(NULL), server(NULL), submit_q(), xio_uri(""),
   portal_id(NULL), _shutdown(false), drained(false),
   magic(0),
@@ -155,21 +157,20 @@ public:
   int bind(struct xio_session_ops *ops, const string &base_uri,
 	   uint16_t port, uint16_t *assigned_port);
 
-  inline void release_xio_rsp(XioRsp* xrsp) {
+  inline void release_xio_msg(XioRsp* xrsp) {
     struct xio_msg *msg = xrsp->dequeue();
     struct xio_msg *next_msg = NULL;
     int code;
-    while (msg) {
+    if (unlikely(!xrsp->xcon->conn)) {
+      // NOTE: msg is not safe to dereference if the connection was torn down
+      xrsp->xcon->msg_release_fail(msg, ENOTCONN);
+    }
+    else while (msg) {
       next_msg = static_cast<struct xio_msg *>(msg->user_context);
-      if (unlikely(!xrsp->xcon->conn || !xrsp->xcon->is_connected()))
-        code = ENOTCONN;
-      else
-        code = xio_release_msg(msg);
-      if (unlikely(code)) {
-	/* very unlikely, so log it */
+      code = xio_release_msg(msg);
+      if (unlikely(code)) /* very unlikely, so log it */
 	xrsp->xcon->msg_release_fail(msg, code);
-      }
-      msg =  next_msg;
+      msg = next_msg;
     }
     xrsp->finalize(); /* unconditional finalize */
   }
@@ -192,7 +193,7 @@ public:
 	break;
       default:
 	/* INCOMING_MSG_RELEASE */
-	release_xio_rsp(static_cast<XioRsp*>(xs));
+	release_xio_msg(static_cast<XioRsp*>(xs));
       break;
       };
     }
@@ -208,15 +209,15 @@ public:
     // and push them in FIFO order to front of the input queue,
     // and mark the connection as flow-controlled
     XioSubmit::Queue requeue_q;
-    XioSubmit *xs;
     XioMsg *xmsg;
 
     while (q_iter != send_q.end()) {
-      xs = &(*q_iter);
+      XioSubmit *xs = &(*q_iter);
       // skip retires and anything for other connections
-      if ((xs->type != XioSubmit::OUTGOING_MSG) ||
-	  (xs->xcon != xcon))
+      if (xs->xcon != xcon) {
+	q_iter++;
 	continue;
+      }
       xmsg = static_cast<XioMsg*>(xs);
       q_iter = send_q.erase(q_iter);
       requeue_q.push_back(*xmsg);
@@ -284,8 +285,19 @@ public:
 		  print_ceph_msg(msgr->cct, "xio_send_msg", xmsg->m);
 		}
 		/* get the right Accelio's errno code */
-		if (unlikely(code))
-		  code = xio_errno();
+		if (unlikely(code)) {
+		  if ((code == -1) && (xio_errno() == -1)) {
+		    /* In case XIO does not have any credits to send,
+		     * it would still queue up the message(s) for transmission,
+		     * but would return -1 and errno would also be set to -1.
+		     * This needs to be treated as a success.
+		     */
+		    code = 0;
+		  }
+		  else {
+		    code = xio_errno();
+		  }
+		}
 	      } /* !ENOTCONN */
 	      if (unlikely(code)) {
 		switch (code) {
@@ -309,7 +321,7 @@ public:
 	    default:
 	      /* INCOMING_MSG_RELEASE */
 	      q_iter = send_q.erase(q_iter);
-	      release_xio_rsp(static_cast<XioRsp*>(xs));
+	      release_xio_msg(static_cast<XioRsp*>(xs));
 	      continue;
 	    } /* switch (xs->type) */
 	    q_iter = send_q.erase(q_iter);
@@ -414,30 +426,30 @@ public:
       /* shift left */
       p_vec[(p_ix-1)] = (char*) /* portal->xio_uri.c_str() */
 			portal->portal_id;
-      }
+    }
 
     for (p_ix = 0; p_ix < nportals; ++p_ix) {
+      string thread_name = "ms_xio_";
+      thread_name.append(std::to_string(p_ix));
       portal = portals[p_ix];
-      portal->create();
+      portal->create(thread_name.c_str());
     }
   }
 
   void shutdown()
   {
-    XioPortal *portal;
     int nportals = portals.size();
     for (int p_ix = 0; p_ix < nportals; ++p_ix) {
-      portal = portals[p_ix];
+      XioPortal *portal = portals[p_ix];
       portal->shutdown();
     }
   }
 
   void join()
   {
-    XioPortal *portal;
     int nportals = portals.size();
     for (int p_ix = 0; p_ix < nportals; ++p_ix) {
-      portal = portals[p_ix];
+      XioPortal *portal = portals[p_ix];
       portal->join();
     }
   }

@@ -12,6 +12,7 @@
 #include "rocksdb/write_batch.h"
 #include "rocksdb/db.h"
 #include "rocksdb/options.h"
+#include "util/autovector.h"
 
 namespace rocksdb {
 
@@ -26,14 +27,14 @@ class ColumnFamilyMemTables {
   // been processed)
   virtual uint64_t GetLogNumber() const = 0;
   virtual MemTable* GetMemTable() const = 0;
-  virtual const Options* GetOptions() const = 0;
   virtual ColumnFamilyHandle* GetColumnFamilyHandle() = 0;
+  virtual void CheckMemtableFull() = 0;
 };
 
 class ColumnFamilyMemTablesDefault : public ColumnFamilyMemTables {
  public:
-  ColumnFamilyMemTablesDefault(MemTable* mem, const Options* options)
-      : ok_(false), mem_(mem), options_(options) {}
+  explicit ColumnFamilyMemTablesDefault(MemTable* mem)
+      : ok_(false), mem_(mem) {}
 
   bool Seek(uint32_t column_family_id) override {
     ok_ = (column_family_id == 0);
@@ -47,17 +48,13 @@ class ColumnFamilyMemTablesDefault : public ColumnFamilyMemTables {
     return mem_;
   }
 
-  const Options* GetOptions() const override {
-    assert(ok_);
-    return options_;
-  }
-
   ColumnFamilyHandle* GetColumnFamilyHandle() override { return nullptr; }
+
+  void CheckMemtableFull() override {}
 
  private:
   bool ok_;
   MemTable* mem_;
-  const Options* const options_;
 };
 
 // WriteBatchInternal provides static methods for manipulating a
@@ -72,10 +69,22 @@ class WriteBatchInternal {
                   const SliceParts& key, const SliceParts& value);
 
   static void Delete(WriteBatch* batch, uint32_t column_family_id,
+                     const SliceParts& key);
+
+  static void Delete(WriteBatch* batch, uint32_t column_family_id,
                      const Slice& key);
+
+  static void SingleDelete(WriteBatch* batch, uint32_t column_family_id,
+                           const SliceParts& key);
+
+  static void SingleDelete(WriteBatch* batch, uint32_t column_family_id,
+                           const Slice& key);
 
   static void Merge(WriteBatch* batch, uint32_t column_family_id,
                     const Slice& key, const Slice& value);
+
+  static void Merge(WriteBatch* batch, uint32_t column_family_id,
+                    const SliceParts& key, const SliceParts& value);
 
   // Return the number of entries in the batch.
   static int Count(const WriteBatch* batch);
@@ -90,6 +99,10 @@ class WriteBatchInternal {
   // this batch.
   static void SetSequence(WriteBatch* batch, SequenceNumber seq);
 
+  // Returns the offset of the first entry in the batch.
+  // This offset is only valid if the batch is not empty.
+  static size_t GetFirstOffset(WriteBatch* batch);
+
   static Slice Contents(const WriteBatch* batch) {
     return Slice(batch->rep_);
   }
@@ -100,24 +113,39 @@ class WriteBatchInternal {
 
   static void SetContents(WriteBatch* batch, const Slice& contents);
 
-  // Inserts batch entries into memtable
-  // If dont_filter_deletes is false AND options.filter_deletes is true,
-  // then --> Drops deletes in batch if db->KeyMayExist returns false
-  // If recovery == true, this means InsertInto is executed on a recovery
-  // code-path. WriteBatch referencing a dropped column family can be
-  // found on a recovery code-path and should be ignored (recovery should not
-  // fail). Additionally, the memtable will be updated only if
-  // memtables->GetLogNumber() >= log_number
-  // However, if recovery == false, any WriteBatch referencing
-  // non-existing column family will return a failure. Also, log_number is
-  // ignored in that case
+  // Inserts batches[i] into memtable, for i in 0..num_batches-1 inclusive.
+  //
+  // If dont_filter_deletes is false AND options.filter_deletes is true
+  // AND db->KeyMayExist is false, then a Delete won't modify the memtable.
+  //
+  // If ignore_missing_column_families == true. WriteBatch
+  // referencing non-existing column family will be ignored.
+  // If ignore_missing_column_families == false, processing of the
+  // batches will be stopped if a reference is found to a non-existing
+  // column family and InvalidArgument() will be returned.  The writes
+  // in batches may be only partially applied at that point.
+  //
+  // If log_number is non-zero, the memtable will be updated only if
+  // memtables->GetLogNumber() >= log_number.
+  static Status InsertInto(const autovector<WriteBatch*>& batches,
+                           SequenceNumber sequence,
+                           ColumnFamilyMemTables* memtables,
+                           bool ignore_missing_column_families = false,
+                           uint64_t log_number = 0, DB* db = nullptr,
+                           const bool dont_filter_deletes = true);
+
+  // Convenience form of InsertInto when you have only one batch
   static Status InsertInto(const WriteBatch* batch,
                            ColumnFamilyMemTables* memtables,
-                           bool recovery = false, uint64_t log_number = 0,
-                           DB* db = nullptr,
+                           bool ignore_missing_column_families = false,
+                           uint64_t log_number = 0, DB* db = nullptr,
                            const bool dont_filter_deletes = true);
 
   static void Append(WriteBatch* dst, const WriteBatch* src);
+
+  // Returns the byte size of appending a WriteBatch with ByteSize
+  // leftByteSize and a WriteBatch with ByteSize rightByteSize
+  static size_t AppendedByteSize(size_t leftByteSize, size_t rightByteSize);
 };
 
 }  // namespace rocksdb

@@ -62,11 +62,10 @@ static void log_subop_stats(
 ReplicatedBackend::ReplicatedBackend(
   PGBackend::Listener *pg,
   coll_t coll,
-  coll_t temp_coll,
+  ObjectStore::CollectionHandle &c,
   ObjectStore *store,
   CephContext *cct) :
-  PGBackend(pg, store,
-	    coll, temp_coll),
+  PGBackend(pg, store, coll, c),
   cct(cct) {}
 
 void ReplicatedBackend::run_recovery_op(
@@ -110,13 +109,13 @@ void ReplicatedBackend::recover_object(
 
 void ReplicatedBackend::check_recovery_sources(const OSDMapRef osdmap)
 {
-  for(map<pg_shard_t, set<hobject_t> >::iterator i = pull_from_peer.begin();
+  for(map<pg_shard_t, set<hobject_t, hobject_t::BitwiseComparator> >::iterator i = pull_from_peer.begin();
       i != pull_from_peer.end();
       ) {
     if (osdmap->is_down(i->first.osd)) {
       dout(10) << "check_recovery_sources resetting pulls from osd." << i->first
 	       << ", osdmap has it marked down" << dendl;
-      for (set<hobject_t>::iterator j = i->second.begin();
+      for (set<hobject_t, hobject_t::BitwiseComparator>::iterator j = i->second.begin();
 	   j != i->second.end();
 	   ++j) {
 	assert(pulling.count(*j) == 1);
@@ -210,15 +209,11 @@ bool ReplicatedBackend::handle_message(
 	return true;
       }
     }
-    else {
-      sub_op_modify_reply<MOSDSubOpReply, MSG_OSD_SUBOPREPLY>(op);
-      return true;
-    }
     break;
   }
 
   case MSG_OSD_REPOPREPLY: {
-    sub_op_modify_reply<MOSDRepOpReply, MSG_OSD_REPOPREPLY>(op);
+    sub_op_modify_reply(op);
     return true;
   }
 
@@ -252,15 +247,6 @@ void ReplicatedBackend::on_change()
 
 void ReplicatedBackend::on_flushed()
 {
-  if (have_temp_coll() &&
-      !store->collection_empty(get_temp_coll())) {
-    vector<hobject_t> objects;
-    store->collection_list(get_temp_coll(), objects);
-    derr << __func__ << ": found objects in the temp collection: "
-	 << objects << ", crashing now"
-	 << dendl;
-    assert(0 == "found garbage in the temp collection");
-  }
 }
 
 int ReplicatedBackend::objects_read_sync(
@@ -270,7 +256,7 @@ int ReplicatedBackend::objects_read_sync(
   uint32_t op_flags,
   bufferlist *bl)
 {
-  return store->read(coll, hoid, off, len, *bl, op_flags);
+  return store->read(ch, ghobject_t(hoid), off, len, *bl, op_flags);
 }
 
 struct AsyncReadCallback : public GenContext<ThreadPool::TPHandle&> {
@@ -289,15 +275,19 @@ void ReplicatedBackend::objects_read_async(
   const hobject_t &hoid,
   const list<pair<boost::tuple<uint64_t, uint64_t, uint32_t>,
 		  pair<bufferlist*, Context*> > > &to_read,
-  Context *on_complete)
+  Context *on_complete,
+  bool fast_read)
 {
+  // There is no fast read implementation for replication backend yet
+  assert(!fast_read);
+
   int r = 0;
   for (list<pair<boost::tuple<uint64_t, uint64_t, uint32_t>,
 		 pair<bufferlist*, Context*> > >::const_iterator i =
 	   to_read.begin();
        i != to_read.end() && r >= 0;
        ++i) {
-    int _r = store->read(coll, hoid, i->first.get<0>(),
+    int _r = store->read(ch, ghobject_t(hoid), i->first.get<0>(),
 			 i->first.get<1>(), *(i->second.first),
 			 i->first.get<2>());
     if (i->second.second) {
@@ -316,10 +306,9 @@ void ReplicatedBackend::objects_read_async(
 
 class RPGTransaction : public PGBackend::PGTransaction {
   coll_t coll;
-  coll_t temp_coll;
-  set<hobject_t> temp_added;
-  set<hobject_t> temp_cleared;
-  ObjectStore::Transaction *t;
+  set<hobject_t, hobject_t::BitwiseComparator> temp_added;
+  set<hobject_t, hobject_t::BitwiseComparator> temp_cleared;
+  mutable ObjectStore::Transaction t;
   uint64_t written;
   const coll_t &get_coll_ct(const hobject_t &hoid) {
     if (hoid.is_temp()) {
@@ -336,28 +325,20 @@ class RPGTransaction : public PGBackend::PGTransaction {
     return get_coll(hoid);
   }
   const coll_t &get_coll(const hobject_t &hoid) {
-    if (hoid.is_temp())
-      return temp_coll;
-    else
-      return coll;
+    return coll;
   }
 public:
-  RPGTransaction(coll_t coll, coll_t temp_coll, bool use_tbl)
-    : coll(coll), temp_coll(temp_coll), t(new ObjectStore::Transaction), written(0)
-    {
-      t->set_use_tbl(use_tbl);
-    }
+  RPGTransaction(coll_t coll)
+    : coll(coll), written(0) {}
 
   /// Yields ownership of contained transaction
-  ObjectStore::Transaction *get_transaction() {
-    ObjectStore::Transaction *_t = t;
-    t = 0;
-    return _t;
+  ObjectStore::Transaction&& get_transaction() {
+    return std::move(t);
   }
-  const set<hobject_t> &get_temp_added() {
+  const set<hobject_t, hobject_t::BitwiseComparator> &get_temp_added() {
     return temp_added;
   }
-  const set<hobject_t> &get_temp_cleared() {
+  const set<hobject_t, hobject_t::BitwiseComparator> &get_temp_cleared() {
     return temp_cleared;
   }
 
@@ -369,38 +350,38 @@ public:
     uint32_t fadvise_flags
     ) {
     written += len;
-    t->write(get_coll_ct(hoid), hoid, off, len, bl, fadvise_flags);
+    t.write(get_coll_ct(hoid), ghobject_t(hoid), off, len, bl, fadvise_flags);
   }
   void remove(
     const hobject_t &hoid
     ) {
-    t->remove(get_coll_rm(hoid), hoid);
+    t.remove(get_coll_rm(hoid), ghobject_t(hoid));
   }
   void stash(
     const hobject_t &hoid,
     version_t former_version) {
-    t->collection_move_rename(
-      coll, hoid, coll,
+    t.collection_move_rename(
+      coll, ghobject_t(hoid), coll,
       ghobject_t(hoid, former_version, shard_id_t::NO_SHARD));
   }
   void setattrs(
     const hobject_t &hoid,
     map<string, bufferlist> &attrs
     ) {
-    t->setattrs(get_coll(hoid), hoid, attrs);
+    t.setattrs(get_coll(hoid), ghobject_t(hoid), attrs);
   }
   void setattr(
     const hobject_t &hoid,
     const string &attrname,
     bufferlist &bl
     ) {
-    t->setattr(get_coll(hoid), hoid, attrname, bl);
+    t.setattr(get_coll(hoid), ghobject_t(hoid), attrname, bl);
   }
   void rmattr(
     const hobject_t &hoid,
     const string &attrname
     ) {
-    t->rmattr(get_coll(hoid), hoid, attrname);
+    t.rmattr(get_coll(hoid), ghobject_t(hoid), attrname);
   }
   void omap_setkeys(
     const hobject_t &hoid,
@@ -408,25 +389,38 @@ public:
     ) {
     for (map<string, bufferlist>::iterator p = keys.begin(); p != keys.end(); ++p)
       written += p->first.length() + p->second.length();
-    return t->omap_setkeys(get_coll(hoid), hoid, keys);
+    return t.omap_setkeys(get_coll(hoid), ghobject_t(hoid), keys);
+  }
+  void omap_setkeys(
+    const hobject_t &hoid,
+    bufferlist &keys_bl
+    ) {
+    written += keys_bl.length();
+    return t.omap_setkeys(get_coll(hoid), ghobject_t(hoid), keys_bl);
   }
   void omap_rmkeys(
     const hobject_t &hoid,
     set<string> &keys
     ) {
-    t->omap_rmkeys(get_coll(hoid), hoid, keys);
+    t.omap_rmkeys(get_coll(hoid), ghobject_t(hoid), keys);
+  }
+  void omap_rmkeys(
+    const hobject_t &hoid,
+    bufferlist &keys_bl
+    ) {
+    t.omap_rmkeys(get_coll(hoid), ghobject_t(hoid), keys_bl);
   }
   void omap_clear(
     const hobject_t &hoid
     ) {
-    t->omap_clear(get_coll(hoid), hoid);
+    t.omap_clear(get_coll(hoid), ghobject_t(hoid));
   }
   void omap_setheader(
     const hobject_t &hoid,
     bufferlist &header
     ) {
     written += header.length();
-    t->omap_setheader(get_coll(hoid), hoid, header);
+    t.omap_setheader(get_coll(hoid), ghobject_t(hoid), header);
   }
   void clone_range(
     const hobject_t &from,
@@ -436,44 +430,44 @@ public:
     uint64_t tooff
     ) {
     assert(get_coll(from) == get_coll_ct(to)  && get_coll(from) == coll);
-    t->clone_range(coll, from, to, fromoff, len, tooff);
+    t.clone_range(coll, ghobject_t(from), ghobject_t(to), fromoff, len, tooff);
   }
   void clone(
     const hobject_t &from,
     const hobject_t &to
     ) {
     assert(get_coll(from) == get_coll_ct(to)  && get_coll(from) == coll);
-    t->clone(coll, from, to);
+    t.clone(coll, ghobject_t(from), ghobject_t(to));
   }
   void rename(
     const hobject_t &from,
     const hobject_t &to
     ) {
-    t->collection_move_rename(
+    t.collection_move_rename(
       get_coll_rm(from),
-      from,
+      ghobject_t(from),
       get_coll_ct(to),
-      to);
+      ghobject_t(to));
   }
 
   void touch(
     const hobject_t &hoid
     ) {
-    t->touch(get_coll_ct(hoid), hoid);
+    t.touch(get_coll_ct(hoid), ghobject_t(hoid));
   }
 
   void truncate(
     const hobject_t &hoid,
     uint64_t off
     ) {
-    t->truncate(get_coll(hoid), hoid, off);
+    t.truncate(get_coll(hoid), ghobject_t(hoid), off);
   }
   void zero(
     const hobject_t &hoid,
     uint64_t off,
     uint64_t len
     ) {
-    t->zero(get_coll(hoid), hoid, off, len);
+    t.zero(get_coll(hoid), ghobject_t(hoid), off, len);
   }
 
   void set_alloc_hint(
@@ -481,10 +475,11 @@ public:
     uint64_t expected_object_size,
     uint64_t expected_write_size
     ) {
-    t->set_alloc_hint(get_coll(hoid), hoid, expected_object_size,
+    t.set_alloc_hint(get_coll(hoid), ghobject_t(hoid), expected_object_size,
                       expected_write_size);
   }
 
+  using PGBackend::PGTransaction::append;
   void append(
     PGTransaction *_to_append
     ) {
@@ -492,14 +487,14 @@ public:
     assert(to_append);
     written += to_append->written;
     to_append->written = 0;
-    t->append(*(to_append->t));
-    for (set<hobject_t>::iterator i = to_append->temp_added.begin();
+    t.append((to_append->t));
+    for (set<hobject_t, hobject_t::BitwiseComparator>::iterator i = to_append->temp_added.begin();
 	 i != to_append->temp_added.end();
 	 ++i) {
       temp_cleared.erase(*i);
       temp_added.insert(*i);
     }
-    for (set<hobject_t>::iterator i = to_append->temp_cleared.begin();
+    for (set<hobject_t, hobject_t::BitwiseComparator>::iterator i = to_append->temp_cleared.begin();
 	 i != to_append->temp_cleared.end();
 	 ++i) {
       temp_added.erase(*i);
@@ -507,20 +502,20 @@ public:
     }
   }
   void nop() {
-    t->nop();
+    t.nop();
   }
   bool empty() const {
-    return t->empty();
+    return t.empty(); 
   }
   uint64_t get_bytes_written() const {
     return written;
   }
-  ~RPGTransaction() { delete t; }
+  ~RPGTransaction() { }
 };
 
 PGBackend::PGTransaction *ReplicatedBackend::get_transaction()
 {
-  return new RPGTransaction(coll, get_temp_coll(), parent->transaction_use_tbl());
+  return new RPGTransaction(coll);
 }
 
 class C_OSD_OnOpCommit : public Context {
@@ -548,7 +543,7 @@ public:
 void ReplicatedBackend::submit_transaction(
   const hobject_t &soid,
   const eversion_t &at_version,
-  PGTransaction *_t,
+  PGTransactionUPtr &&_t,
   const eversion_t &trim_to,
   const eversion_t &trim_rollback_to,
   const vector<pg_log_entry_t> &log_entries,
@@ -560,9 +555,10 @@ void ReplicatedBackend::submit_transaction(
   osd_reqid_t reqid,
   OpRequestRef orig_op)
 {
-  RPGTransaction *t = dynamic_cast<RPGTransaction*>(_t);
+  std::unique_ptr<RPGTransaction> t(
+    static_cast<RPGTransaction*>(_t.release()));
   assert(t);
-  ObjectStore::Transaction *op_t = t->get_transaction();
+  ObjectStore::Transaction op_t = t->get_transaction();
 
   assert(t->get_temp_added().size() <= 1);
   assert(t->get_temp_cleared().size() <= 1);
@@ -600,10 +596,7 @@ void ReplicatedBackend::submit_transaction(
     &op,
     op_t);
 
-  ObjectStore::Transaction local_t;
-  local_t.set_use_tbl(op_t->get_use_tbl());
   if (!(t->get_temp_added().empty())) {
-    get_temp_coll(&local_t);
     add_temp_objs(t->get_temp_added());
   }
   clear_temp_objs(t->get_temp_cleared());
@@ -614,23 +607,20 @@ void ReplicatedBackend::submit_transaction(
     trim_to,
     trim_rollback_to,
     true,
-    &local_t);
-
-  local_t.append(*op_t);
-  local_t.swap(*op_t);
+    op_t);
   
-  op_t->register_on_applied_sync(on_local_applied_sync);
-  op_t->register_on_applied(
+  op_t.register_on_applied_sync(on_local_applied_sync);
+  op_t.register_on_applied(
     parent->bless_context(
       new C_OSD_OnOpApplied(this, &op)));
-  op_t->register_on_applied(
-    new ObjectStore::C_DeleteTransaction(op_t));
-  op_t->register_on_commit(
+  op_t.register_on_commit(
     parent->bless_context(
       new C_OSD_OnOpCommit(this, &op)));
-      
-  parent->queue_transaction(op_t, op.op);
-  delete t;
+
+  vector<ObjectStore::Transaction> tls;
+  tls.push_back(std::move(op_t));
+
+  parent->queue_transactions(tls, op.op);
 }
 
 void ReplicatedBackend::op_applied(
@@ -672,12 +662,11 @@ void ReplicatedBackend::op_commit(
   }
 }
 
-template<typename T, int MSGTYPE>
 void ReplicatedBackend::sub_op_modify_reply(OpRequestRef op)
 {
-  T *r = static_cast<T *>(op->get_req());
-  assert(r->get_header().type == MSGTYPE);
-  assert(MSGTYPE == MSG_OSD_SUBOPREPLY || MSGTYPE == MSG_OSD_REPOPREPLY);
+  MOSDRepOpReply *r = static_cast<MOSDRepOpReply *>(op->get_req());
+  r->finish_decode();
+  assert(r->get_header().type == MSG_OSD_REPOPREPLY);
 
   op->mark_started();
 
@@ -709,12 +698,18 @@ void ReplicatedBackend::sub_op_modify_reply(OpRequestRef op)
     if (r->ack_type & CEPH_OSD_FLAG_ONDISK) {
       assert(ip_op.waiting_for_commit.count(from));
       ip_op.waiting_for_commit.erase(from);
-      if (ip_op.op)
-	ip_op.op->mark_event("sub_op_commit_rec");
+      if (ip_op.op) {
+        ostringstream ss;
+        ss << "sub_op_commit_rec from " << from;
+	ip_op.op->mark_event(ss.str());
+      }
     } else {
       assert(ip_op.waiting_for_applied.count(from));
-      if (ip_op.op)
-	ip_op.op->mark_event("sub_op_applied_rec");
+      if (ip_op.op) {
+        ostringstream ss;
+        ss << "sub_op_applied_rec from " << from;
+	ip_op.op->mark_event(ss.str());
+      }
     }
     ip_op.waiting_for_applied.erase(from);
 
@@ -750,14 +745,21 @@ void ReplicatedBackend::be_deep_scrub(
   bufferlist bl, hdrbl;
   int r;
   __u64 pos = 0;
-  while ( (r = store->read(
-	     coll,
-	     ghobject_t(
-	       poid, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard),
-	     pos,
-	     cct->_conf->osd_deep_scrub_stride, bl,
-	     true)) > 0) {
+
+  uint32_t fadvise_flags = CEPH_OSD_OP_FLAG_FADVISE_SEQUENTIAL | CEPH_OSD_OP_FLAG_FADVISE_DONTNEED;
+
+  while (true) {
     handle.reset_tp_timeout();
+    r = store->read(
+	  ch,
+	  ghobject_t(
+	    poid, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard),
+	  pos,
+	  cct->_conf->osd_deep_scrub_stride, bl,
+	  fadvise_flags, true);
+    if (r <= 0)
+      break;
+
     h << bl;
     pos += bl.length();
     bl.clear();
@@ -766,6 +768,7 @@ void ReplicatedBackend::be_deep_scrub(
     dout(25) << __func__ << "  " << poid << " got "
 	     << r << " on read, read_error" << dendl;
     o.read_error = true;
+    return;
   }
   o.digest = h.digest();
   o.digest_present = true;
@@ -793,6 +796,7 @@ void ReplicatedBackend::be_deep_scrub(
     dout(25) << __func__ << "  " << poid << " got "
 	     << r << " on omap header read, read_error" << dendl;
     o.read_error = true;
+    return;
   }
 
   ObjectMap::ObjectMapIterator iter = store->get_omap_iterator(
@@ -801,15 +805,16 @@ void ReplicatedBackend::be_deep_scrub(
       poid, ghobject_t::NO_GEN, get_parent()->whoami_shard().shard));
   assert(iter);
   uint64_t keys_scanned = 0;
-  for (iter->seek_to_first(); iter->valid() ; iter->next()) {
+  for (iter->seek_to_first(); iter->valid() ; iter->next(false)) {
     if (cct->_conf->osd_scan_list_ping_tp_interval &&
 	(keys_scanned % cct->_conf->osd_scan_list_ping_tp_interval == 0)) {
       handle.reset_tp_timeout();
     }
     ++keys_scanned;
 
-    dout(25) << "CRC key " << iter->key() << " value "
-	     << string(iter->value().c_str(), iter->value().length()) << dendl;
+    dout(25) << "CRC key " << iter->key() << " value:\n";
+    iter->value().hexdump(*_dout);
+    *_dout << dendl;
 
     ::encode(iter->key(), bl);
     ::encode(iter->value(), bl);
@@ -820,11 +825,13 @@ void ReplicatedBackend::be_deep_scrub(
     dout(25) << __func__ << "  " << poid << " got "
 	     << r << " on omap scan, read_error" << dendl;
     o.read_error = true;
+    return;
   }
-
   //Store final calculated CRC32 of omap header & key/values
   o.omap_digest = oh.digest();
   o.omap_digest_present = true;
+  dout(20) << __func__ << "  " << poid << " omap_digest "
+	   << std::hex << o.omap_digest << std::dec << dendl;
 }
 
 void ReplicatedBackend::_do_push(OpRequestRef op)
@@ -834,12 +841,12 @@ void ReplicatedBackend::_do_push(OpRequestRef op)
   pg_shard_t from = m->from;
 
   vector<PushReplyOp> replies;
-  ObjectStore::Transaction *t = new ObjectStore::Transaction;
+  ObjectStore::Transaction t;
   for (vector<PushOp>::iterator i = m->pushes.begin();
        i != m->pushes.end();
        ++i) {
     replies.push_back(PushReplyOp());
-    handle_push(from, *i, &(replies.back()), t);
+    handle_push(from, *i, &(replies.back()), &t);
   }
 
   MOSDPGPushReply *reply = new MOSDPGPushReply;
@@ -850,13 +857,11 @@ void ReplicatedBackend::_do_push(OpRequestRef op)
   reply->replies.swap(replies);
   reply->compute_cost(cct);
 
-  t->register_on_complete(
+  t.register_on_complete(
     new PG_SendMessageOnConn(
       get_parent(), reply, m->get_connection()));
 
-  t->register_on_applied(
-    new ObjectStore::C_DeleteTransaction(t));
-  get_parent()->queue_transaction(t);
+  get_parent()->queue_transaction(std::move(t));
 }
 
 struct C_ReplicatedBackend_OnPullComplete : GenContext<ThreadPool::TPHandle&> {
@@ -872,12 +877,12 @@ struct C_ReplicatedBackend_OnPullComplete : GenContext<ThreadPool::TPHandle&> {
 	   to_continue.begin();
 	 i != to_continue.end();
 	 ++i) {
-      map<hobject_t, ReplicatedBackend::PullInfo>::iterator j =
+      map<hobject_t, ReplicatedBackend::PullInfo, hobject_t::BitwiseComparator>::iterator j =
 	bc->pulling.find(*i);
       assert(j != bc->pulling.end());
       if (!bc->start_pushes(*i, j->second.obc, h)) {
 	bc->get_parent()->on_global_recover(
-	  *i);
+	  *i, j->second.stat);
       }
       bc->pulling.erase(*i);
       handle.reset_tp_timeout();
@@ -893,12 +898,12 @@ void ReplicatedBackend::_do_pull_response(OpRequestRef op)
   pg_shard_t from = m->from;
 
   vector<PullOp> replies(1);
-  ObjectStore::Transaction *t = new ObjectStore::Transaction;
+  ObjectStore::Transaction t;
   list<hobject_t> to_continue;
   for (vector<PushOp>::iterator i = m->pushes.begin();
        i != m->pushes.end();
        ++i) {
-    bool more = handle_pull_response(from, *i, &(replies.back()), &to_continue, t);
+    bool more = handle_pull_response(from, *i, &(replies.back()), &to_continue, &t);
     if (more)
       replies.push_back(PullOp());
   }
@@ -908,7 +913,7 @@ void ReplicatedBackend::_do_pull_response(OpRequestRef op)
 	this,
 	m->get_priority());
     c->to_continue.swap(to_continue);
-    t->register_on_complete(
+    t.register_on_complete(
       new PG_RecoveryQueueAsync(
 	get_parent(),
 	get_parent()->bless_gencontext(c)));
@@ -924,14 +929,12 @@ void ReplicatedBackend::_do_pull_response(OpRequestRef op)
     reply->pulls.swap(replies);
     reply->compute_cost(cct);
 
-    t->register_on_complete(
+    t.register_on_complete(
       new PG_SendMessageOnConn(
 	get_parent(), reply, m->get_connection()));
   }
 
-  t->register_on_applied(
-    new ObjectStore::C_DeleteTransaction(t));
-  get_parent()->queue_transaction(t);
+  get_parent()->queue_transaction(std::move(t));
 }
 
 void ReplicatedBackend::do_pull(OpRequestRef op)
@@ -971,7 +974,6 @@ void ReplicatedBackend::do_push_reply(OpRequestRef op)
   send_pushes(m->get_priority(), _replies);
 }
 
-template<typename T, int MSGTYPE>
 Message * ReplicatedBackend::generate_subop(
   const hobject_t &soid,
   const eversion_t &at_version,
@@ -984,14 +986,13 @@ Message * ReplicatedBackend::generate_subop(
   const vector<pg_log_entry_t> &log_entries,
   boost::optional<pg_hit_set_history_t> &hset_hist,
   InProgressOp *op,
-  ObjectStore::Transaction *op_t,
+  ObjectStore::Transaction &op_t,
   pg_shard_t peer,
   const pg_info_t &pinfo)
 {
   int acks_wanted = CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK;
-  assert(MSGTYPE == MSG_OSD_SUBOP || MSGTYPE == MSG_OSD_REPOP);
   // forward the write/update/whatever
-  T *wr = new T(
+  MOSDRepOp *wr = new MOSDRepOp(
     reqid, parent->whoami_shard(),
     spg_t(get_info().pgid.pgid, peer.shard),
     soid, acks_wanted,
@@ -1006,10 +1007,9 @@ Message * ReplicatedBackend::generate_subop(
 	     << ", pinfo.last_backfill "
 	     << pinfo.last_backfill << ")" << dendl;
     ObjectStore::Transaction t;
-    t.set_use_tbl(op_t->get_use_tbl());
     ::encode(t, wr->get_data());
   } else {
-    ::encode(*op_t, wr->get_data());
+    ::encode(op_t, wr->get_data());
   }
 
   ::encode(log_entries, wr->logbl);
@@ -1040,7 +1040,7 @@ void ReplicatedBackend::issue_op(
   const vector<pg_log_entry_t> &log_entries,
   boost::optional<pg_hit_set_history_t> &hset_hist,
   InProgressOp *op,
-  ObjectStore::Transaction *op_t)
+  ObjectStore::Transaction &op_t)
 {
 
   if (parent->get_actingbackfill_shards().size() > 1) {
@@ -1060,41 +1060,21 @@ void ReplicatedBackend::issue_op(
     const pg_info_t &pinfo = parent->get_shard_info().find(peer)->second;
 
     Message *wr;
-    uint64_t min_features = parent->min_peer_features();
-    if (!(min_features & CEPH_FEATURE_OSD_REPOP)) {
-      dout(20) << "Talking to old version of OSD, doesn't support RepOp, fall back to SubOp" << dendl;
-      wr = generate_subop<MOSDSubOp, MSG_OSD_SUBOP>(
-	    soid,
-	    at_version,
-	    tid,
-	    reqid,
-	    pg_trim_to,
-	    pg_trim_rollback_to,
-	    new_temp_oid,
-	    discard_temp_oid,
-	    log_entries,
-	    hset_hist,
-	    op,
-	    op_t,
-	    peer,
-	    pinfo);
-    } else {
-      wr = generate_subop<MOSDRepOp, MSG_OSD_REPOP>(
-	    soid,
-	    at_version,
-	    tid,
-	    reqid,
-	    pg_trim_to,
-	    pg_trim_rollback_to,
-	    new_temp_oid,
-	    discard_temp_oid,
-	    log_entries,
-	    hset_hist,
-	    op,
-	    op_t,
-	    peer,
-	    pinfo);
-    }
+    wr = generate_subop(
+      soid,
+      at_version,
+      tid,
+      reqid,
+      pg_trim_to,
+      pg_trim_rollback_to,
+      new_temp_oid,
+      discard_temp_oid,
+      log_entries,
+      hset_hist,
+      op,
+      op_t,
+      peer,
+      pinfo);
 
     get_parent()->send_message_osd_cluster(
       peer.osd, wr, get_osdmap()->get_epoch());
@@ -1102,25 +1082,12 @@ void ReplicatedBackend::issue_op(
 }
 
 // sub op modify
-void ReplicatedBackend::sub_op_modify(OpRequestRef op) {
-  Message *m = op->get_req();
-  int msg_type = m->get_type();
-  if (msg_type == MSG_OSD_SUBOP) {
-    sub_op_modify_impl<MOSDSubOp, MSG_OSD_SUBOP>(op);
-  } else if (msg_type == MSG_OSD_REPOP) {
-    sub_op_modify_impl<MOSDRepOp, MSG_OSD_REPOP>(op);
-  } else {
-    assert(0);
-  }
-}
-
-template<typename T, int MSGTYPE>
-void ReplicatedBackend::sub_op_modify_impl(OpRequestRef op)
+void ReplicatedBackend::sub_op_modify(OpRequestRef op)
 {
-  T *m = static_cast<T *>(op->get_req());
+  MOSDRepOp *m = static_cast<MOSDRepOp *>(op->get_req());
+  m->finish_decode();
   int msg_type = m->get_type();
-  assert(MSGTYPE == msg_type);
-  assert(msg_type == MSG_OSD_SUBOP || msg_type == MSG_OSD_REPOP);
+  assert(MSG_OSD_REPOP == msg_type);
 
   const hobject_t& soid = m->poid;
 
@@ -1141,7 +1108,7 @@ void ReplicatedBackend::sub_op_modify_impl(OpRequestRef op)
 
   op->mark_started();
 
-  RepModifyRef rm(new RepModify);
+  RepModifyRef rm(std::make_shared<RepModify>());
   rm->op = op;
   rm->ackerosd = ackerosd;
   rm->last_complete = get_info().last_complete;
@@ -1153,19 +1120,17 @@ void ReplicatedBackend::sub_op_modify_impl(OpRequestRef op)
 
   bufferlist::iterator p = m->get_data().begin();
   ::decode(rm->opt, p);
-  rm->localt.set_use_tbl(rm->opt.get_use_tbl());
 
   if (m->new_temp_oid != hobject_t()) {
     dout(20) << __func__ << " start tracking temp " << m->new_temp_oid << dendl;
     add_temp_obj(m->new_temp_oid);
-    get_temp_coll(&rm->localt);
   }
   if (m->discard_temp_oid != hobject_t()) {
     dout(20) << __func__ << " stop tracking temp " << m->discard_temp_oid << dendl;
     if (rm->opt.empty()) {
       dout(10) << __func__ << ": removing object " << m->discard_temp_oid
 	       << " since we won't get the transaction" << dendl;
-      rm->localt.remove(temp_coll, m->discard_temp_oid);
+      rm->localt.remove(coll, ghobject_t(m->discard_temp_oid));
     }
     clear_temp_obj(m->discard_temp_oid);
   }
@@ -1189,20 +1154,19 @@ void ReplicatedBackend::sub_op_modify_impl(OpRequestRef op)
     m->pg_trim_to,
     m->pg_trim_rollback_to,
     update_snaps,
-    &(rm->localt));
+    rm->localt);
 
-  rm->bytes_written = rm->opt.get_encoded_bytes();
-
-  op->mark_started();
-
-  rm->localt.append(rm->opt);
-  rm->localt.register_on_commit(
+  rm->opt.register_on_commit(
     parent->bless_context(
       new C_OSD_RepModifyCommit(this, rm)));
   rm->localt.register_on_applied(
     parent->bless_context(
       new C_OSD_RepModifyApply(this, rm)));
-  parent->queue_transaction(&(rm->localt), op);
+  vector<ObjectStore::Transaction> tls;
+  tls.reserve(2);
+  tls.push_back(std::move(rm->localt));
+  tls.push_back(std::move(rm->opt));
+  parent->queue_transactions(tls, op);
   // op is cleaned up by oncommit/onapply when both are executed
 }
 
@@ -1261,7 +1225,7 @@ void ReplicatedBackend::sub_op_modify_commit(RepModifyRef rm)
   get_parent()->update_last_complete_ondisk(rm->last_complete);
 
   Message *m = rm->op->get_req();
-  Message *commit;
+  Message *commit = NULL;
   if (m->get_type() == MSG_OSD_SUBOP) {
     // doesn't have CLIENT SUBOP feature ,use Subop
     MOSDSubOpReply  *reply = new MOSDSubOpReply(
@@ -1297,7 +1261,7 @@ void ReplicatedBackend::calc_head_subsets(
   const pg_missing_t& missing,
   const hobject_t &last_backfill,
   interval_set<uint64_t>& data_subset,
-  map<hobject_t, interval_set<uint64_t> >& clone_subsets)
+  map<hobject_t, interval_set<uint64_t>, hobject_t::BitwiseComparator>& clone_subsets)
 {
   dout(10) << "calc_head_subsets " << head
 	   << " clone_overlap " << snapset.clone_overlap << dendl;
@@ -1326,7 +1290,8 @@ void ReplicatedBackend::calc_head_subsets(
     hobject_t c = head;
     c.snap = snapset.clones[j];
     prev.intersection_of(snapset.clone_overlap[snapset.clones[j]]);
-    if (!missing.is_missing(c) && c < last_backfill) {
+    if (!missing.is_missing(c) &&
+	cmp(c, last_backfill, get_parent()->sort_bitwise()) < 0) {
       dout(10) << "calc_head_subsets " << head << " has prev " << c
 	       << " overlap " << prev << dendl;
       clone_subsets[c] = prev;
@@ -1357,7 +1322,7 @@ void ReplicatedBackend::calc_clone_subsets(
   const pg_missing_t& missing,
   const hobject_t &last_backfill,
   interval_set<uint64_t>& data_subset,
-  map<hobject_t, interval_set<uint64_t> >& clone_subsets)
+  map<hobject_t, interval_set<uint64_t>, hobject_t::BitwiseComparator>& clone_subsets)
 {
   dout(10) << "calc_clone_subsets " << soid
 	   << " clone_overlap " << snapset.clone_overlap << dendl;
@@ -1390,7 +1355,8 @@ void ReplicatedBackend::calc_clone_subsets(
     hobject_t c = soid;
     c.snap = snapset.clones[j];
     prev.intersection_of(snapset.clone_overlap[snapset.clones[j]]);
-    if (!missing.is_missing(c) && c < last_backfill) {
+    if (!missing.is_missing(c) &&
+	cmp(c, last_backfill, get_parent()->sort_bitwise()) < 0) {
       dout(10) << "calc_clone_subsets " << soid << " has prev " << c
 	       << " overlap " << prev << dendl;
       clone_subsets[c] = prev;
@@ -1409,7 +1375,8 @@ void ReplicatedBackend::calc_clone_subsets(
     hobject_t c = soid;
     c.snap = snapset.clones[j];
     next.intersection_of(snapset.clone_overlap[snapset.clones[j-1]]);
-    if (!missing.is_missing(c) && c < last_backfill) {
+    if (!missing.is_missing(c) &&
+	cmp(c, last_backfill, get_parent()->sort_bitwise()) < 0) {
       dout(10) << "calc_clone_subsets " << soid << " has next " << c
 	       << " overlap " << next << dendl;
       clone_subsets[c] = next;
@@ -1445,11 +1412,11 @@ void ReplicatedBackend::prepare_pull(
   eversion_t _v = get_parent()->get_local_missing().missing.find(
     soid)->second.need;
   assert(_v == v);
-  const map<hobject_t, set<pg_shard_t> > &missing_loc(
+  const map<hobject_t, set<pg_shard_t>, hobject_t::BitwiseComparator> &missing_loc(
     get_parent()->get_missing_loc_shards());
   const map<pg_shard_t, pg_missing_t > &peer_missing(
     get_parent()->get_shard_missing());
-  map<hobject_t, set<pg_shard_t> >::const_iterator q = missing_loc.find(soid);
+  map<hobject_t, set<pg_shard_t>, hobject_t::BitwiseComparator>::const_iterator q = missing_loc.find(soid);
   assert(q != missing_loc.end());
   assert(!q->second.empty());
 
@@ -1500,6 +1467,9 @@ void ReplicatedBackend::prepare_pull(
 		       recovery_info.clone_subset);
     // FIXME: this may overestimate if we are pulling multiple clones in parallel...
     dout(10) << " pulling " << recovery_info << dendl;
+
+    assert(ssc->snapset.clone_size.count(soid.snap));
+    recovery_info.size = ssc->snapset.clone_size[soid.snap];
   } else {
     // pulling head or unversioned object.
     // always pull the whole thing.
@@ -1525,6 +1495,7 @@ void ReplicatedBackend::prepare_pull(
   pi.head_ctx = headctx;
   pi.recovery_info = op.recovery_info;
   pi.recovery_progress = op.recovery_progress;
+  pi.cache_dont_need = h->cache_dont_need;
 }
 
 /*
@@ -1533,7 +1504,7 @@ void ReplicatedBackend::prepare_pull(
  */
 void ReplicatedBackend::prep_push_to_replica(
   ObjectContextRef obc, const hobject_t& soid, pg_shard_t peer,
-  PushOp *pop)
+  PushOp *pop, bool cache_dont_need)
 {
   const object_info_t& oi = obc->obs.oi;
   uint64_t size = obc->obs.oi.size;
@@ -1541,7 +1512,7 @@ void ReplicatedBackend::prep_push_to_replica(
   dout(10) << __func__ << ": " << soid << " v" << oi.version
 	   << " size " << size << " to osd." << peer << dendl;
 
-  map<hobject_t, interval_set<uint64_t> > clone_subsets;
+  map<hobject_t, interval_set<uint64_t>, hobject_t::BitwiseComparator> clone_subsets;
   interval_set<uint64_t> data_subset;
 
   // are we doing a clone on the replica?
@@ -1553,14 +1524,14 @@ void ReplicatedBackend::prep_push_to_replica(
     // we need the head (and current SnapSet) locally to do that.
     if (get_parent()->get_local_missing().is_missing(head)) {
       dout(15) << "push_to_replica missing head " << head << ", pushing raw clone" << dendl;
-      return prep_push(obc, soid, peer, pop);
+      return prep_push(obc, soid, peer, pop, cache_dont_need);
     }
     hobject_t snapdir = head;
     snapdir.snap = CEPH_SNAPDIR;
     if (get_parent()->get_local_missing().is_missing(snapdir)) {
       dout(15) << "push_to_replica missing snapdir " << snapdir
 	       << ", pushing raw clone" << dendl;
-      return prep_push(obc, soid, peer, pop);
+      return prep_push(obc, soid, peer, pop, cache_dont_need);
     }
 
     SnapSetContext *ssc = obc->ssc;
@@ -1589,21 +1560,21 @@ void ReplicatedBackend::prep_push_to_replica(
       data_subset, clone_subsets);
   }
 
-  prep_push(obc, soid, peer, oi.version, data_subset, clone_subsets, pop);
+  prep_push(obc, soid, peer, oi.version, data_subset, clone_subsets, pop, cache_dont_need);
 }
 
 void ReplicatedBackend::prep_push(ObjectContextRef obc,
 			     const hobject_t& soid, pg_shard_t peer,
-			     PushOp *pop)
+			     PushOp *pop, bool cache_dont_need)
 {
   interval_set<uint64_t> data_subset;
   if (obc->obs.oi.size)
     data_subset.insert(0, obc->obs.oi.size);
-  map<hobject_t, interval_set<uint64_t> > clone_subsets;
+  map<hobject_t, interval_set<uint64_t>, hobject_t::BitwiseComparator> clone_subsets;
 
   prep_push(obc, soid, peer,
 	    obc->obs.oi.version, data_subset, clone_subsets,
-	    pop);
+	    pop, cache_dont_need);
 }
 
 void ReplicatedBackend::prep_push(
@@ -1611,8 +1582,9 @@ void ReplicatedBackend::prep_push(
   const hobject_t& soid, pg_shard_t peer,
   eversion_t version,
   interval_set<uint64_t> &data_subset,
-  map<hobject_t, interval_set<uint64_t> >& clone_subsets,
-  PushOp *pop)
+  map<hobject_t, interval_set<uint64_t>, hobject_t::BitwiseComparator>& clone_subsets,
+  PushOp *pop,
+  bool cache_dont_need)
 {
   get_parent()->begin_peer_recover(peer, soid);
   // take note.
@@ -1634,7 +1606,7 @@ void ReplicatedBackend::prep_push(
 			pi.recovery_progress,
 			&new_progress,
 			pop,
-			&(pi.stat));
+			&(pi.stat), cache_dont_need);
   assert(r == 0);
   pi.recovery_progress = new_progress;
 }
@@ -1678,6 +1650,7 @@ void ReplicatedBackend::submit_push_data(
   ObjectRecoveryInfo &recovery_info,
   bool first,
   bool complete,
+  bool cache_dont_need,
   const interval_set<uint64_t> &intervals_included,
   bufferlist data_included,
   bufferlist omap_header,
@@ -1685,45 +1658,52 @@ void ReplicatedBackend::submit_push_data(
   map<string, bufferlist> &omap_entries,
   ObjectStore::Transaction *t)
 {
-  coll_t target_coll;
+  hobject_t target_oid;
   if (first && complete) {
-    target_coll = coll;
+    target_oid = recovery_info.soid;
   } else {
-    dout(10) << __func__ << ": Creating oid "
-	     << recovery_info.soid << " in the temp collection" << dendl;
-    add_temp_obj(recovery_info.soid);
-    target_coll = get_temp_coll(t);
+    target_oid = get_parent()->get_temp_recovery_object(recovery_info.version,
+							recovery_info.soid.snap);
+    if (first) {
+      dout(10) << __func__ << ": Adding oid "
+	       << target_oid << " in the temp collection" << dendl;
+      add_temp_obj(target_oid);
+    }
   }
 
   if (first) {
-    get_parent()->on_local_recover_start(recovery_info.soid, t);
-    t->remove(get_temp_coll(t), recovery_info.soid);
-    t->touch(target_coll, recovery_info.soid);
-    t->truncate(target_coll, recovery_info.soid, recovery_info.size);
-    t->omap_setheader(target_coll, recovery_info.soid, omap_header);
+    t->remove(coll, ghobject_t(target_oid));
+    t->touch(coll, ghobject_t(target_oid));
+    t->truncate(coll, ghobject_t(target_oid), recovery_info.size);
+    t->omap_setheader(coll, ghobject_t(target_oid), omap_header);
   }
   uint64_t off = 0;
+  uint32_t fadvise_flags = CEPH_OSD_OP_FLAG_FADVISE_SEQUENTIAL;
+  if (cache_dont_need)
+    fadvise_flags |= CEPH_OSD_OP_FLAG_FADVISE_DONTNEED;
   for (interval_set<uint64_t>::const_iterator p = intervals_included.begin();
        p != intervals_included.end();
        ++p) {
     bufferlist bit;
     bit.substr_of(data_included, off, p.get_len());
-    t->write(target_coll, recovery_info.soid,
-	     p.get_start(), p.get_len(), bit);
+    t->write(coll, ghobject_t(target_oid),
+	     p.get_start(), p.get_len(), bit, fadvise_flags);
     off += p.get_len();
   }
 
-  t->omap_setkeys(target_coll, recovery_info.soid,
-		  omap_entries);
-  t->setattrs(target_coll, recovery_info.soid,
-	      attrs);
+  if (!omap_entries.empty())
+    t->omap_setkeys(coll, ghobject_t(target_oid), omap_entries);
+  if (!attrs.empty())
+    t->setattrs(coll, ghobject_t(target_oid), attrs);
 
   if (complete) {
     if (!first) {
       dout(10) << __func__ << ": Removing oid "
-	       << recovery_info.soid << " from the temp collection" << dendl;
-      clear_temp_obj(recovery_info.soid);
-      t->collection_move(coll, target_coll, recovery_info.soid);
+	       << target_oid << " from the temp collection" << dendl;
+      clear_temp_obj(target_oid);
+      t->remove(coll, ghobject_t(recovery_info.soid));
+      t->collection_move_rename(coll, ghobject_t(target_oid),
+				coll, ghobject_t(recovery_info.soid));
     }
 
     submit_push_complete(recovery_info, t);
@@ -1733,7 +1713,7 @@ void ReplicatedBackend::submit_push_data(
 void ReplicatedBackend::submit_push_complete(ObjectRecoveryInfo &recovery_info,
 					     ObjectStore::Transaction *t)
 {
-  for (map<hobject_t, interval_set<uint64_t> >::const_iterator p =
+  for (map<hobject_t, interval_set<uint64_t>, hobject_t::BitwiseComparator>::const_iterator p =
 	 recovery_info.clone_subset.begin();
        p != recovery_info.clone_subset.end();
        ++p) {
@@ -1742,7 +1722,7 @@ void ReplicatedBackend::submit_push_complete(ObjectRecoveryInfo &recovery_info,
 	 ++q) {
       dout(15) << " clone_range " << p->first << " "
 	       << q.get_start() << "~" << q.get_len() << dendl;
-      t->clone_range(coll, p->first, recovery_info.soid,
+      t->clone_range(coll, ghobject_t(p->first), ghobject_t(recovery_info.soid),
 		     q.get_start(), q.get_len(), q.get_start());
     }
   }
@@ -1802,6 +1782,15 @@ bool ReplicatedBackend::handle_pull_response(
 
   bool first = pi.recovery_progress.first;
   if (first) {
+    // attrs only reference the origin bufferlist (decode from MOSDPGPush message)
+    // whose size is much greater than attrs in recovery. If obc cache it (get_obc maybe
+    // cache the attr), this causes the whole origin bufferlist would not be free until
+    // obc is evicted from obc cache. So rebuild the bufferlist before cache it.
+    for (map<string, bufferlist>::iterator it = pop.attrset.begin();
+         it != pop.attrset.end();
+         ++it) {
+      it->second.rebuild();
+    }
     pi.obc = get_parent()->get_obc(pi.recovery_info.soid, pop.attrset);
     pi.recovery_info.oi = pi.obc->obs.oi;
     pi.recovery_info = recalc_subsets(pi.recovery_info, pi.obc->ssc);
@@ -1821,8 +1810,6 @@ bool ReplicatedBackend::handle_pull_response(
 
   pi.recovery_progress = pop.after_progress;
 
-  pi.stat.num_bytes_recovered += data.length();
-
   dout(10) << "new recovery_info " << pi.recovery_info
 	   << ", new progress " << pi.recovery_progress
 	   << dendl;
@@ -1830,7 +1817,7 @@ bool ReplicatedBackend::handle_pull_response(
   bool complete = pi.is_complete();
 
   submit_push_data(pi.recovery_info, first,
-		   complete,
+		   complete, pi.cache_dont_need,
 		   data_included, data,
 		   pop.omap_header,
 		   pop.attrset,
@@ -1838,12 +1825,13 @@ bool ReplicatedBackend::handle_pull_response(
 		   t);
 
   pi.stat.num_keys_recovered += pop.omap_entries.size();
+  pi.stat.num_bytes_recovered += data.length();
 
   if (complete) {
-    to_continue->push_back(hoid);
     pi.stat.num_objects_recovered++;
+    to_continue->push_back(hoid);
     get_parent()->on_local_recover(
-      hoid, pi.stat, pi.recovery_info, pi.obc, t);
+      hoid, pi.recovery_info, pi.obc, t);
     pull_from_peer[from].erase(hoid);
     if (pull_from_peer[from].empty())
       pull_from_peer.erase(from);
@@ -1874,6 +1862,7 @@ void ReplicatedBackend::handle_push(
   submit_push_data(pop.recovery_info,
 		   first,
 		   complete,
+		   true, // must be replicate
 		   pop.data_included,
 		   data,
 		   pop.omap_header,
@@ -1884,7 +1873,6 @@ void ReplicatedBackend::handle_push(
   if (complete)
     get_parent()->on_local_recover(
       pop.recovery_info.soid,
-      object_stat_sum_t(),
       pop.recovery_info,
       ObjectContextRef(), // ok, is replica
       t);
@@ -1900,38 +1888,28 @@ void ReplicatedBackend::send_pushes(int prio, map<pg_shard_t, vector<PushOp> > &
       get_osdmap()->get_epoch());
     if (!con)
       continue;
-    if (!(con->get_features() & CEPH_FEATURE_OSD_PACKED_RECOVERY)) {
-      for (vector<PushOp>::iterator j = i->second.begin();
-	   j != i->second.end();
+    vector<PushOp>::iterator j = i->second.begin();
+    while (j != i->second.end()) {
+      uint64_t cost = 0;
+      uint64_t pushes = 0;
+      MOSDPGPush *msg = new MOSDPGPush();
+      msg->from = get_parent()->whoami_shard();
+      msg->pgid = get_parent()->primary_spg_t();
+      msg->map_epoch = get_osdmap()->get_epoch();
+      msg->set_priority(prio);
+      for (;
+           (j != i->second.end() &&
+	    cost < cct->_conf->osd_max_push_cost &&
+	    pushes < cct->_conf->osd_max_push_objects) ;
 	   ++j) {
-	dout(20) << __func__ << ": sending push (legacy) " << *j
+	dout(20) << __func__ << ": sending push " << *j
 		 << " to osd." << i->first << dendl;
-	send_push_op_legacy(prio, i->first, *j);
+	cost += j->cost(cct);
+	pushes += 1;
+	msg->pushes.push_back(*j);
       }
-    } else {
-      vector<PushOp>::iterator j = i->second.begin();
-      while (j != i->second.end()) {
-	uint64_t cost = 0;
-	uint64_t pushes = 0;
-	MOSDPGPush *msg = new MOSDPGPush();
-	msg->from = get_parent()->whoami_shard();
-	msg->pgid = get_parent()->primary_spg_t();
-	msg->map_epoch = get_osdmap()->get_epoch();
-	msg->set_priority(prio);
-	for (;
-	     (j != i->second.end() &&
-	      cost < cct->_conf->osd_max_push_cost &&
-	      pushes < cct->_conf->osd_max_push_objects) ;
-	     ++j) {
-	  dout(20) << __func__ << ": sending push " << *j
-		   << " to osd." << i->first << dendl;
-	  cost += j->cost(cct);
-	  pushes += 1;
-	  msg->pushes.push_back(*j);
-	}
-	msg->compute_cost(cct);
-	get_parent()->send_message_osd_cluster(msg, con);
-      }
+      msg->compute_cost(cct);
+      get_parent()->send_message_osd_cluster(msg, con);
     }
   }
 }
@@ -1946,30 +1924,16 @@ void ReplicatedBackend::send_pulls(int prio, map<pg_shard_t, vector<PullOp> > &p
       get_osdmap()->get_epoch());
     if (!con)
       continue;
-    if (!(con->get_features() & CEPH_FEATURE_OSD_PACKED_RECOVERY)) {
-      for (vector<PullOp>::iterator j = i->second.begin();
-	   j != i->second.end();
-	   ++j) {
-	dout(20) << __func__ << ": sending pull (legacy) " << *j
-		 << " to osd." << i->first << dendl;
-	send_pull_legacy(
-	  prio,
-	  i->first,
-	  j->recovery_info,
-	  j->recovery_progress);
-      }
-    } else {
-      dout(20) << __func__ << ": sending pulls " << i->second
-	       << " to osd." << i->first << dendl;
-      MOSDPGPull *msg = new MOSDPGPull();
-      msg->from = parent->whoami_shard();
-      msg->set_priority(prio);
-      msg->pgid = get_parent()->primary_spg_t();
-      msg->map_epoch = get_osdmap()->get_epoch();
-      msg->pulls.swap(i->second);
-      msg->compute_cost(cct);
-      get_parent()->send_message_osd_cluster(msg, con);
-    }
+    dout(20) << __func__ << ": sending pulls " << i->second
+	     << " to osd." << i->first << dendl;
+    MOSDPGPull *msg = new MOSDPGPull();
+    msg->from = parent->whoami_shard();
+    msg->set_priority(prio);
+    msg->pgid = get_parent()->primary_spg_t();
+    msg->map_epoch = get_osdmap()->get_epoch();
+    msg->pulls.swap(i->second);
+    msg->compute_cost(cct);
+    get_parent()->send_message_osd_cluster(msg, con);
   }
 }
 
@@ -1977,7 +1941,8 @@ int ReplicatedBackend::build_push_op(const ObjectRecoveryInfo &recovery_info,
 				     const ObjectRecoveryProgress &progress,
 				     ObjectRecoveryProgress *out_progress,
 				     PushOp *out_op,
-				     object_stat_sum_t *stat)
+				     object_stat_sum_t *stat,
+                                     bool cache_dont_need)
 {
   ObjectRecoveryProgress _new_progress;
   if (!out_progress)
@@ -1992,8 +1957,8 @@ int ReplicatedBackend::build_push_op(const ObjectRecoveryInfo &recovery_info,
           << dendl;
 
   if (progress.first) {
-    store->omap_get_header(coll, recovery_info.soid, &out_op->omap_header);
-    store->getattrs(coll, recovery_info.soid, out_op->attrset);
+    store->omap_get_header(coll, ghobject_t(recovery_info.soid), &out_op->omap_header);
+    store->getattrs(ch, ghobject_t(recovery_info.soid), out_op->attrset);
 
     // Debug
     bufferlist bv = out_op->attrset[OI_ATTR];
@@ -2015,10 +1980,10 @@ int ReplicatedBackend::build_push_op(const ObjectRecoveryInfo &recovery_info,
   if (!progress.omap_complete) {
     ObjectMap::ObjectMapIterator iter =
       store->get_omap_iterator(coll,
-			       recovery_info.soid);
+			       ghobject_t(recovery_info.soid));
     for (iter->lower_bound(progress.omap_recovered_to);
 	 iter->valid();
-	 iter->next()) {
+	 iter->next(false)) {
       if (!out_op->omap_entries.empty() &&
 	  available <= (iter->key().size() + iter->value().length()))
 	break;
@@ -2039,7 +2004,7 @@ int ReplicatedBackend::build_push_op(const ObjectRecoveryInfo &recovery_info,
     if (!recovery_info.copy_subset.empty()) {
       interval_set<uint64_t> copy_subset = recovery_info.copy_subset;
       bufferlist bl;
-      int r = store->fiemap(coll, recovery_info.soid, 0,
+      int r = store->fiemap(ch, ghobject_t(recovery_info.soid), 0,
                             copy_subset.range_end(), bl);
       if (r >= 0)  {
         interval_set<uint64_t> fiemap_included;
@@ -2068,8 +2033,9 @@ int ReplicatedBackend::build_push_op(const ObjectRecoveryInfo &recovery_info,
        p != out_op->data_included.end();
        ++p) {
     bufferlist bit;
-    store->read(coll, recovery_info.soid,
-		     p.get_start(), p.get_len(), bit);
+    store->read(ch, ghobject_t(recovery_info.soid),
+		p.get_start(), p.get_len(), bit,
+                cache_dont_need ? CEPH_OSD_OP_FLAG_FADVISE_DONTNEED: 0);
     if (p.get_len() != bit.length()) {
       dout(10) << " extent " << p.get_start() << "~" << p.get_len()
 	       << " is actually " << p.get_start() << "~" << bit.length()
@@ -2199,12 +2165,17 @@ bool ReplicatedBackend::handle_push_reply(pg_shard_t peer, PushReplyOp &op, Push
 	peer, soid, pi->recovery_info,
 	pi->stat);
 
+      object_stat_sum_t stat;
+      stat.num_bytes_recovered = pi->recovery_info.size;
+      stat.num_keys_recovered = reply->omap_entries.size();
+      stat.num_objects_recovered = 1;
+
       pushing[soid].erase(peer);
       pi = NULL;
 
 
       if (pushing[soid].empty()) {
-	get_parent()->on_global_recover(soid);
+	get_parent()->on_global_recover(soid, stat);
 	pushing.erase(soid);
       } else {
 	dout(10) << "pushed " << soid << ", still waiting for push ack from "
@@ -2253,7 +2224,7 @@ void ReplicatedBackend::handle_pull(pg_shard_t peer, PullOp &op, PushOp *reply)
 {
   const hobject_t &soid = op.soid;
   struct stat st;
-  int r = store->stat(coll, soid, &st);
+  int r = store->stat(ch, ghobject_t(soid), &st);
   if (r != 0) {
     get_parent()->clog_error() << get_info().pgid << " "
 			       << peer << " tried to pull " << soid
@@ -2340,7 +2311,7 @@ void ReplicatedBackend::sub_op_push(OpRequestRef op)
   pop.recovery_info = m->recovery_info;
   pop.before_progress = m->current_progress;
   pop.after_progress = m->recovery_progress;
-  ObjectStore::Transaction *t = new ObjectStore::Transaction;
+  ObjectStore::Transaction t;
 
   if (is_primary()) {
     PullOp resp;
@@ -2348,7 +2319,7 @@ void ReplicatedBackend::sub_op_push(OpRequestRef op)
     list<hobject_t> to_continue;
     bool more = handle_pull_response(
       m->from, pop, &resp,
-      &to_continue, t);
+      &to_continue, &t);
     if (more) {
       send_pull_legacy(
 	m->get_priority(),
@@ -2361,7 +2332,7 @@ void ReplicatedBackend::sub_op_push(OpRequestRef op)
 	  this,
 	  op->get_req()->get_priority());
       c->to_continue.swap(to_continue);
-      t->register_on_complete(
+      t.register_on_complete(
 	new PG_RecoveryQueueAsync(
 	  get_parent(),
 	  get_parent()->bless_gencontext(c)));
@@ -2374,13 +2345,11 @@ void ReplicatedBackend::sub_op_push(OpRequestRef op)
       get_osdmap()->get_epoch(), CEPH_OSD_FLAG_ACK);
     reply->set_priority(m->get_priority());
     assert(entity_name_t::TYPE_OSD == m->get_connection()->peer_type);
-    handle_push(m->from, pop, &resp, t);
-    t->register_on_complete(new PG_SendMessageOnConn(
+    handle_push(m->from, pop, &resp, &t);
+    t.register_on_complete(new PG_SendMessageOnConn(
 			      get_parent(), reply, m->get_connection()));
   }
-  t->register_on_applied(
-    new ObjectStore::C_DeleteTransaction(t));
-  get_parent()->queue_transaction(t);
+  get_parent()->queue_transaction(std::move(t));
   return;
 }
 
@@ -2414,8 +2383,7 @@ int ReplicatedBackend::start_pushes(
       ++pushes;
       h->pushes[peer].push_back(PushOp());
       prep_push_to_replica(obc, soid, peer,
-			   &(h->pushes[peer].back())
-	);
+			   &(h->pushes[peer].back()), h->cache_dont_need);
     }
   }
   return pushes;

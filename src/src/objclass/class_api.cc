@@ -6,6 +6,7 @@
 
 #include "objclass/objclass.h"
 #include "osd/ReplicatedPG.h"
+#include "osd/osd_types.h"
 
 #include "osd/ClassHandler.h"
 
@@ -80,6 +81,25 @@ int cls_unregister_method(cls_method_handle_t handle)
   ClassHandler::ClassMethod *method = (ClassHandler::ClassMethod *)handle;
   method->unregister();
   return 1;
+}
+
+int cls_register_cxx_filter(cls_handle_t hclass,
+                            const std::string &filter_name,
+                            cls_cxx_filter_factory_t fn,
+                            cls_filter_handle_t *handle)
+{
+  ClassHandler::ClassData *cls = (ClassHandler::ClassData *)hclass;
+  cls_filter_handle_t hfilter = (cls_filter_handle_t)cls->register_cxx_filter(filter_name, fn);
+  if (handle) {
+    *handle = hfilter;
+  }
+  return (hfilter != NULL);
+}
+
+void cls_unregister_filter(cls_filter_handle_t handle)
+{
+  ClassHandler::ClassFilter *filter = (ClassHandler::ClassFilter *)handle;
+  filter->unregister();
 }
 
 int cls_call(cls_method_context_t hctx, const char *cls, const char *method,
@@ -223,7 +243,38 @@ int cls_cxx_stat(cls_method_context_t hctx, uint64_t *size, time_t *mtime)
   return 0;
 }
 
+int cls_cxx_stat2(cls_method_context_t hctx, uint64_t *size, ceph::real_time *mtime)
+{
+  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  vector<OSDOp> ops(1);
+  int ret;
+  ops[0].op.op = CEPH_OSD_OP_STAT;
+  ret = (*pctx)->pg->do_osd_ops(*pctx, ops);
+  if (ret < 0)
+    return ret;
+  bufferlist::iterator iter = ops[0].outdata.begin();
+  real_time ut;
+  uint64_t s;
+  try {
+    ::decode(s, iter);
+    ::decode(ut, iter);
+  } catch (buffer::error& err) {
+    return -EIO;
+  }
+  if (size)
+    *size = s;
+  if (mtime)
+    *mtime = ut;
+  return 0;
+}
+
 int cls_cxx_read(cls_method_context_t hctx, int ofs, int len, bufferlist *outbl)
+{
+  return cls_cxx_read2(hctx, ofs, len, outbl, 0);
+}
+
+int cls_cxx_read2(cls_method_context_t hctx, int ofs, int len,
+                  bufferlist *outbl, uint32_t op_flags)
 {
   ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
   vector<OSDOp> ops(1);
@@ -231,6 +282,7 @@ int cls_cxx_read(cls_method_context_t hctx, int ofs, int len, bufferlist *outbl)
   ops[0].op.op = CEPH_OSD_OP_SYNC_READ;
   ops[0].op.extent.offset = ofs;
   ops[0].op.extent.length = len;
+  ops[0].op.flags = op_flags;
   ret = (*pctx)->pg->do_osd_ops(*pctx, ops);
   if (ret < 0)
     return ret;
@@ -240,11 +292,18 @@ int cls_cxx_read(cls_method_context_t hctx, int ofs, int len, bufferlist *outbl)
 
 int cls_cxx_write(cls_method_context_t hctx, int ofs, int len, bufferlist *inbl)
 {
+  return cls_cxx_write2(hctx, ofs, len, inbl, 0);
+}
+
+int cls_cxx_write2(cls_method_context_t hctx, int ofs, int len,
+                   bufferlist *inbl, uint32_t op_flags)
+{
   ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
   vector<OSDOp> ops(1);
   ops[0].op.op = CEPH_OSD_OP_WRITE;
   ops[0].op.extent.offset = ofs;
   ops[0].op.extent.length = len;
+  ops[0].op.flags = op_flags;
   ops[0].indata = *inbl;
   return (*pctx)->pg->do_osd_ops(*pctx, ops);
 }
@@ -548,6 +607,28 @@ int cls_cxx_map_remove_key(cls_method_context_t hctx, const string &key)
   return (*pctx)->pg->do_osd_ops(*pctx, ops);
 }
 
+int cls_cxx_list_watchers(cls_method_context_t hctx,
+			  obj_list_watch_response_t *watchers)
+{
+  ReplicatedPG::OpContext **pctx = (ReplicatedPG::OpContext **)hctx;
+  vector<OSDOp> nops(1);
+  OSDOp& op = nops[0];
+  int r;
+
+  op.op.op = CEPH_OSD_OP_LIST_WATCHERS;
+  r = (*pctx)->pg->do_osd_ops(*pctx, nops);
+  if (r < 0)
+    return r;
+
+  bufferlist::iterator iter = op.outdata.begin();
+  try {
+    ::decode(*watchers, iter);
+  } catch (buffer::error& err) {
+    return -EIO;
+  }
+  return 0;
+}
+
 int cls_gen_random_bytes(char *buf, int size)
 {
   return get_random_bytes(buf, size);
@@ -573,7 +654,7 @@ int cls_gen_rand_base64(char *dest, int size) /* size should be the required str
   }
   tmp_dest[ret] = '\0';
   memcpy(dest, tmp_dest, size);
-  dest[size] = '\0';
+  dest[size-1] = '\0';
 
   return 0;
 }

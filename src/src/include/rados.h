@@ -143,6 +143,8 @@ extern const char *ceph_osd_state_name(int s);
 #define CEPH_OSDMAP_NODEEP_SCRUB (1<<12) /* block periodic deep-scrub */
 #define CEPH_OSDMAP_NOTIERAGENT (1<<13) /* disable tiering agent */
 #define CEPH_OSDMAP_NOREBALANCE (1<<14) /* block osd backfill unless pg is degraded */
+#define CEPH_OSDMAP_SORTBITWISE (1<<15) /* use bitwise hobject_t sort */
+#define CEPH_OSDMAP_REQUIRE_JEWEL (1<<16) /* require jewel for booting osds */
 
 /*
  * The error code to return when an OSD can't handle a write
@@ -165,7 +167,6 @@ extern const char *ceph_osd_state_name(int s);
 #define CEPH_OSD_OP_MODE_CACHE 0x8000
 
 #define CEPH_OSD_OP_TYPE       0x0f00
-#define CEPH_OSD_OP_TYPE_LOCK  0x0100
 #define CEPH_OSD_OP_TYPE_DATA  0x0200
 #define CEPH_OSD_OP_TYPE_ATTR  0x0300
 #define CEPH_OSD_OP_TYPE_EXEC  0x0400
@@ -250,6 +251,10 @@ extern const char *ceph_osd_state_name(int s);
 									    \
 	/* hints */							    \
 	f(SETALLOCHINT,	__CEPH_OSD_OP(WR, DATA, 35),	"set-alloc-hint")   \
+                                                                            \
+	/* cache pin/unpin */						    \
+	f(CACHE_PIN,	__CEPH_OSD_OP(WR, DATA, 36),	"cache-pin")        \
+	f(CACHE_UNPIN,	__CEPH_OSD_OP(WR, DATA, 37),	"cache-unpin")      \
 									    \
 	/** multi **/							    \
 	f(CLONERANGE,	__CEPH_OSD_OP(WR, MULTI, 1),	"clonerange")	    \
@@ -279,14 +284,6 @@ extern const char *ceph_osd_state_name(int s);
 	f(SCRUB_STOP,	__CEPH_OSD_OP1(SUB, 8),		"scrub-stop")	    \
 	f(SCRUB_MAP,	__CEPH_OSD_OP1(SUB, 9),		"scrub-map")	    \
 									    \
-	/** lock **/							    \
-	f(WRLOCK,	__CEPH_OSD_OP(WR, LOCK, 1),	"wrlock")	    \
-	f(WRUNLOCK,	__CEPH_OSD_OP(WR, LOCK, 2),	"wrunlock")	    \
-	f(RDLOCK,	__CEPH_OSD_OP(WR, LOCK, 3),	"rdlock")	    \
-	f(RDUNLOCK,	__CEPH_OSD_OP(WR, LOCK, 4),	"rdunlock")	    \
-	f(UPLOCK,	__CEPH_OSD_OP(WR, LOCK, 5),	"uplock")	    \
-	f(DNLOCK,	__CEPH_OSD_OP(WR, LOCK, 6),	"dnlock")	    \
-									    \
 	/** exec **/							    \
 	/* note: the RD bit here is wrong; see special-case below in helper */ \
 	f(CALL,		__CEPH_OSD_OP(RD, EXEC, 1),	"call")		    \
@@ -297,7 +294,8 @@ extern const char *ceph_osd_state_name(int s);
 	f(PG_HITSET_LS,	__CEPH_OSD_OP(RD, PG, 3),	"pg-hitset-ls")	    \
 	f(PG_HITSET_GET, __CEPH_OSD_OP(RD, PG, 4),	"pg-hitset-get")    \
 	f(PGNLS,	__CEPH_OSD_OP(RD, PG, 5),	"pgnls")	    \
-	f(PGNLS_FILTER,	__CEPH_OSD_OP(RD, PG, 6),	"pgnls-filter")
+	f(PGNLS_FILTER,	__CEPH_OSD_OP(RD, PG, 6),	"pgnls-filter")     \
+	f(SCRUBLS, __CEPH_OSD_OP(RD, PG, 7), "scrubls")
 
 enum {
 #define GENERATE_ENUM_ENTRY(op, opcode, str)	CEPH_OSD_OP_##op = (opcode),
@@ -305,10 +303,6 @@ __CEPH_FORALL_OSD_OPS(GENERATE_ENUM_ENTRY)
 #undef GENERATE_ENUM_ENTRY
 };
 
-static inline int ceph_osd_op_type_lock(int op)
-{
-	return (op & CEPH_OSD_OP_TYPE) == CEPH_OSD_OP_TYPE_LOCK;
-}
 static inline int ceph_osd_op_type_data(int op)
 {
 	return (op & CEPH_OSD_OP_TYPE) == CEPH_OSD_OP_TYPE_DATA;
@@ -410,6 +404,8 @@ enum {
 						      pool uses pool snaps */
 	CEPH_OSD_FLAG_REDIRECTED   = 0x200000,  /* op has been redirected */
 	CEPH_OSD_FLAG_KNOWN_REDIR = 0x400000,  /* redirect bit is authoritative */
+	CEPH_OSD_FLAG_FULL_TRY =    0x800000,  /* try op despite full flag */
+	CEPH_OSD_FLAG_FULL_FORCE = 0x1000000,  /* force op despite full flag */
 };
 
 enum {
@@ -446,6 +442,7 @@ enum {
 	CEPH_OSD_COPY_FROM_FLAG_IGNORE_CACHE = 4, /* ignore osd cache logic */
 	CEPH_OSD_COPY_FROM_FLAG_MAP_SNAP_CLONE = 8, /* map snap direct to
 						     * cloneid */
+	CEPH_OSD_COPY_FROM_FLAG_RWORDERED = 16, /* order with write */
 };
 
 enum {
@@ -520,6 +517,11 @@ struct ceph_osd_op {
 			__le64 snapid;
 			__le64 src_version;
 			__u8 flags;
+			/*
+			 * __le32 flags: CEPH_OSD_OP_FLAG_FADVISE_: mean the fadvise flags for dest object
+			 * src_fadvise_flags mean the fadvise flags for src object
+			 */
+			__le32 src_fadvise_flags;
 		} __attribute__ ((packed)) copy_from;
 		struct {
 			struct ceph_timespec stamp;

@@ -1,0 +1,70 @@
+From 2009a966d779240bc62f0877201aabd0cd59ac6f Mon Sep 17 00:00:00 2001
+From: Boris Ranto <branto@redhat.com>
+Date: Tue, 21 Feb 2017 13:49:01 +0100
+Subject: [PATCH] Makefile: Fix dencoder build
+
+Signed-off-by: Boris Ranto <branto@redhat.com>
+---
+ src/rgw/Makefile.am | 26 ++++----------------------
+ 1 file changed, 4 insertions(+), 22 deletions(-)
+
+diff --git a/src/rgw/Makefile.am b/src/rgw/Makefile.am
+index b083dd1..a94e4e2 100644
+--- a/src/rgw/Makefile.am
++++ b/src/rgw/Makefile.am
+@@ -1,25 +1,5 @@
+ if ENABLE_CLIENT
+-
+-# inject rgw stuff in the decoder testcase
+-DENCODER_SOURCES += \
+-	rgw/rgw_dencoder.cc \
+-	rgw/rgw_acl.cc \
+-	rgw/rgw_basic_types.cc \
+-	rgw/rgw_common.cc \
+-	rgw/rgw_env.cc \
+-	rgw/rgw_json_enc.cc \
+-	rgw/rgw_keystone.cc
+-
+-DENCODER_DEPS += -lcurl -lexpat \
+-	libcls_version_client.la \
+-	libcls_log_client.la \
+-	libcls_refcount_client.la \
+-	libcls_user_client.la \
+-	libcls_timeindex_client.la \
+-	libcls_statelog_client.la
+-
+ if WITH_RADOS
+-if WITH_RADOSGW
+ 
+ librgw_la_SOURCES = \
+ 	rgw/rgw_acl.cc \
+@@ -122,8 +102,9 @@ librgw_la_LIBADD = $(LIBRGW_DEPS) \
+ 
+ librgw_la_LDFLAGS = ${AM_LDFLAGS} -version-info 2:0:0
+ 
+-lib_LTLIBRARIES += librgw.la
++noinst_LTLIBRARIES += librgw.la
+ 
++if WITH_RADOSGW
+ CIVETWEB_INCLUDE = --include $(srcdir)/civetweb/include/civetweb_conf.h
+ 
+ libcivetweb_la_SOURCES =  \
+@@ -176,6 +157,8 @@ ceph_rgw_jsonparser_SOURCES = \
+ ceph_rgw_jsonparser_LDADD = $(LIBRGW) $(LIBRGW_DEPS) $(CEPH_GLOBAL)
+ bin_DEBUGPROGRAMS += ceph_rgw_jsonparser
+ 
++endif # WITH_RADOSGW
++
+ noinst_HEADERS += \
+ 	rgw/rgw_acl.h \
+ 	rgw/rgw_acl_s3.h \
+@@ -262,6 +245,5 @@ noinst_HEADERS += \
+ 	civetweb/include/civetweb_conf.h \
+ 	civetweb/src/md5.h
+ 
+-endif # WITH_RADOSGW
+ endif # WITH_RADOS
+ endif # ENABLE_CLIENT
+-- 
+2.9.3
+

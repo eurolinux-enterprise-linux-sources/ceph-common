@@ -7,14 +7,19 @@
 # common
 #################################################################################
 Name:		ceph-common
-Version:	0.94.5
-Release:	2%{?dist}
+Version:	10.2.5
+Release:	4%{?dist}
 Epoch:		1
 Summary:	Ceph Common
 License:	GPLv2
 Group:		System Environment/Base
 URL:		http://ceph.com/
-Source0:	http://ceph.com/download/ceph-%{version}.tar.bz2
+Source0:	http://ceph.com/download/ceph-%{version}.tar.gz
+Patch1: 0001-Makefile-Fix-dencoder-build.patch
+Patch2: 0002-Add-fake-fcgiapp.h-for-rgw.patch
+Patch3: 0003-common-Build-more-files-of-libcommon-in-client.patch
+Patch4: 0004-libradosstripper-Build-libradostripper-for-rados-as-.patch
+Patch5: 0005-A-compile-patch-for-s390.patch
 Requires:	librbd1 = %{epoch}:%{version}-%{release}
 Requires:	librados2 = %{epoch}:%{version}-%{release}
 Requires:	python-rbd = %{epoch}:%{version}-%{release}
@@ -53,6 +58,13 @@ BuildRequires:	libuuid-devel
 BuildRequires:	libblkid-devel >= 2.17
 BuildRequires:	libudev-devel
 BuildRequires:	expat-devel
+BuildRequires:	Cython
+BuildRequires:	python-devel
+BuildRequires:	python-virtualenv
+BuildRequires:	python-sphinx
+BuildRequires:	openldap-devel
+BuildRequires:	snappy-devel
+BuildRequires:	redhat-lsb-core
 %if ! ( 0%{?rhel} && 0%{?rhel} <= 6 )
 BuildRequires:	xfsprogs-devel
 %endif
@@ -161,6 +173,11 @@ block device.
 #################################################################################
 %prep
 %setup -q -n ceph-%{version}
+%patch1 -p1
+%patch2 -p1
+%patch3 -p1
+%patch4 -p1
+%patch5 -p1
 
 %build
 ./autogen.sh
@@ -180,9 +197,12 @@ MY_CONF_OPT="$MY_CONF_OPT --disable-server --without-libatomic-ops --without-tcm
 export RPM_OPT_FLAGS=`echo $RPM_OPT_FLAGS | sed -e 's/i386/i486/'`
 
 %{configure}	--prefix=/usr \
-		--localstatedir=/var \
-		--sysconfdir=/etc \
+		--libexecdir=%{_libexecdir} \
+		--localstatedir=%{_localstatedir} \
+		--sysconfdir=%{_sysconfdir} \
 		--docdir=%{_docdir}/ceph \
+		--with-man-pages \
+		--mandir="%_mandir" \
 		$MY_CONF_OPT \
 		CFLAGS="$RPM_OPT_FLAGS $EXTRA_CFLAGS" \
 		CXXFLAGS="$RPM_OPT_FLAGS $EXTRA_CFLAGS" \
@@ -194,7 +214,6 @@ make %{_smp_mflags}
 make DESTDIR=$RPM_BUILD_ROOT install
 find $RPM_BUILD_ROOT -type f -name "*.la" -exec rm -f {} ';'
 find $RPM_BUILD_ROOT -type f -name "*.a" -exec rm -f {} ';'
-install -D src/init-rbdmap $RPM_BUILD_ROOT%{_initrddir}/rbdmap
 install -D src/rbdmap $RPM_BUILD_ROOT%{_sysconfdir}/ceph/rbdmap
 rm -f $RPM_BUILD_ROOT%{_docdir}/ceph/sample.ceph.conf
 rm -f $RPM_BUILD_ROOT%{_docdir}/ceph/sample.fetch_config
@@ -204,13 +223,19 @@ rm -f $RPM_BUILD_ROOT%{_sysconfdir}/bash_completion.d/radosgw-admin
 rm -f $RPM_BUILD_ROOT%{_bindir}/crushtool
 rm -f $RPM_BUILD_ROOT%{_bindir}/monmaptool
 rm -f $RPM_BUILD_ROOT%{_bindir}/osdmaptool
-rm -f $RPM_BUILD_ROOT%{_bindir}/rbd-replay
-rm -f $RPM_BUILD_ROOT%{_bindir}/rbd-replay-many
+rm -f $RPM_BUILD_ROOT%{_bindir}/ceph-detect-init
+rm -f $RPM_BUILD_ROOT%{_bindir}/rbd-mirror
+rm -f $RPM_BUILD_ROOT%{_bindir}/rbd-nbd
+rm -f $RPM_BUILD_ROOT%{_sbindir}/ceph-disk
 rm -f $RPM_BUILD_ROOT%{_libdir}/ceph/ceph_common.sh
 rm -f $RPM_BUILD_ROOT%{_libexecdir}/ceph/ceph-osd-prestart.sh
-rm -f $RPM_BUILD_ROOT%{_mandir}/man8/rbd-replay.8*
-rm -f $RPM_BUILD_ROOT%{_mandir}/man8/rbd-replay-many.8*
-rm -f $RPM_BUILD_ROOT%{_mandir}/man8/rbd-replay-prep.8*
+rm -f $RPM_BUILD_ROOT%{_mandir}/man8/rbd-mirror.8*
+rm -f $RPM_BUILD_ROOT%{_mandir}/man8/rbd-nbd.8*
+rm -f $RPM_BUILD_ROOT%{_unitdir}/ceph*
+rm -f $RPM_BUILD_ROOT%{_libexecdir}/ceph/ceph_common.sh
+rm -rf $RPM_BUILD_ROOT%{python_sitelib}/ceph_detect_init*
+rm -rf $RPM_BUILD_ROOT%{python_sitelib}/ceph_disk*
+rm -rf $RPM_BUILD_ROOT%{_libdir}/ceph/compressor
 
 # udev rules
 %if 0%{?rhel} >= 7 || 0%{?fedora}
@@ -236,6 +261,9 @@ rm -rf $RPM_BUILD_ROOT
 %{_bindir}/ceph-syn
 %{_bindir}/rados
 %{_bindir}/rbd
+%{_bindir}/rbd-replay
+%{_bindir}/rbd-replay-many
+%{_bindir}/rbdmap
 %{_bindir}/ceph-post-file
 %{_bindir}/ceph-brag
 %{_mandir}/man8/ceph-authtool.8*
@@ -247,18 +275,24 @@ rm -rf $RPM_BUILD_ROOT
 %{_mandir}/man8/ceph.8*
 %{_mandir}/man8/rados.8*
 %{_mandir}/man8/rbd.8*
+%{_mandir}/man8/rbdmap.8*
+%{_mandir}/man8/rbd-replay.8*
+%{_mandir}/man8/rbd-replay-many.8*
+%{_mandir}/man8/rbd-replay-prep.8*
+%dir %{_datadir}/ceph/
 %{_datadir}/ceph/known_hosts_drop.ceph.com
-%{_datadir}/ceph/id_dsa_drop.ceph.com
-%{_datadir}/ceph/id_dsa_drop.ceph.com.pub
+%{_datadir}/ceph/id_rsa_drop.ceph.com
+%{_datadir}/ceph/id_rsa_drop.ceph.com.pub
 %dir %{_sysconfdir}/ceph/
-%dir %{_localstatedir}/log/ceph/
 %config %{_sysconfdir}/bash_completion.d/ceph
 %config %{_sysconfdir}/bash_completion.d/rados
 %config %{_sysconfdir}/bash_completion.d/rbd
 %config(noreplace) %{_sysconfdir}/ceph/rbdmap
-%{_initrddir}/rbdmap
+%{_unitdir}/rbdmap.service
 %{python_sitelib}/ceph_argparse.py*
+%{python_sitelib}/ceph_daemon.py*
 %{_udevrulesdir}/50-rbd.rules
+%dir %{_localstatedir}/log/ceph/
 
 %postun
 # Package removal cleanup
@@ -285,6 +319,7 @@ fi
 %{_includedir}/rados/librados.h
 %{_includedir}/rados/librados.hpp
 %{_includedir}/rados/buffer.h
+%{_includedir}/rados/buffer_fwd.h
 %{_includedir}/rados/page.h
 %{_includedir}/rados/crc32c.h
 %{_includedir}/rados/rados_types.h
@@ -322,14 +357,19 @@ fi
 #################################################################################
 %files -n python-rados
 %defattr(-,root,root,-)
-%{python_sitelib}/rados.py*
+%{python_sitearch}/rados.so
+%{python_sitearch}/rados-*.egg-info
 
 #################################################################################
 %files -n python-rbd
 %defattr(-,root,root,-)
-%{python_sitelib}/rbd.py*
+%{python_sitearch}/rbd.so
+%{python_sitearch}/rbd-*.egg-info
 
 %changelog
+* Fri Jun 08 2018 Boris Ranto <branto@redhat.com> - 1:10.2.5-4
+- rebase the package to 10.2.5
+
 * Tue Jun 20 2017 Boris Ranto <branto@redhat.com> - 1:0.94.5-2
 - drop the rebase
 

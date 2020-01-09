@@ -29,6 +29,7 @@
 #define CEPH_INO_ROOT   1
 #define CEPH_INO_CEPH   2       /* hidden .ceph dir */
 #define CEPH_INO_DOTDOT 3	/* used by ceph fuse for parent (..) */
+#define CEPH_INO_LOST_AND_FOUND 4	/* reserved ino for use in recovery */
 
 /* arbitrary limit on max # of monitors (cluster of 3 is typical) */
 #define CEPH_MAX_MON   31
@@ -94,6 +95,7 @@ struct ceph_dir_layout {
 #define CEPH_MSG_MON_MAP                4
 #define CEPH_MSG_MON_GET_MAP            5
 #define CEPH_MSG_MON_GET_OSDMAP         6
+#define CEPH_MSG_MON_METADATA           7
 #define CEPH_MSG_STATFS                 13
 #define CEPH_MSG_STATFS_REPLY           14
 #define CEPH_MSG_MON_SUBSCRIBE          15
@@ -128,6 +130,9 @@ struct ceph_dir_layout {
 #define CEPH_MSG_OSD_OP                 42
 #define CEPH_MSG_OSD_OPREPLY            43
 #define CEPH_MSG_WATCH_NOTIFY           44
+
+/* FSMap subscribers (see all MDS clusters at once) */
+#define CEPH_MSG_FS_MAP                 45
 
 
 /* watch-notify operations */
@@ -229,6 +234,11 @@ struct ceph_mon_subscribe_ack {
  */
 #define CEPH_MDSMAP_DOWN    (1<<0)  /* cluster deliberately down */
 #define CEPH_MDSMAP_ALLOW_SNAPS   (1<<1)  /* cluster allowed to create snapshots */
+#define CEPH_MDSMAP_ALLOW_MULTIMDS (1<<2) /* cluster allowed to have >1 active MDS */
+#define CEPH_MDSMAP_ALLOW_DIRFRAGS (1<<3) /* cluster allowed to fragment directories */
+
+#define CEPH_MDSMAP_ALLOW_CLASSICS (CEPH_MDSMAP_ALLOW_SNAPS | CEPH_MDSMAP_ALLOW_MULTIMDS | \
+				    CEPH_MDSMAP_ALLOW_DIRFRAGS)
 
 /*
  * mds states
@@ -243,7 +253,8 @@ struct ceph_mon_subscribe_ack {
 #define CEPH_MDS_STATE_CREATING    -6  /* up, creating MDS instance. */
 #define CEPH_MDS_STATE_STARTING    -7  /* up, starting previously stopped mds */
 #define CEPH_MDS_STATE_STANDBY_REPLAY -8 /* up, tailing active node's journal */
-#define CEPH_MDS_STATE_REPLAYONCE   -9 /* up, replaying an active node's journal */
+#define CEPH_MDS_STATE_REPLAYONCE   -9 /* Legacy, unused */
+#define CEPH_MDS_STATE_NULL         -10
 
 #define CEPH_MDS_STATE_REPLAY       8  /* up, replaying journal. */
 #define CEPH_MDS_STATE_RESOLVE      9  /* up, disambiguating distributed
@@ -253,6 +264,7 @@ struct ceph_mon_subscribe_ack {
 #define CEPH_MDS_STATE_CLIENTREPLAY 12 /* up, replaying client operations */
 #define CEPH_MDS_STATE_ACTIVE       13 /* up, active */
 #define CEPH_MDS_STATE_STOPPING     14 /* up, but exporting metadata */
+#define CEPH_MDS_STATE_DAMAGED      15 /* rank not replayable, need repair */
 
 extern const char *ceph_mds_state_name(int s);
 
@@ -290,6 +302,9 @@ enum {
 	CEPH_SESSION_FLUSHMSG,
 	CEPH_SESSION_FLUSHMSG_ACK,
 	CEPH_SESSION_FORCE_RO,
+    // A response to REQUEST_OPEN indicating that the client should
+    // permanently desist from contacting the MDS
+	CEPH_SESSION_REJECT
 };
 
 extern const char *ceph_session_op_name(int op);
@@ -341,24 +356,29 @@ enum {
 	CEPH_MDS_OP_MKSNAP     = 0x01400,
 	CEPH_MDS_OP_RMSNAP     = 0x01401,
 	CEPH_MDS_OP_LSSNAP     = 0x00402,
+	CEPH_MDS_OP_RENAMESNAP = 0x01403,
 
 	// internal op
 	CEPH_MDS_OP_FRAGMENTDIR= 0x01500,
 	CEPH_MDS_OP_EXPORTDIR  = 0x01501,
-	CEPH_MDS_OP_VALIDATE   = 0x01502,
-	CEPH_MDS_OP_FLUSH      = 0x01503
+	CEPH_MDS_OP_FLUSH      = 0x01502,
+	CEPH_MDS_OP_ENQUEUE_SCRUB  = 0x01503,
+	CEPH_MDS_OP_REPAIR_FRAGSTATS = 0x01504,
+	CEPH_MDS_OP_REPAIR_INODESTATS = 0x01505
 };
 
 extern const char *ceph_mds_op_name(int op);
 
 
-#define CEPH_SETATTR_MODE   1
-#define CEPH_SETATTR_UID    2
-#define CEPH_SETATTR_GID    4
-#define CEPH_SETATTR_MTIME  8
-#define CEPH_SETATTR_ATIME 16
-#define CEPH_SETATTR_SIZE  32
-#define CEPH_SETATTR_CTIME 64
+#define CEPH_SETATTR_MODE	(1 << 0)
+#define CEPH_SETATTR_UID	(1 << 1)
+#define CEPH_SETATTR_GID	(1 << 2)
+#define CEPH_SETATTR_MTIME	(1 << 3)
+#define CEPH_SETATTR_ATIME	(1 << 4)
+#define CEPH_SETATTR_SIZE	(1 << 5)
+#define CEPH_SETATTR_CTIME	(1 << 6)
+#define CEPH_SETATTR_MTIME_NOW	(1 << 7)
+#define CEPH_SETATTR_ATIME_NOW	(1 << 8)
 
 /*
  * Ceph setxattr request flags.
@@ -366,6 +386,18 @@ extern const char *ceph_mds_op_name(int op);
 #define CEPH_XATTR_CREATE  (1 << 0)
 #define CEPH_XATTR_REPLACE (1 << 1)
 #define CEPH_XATTR_REMOVE  (1 << 31)
+
+/*
+ * readdir request flags;
+ */
+#define CEPH_READDIR_REPLY_BITFLAGS	(1<<0)
+
+/*
+ * readdir reply flags.
+ */
+#define CEPH_READDIR_FRAG_END		(1<<0)
+#define CEPH_READDIR_FRAG_COMPLETE	(1<<8)
+#define CEPH_READDIR_HASH_ORDER		(1<<9)
 
 union ceph_mds_request_args {
 	struct {
@@ -384,6 +416,7 @@ union ceph_mds_request_args {
 		__le32 frag;                 /* which dir fragment */
 		__le32 max_entries;          /* how many dentries to grab */
 		__le32 max_bytes;
+		__le16 flags;
 	} __attribute__ ((packed)) readdir;
 	struct {
 		__le32 mode;
@@ -399,11 +432,12 @@ union ceph_mds_request_args {
 		__le32 stripe_count;         /* ... */
 		__le32 object_size;
 		__le32 pool;                 /* if >= 0 and CREATEPOOLID feature */
-		__le32 unused;               /* used to be preferred */
+		__le32 mask;                 /* CEPH_CAP_* */
 		__le64 old_size;             /* if O_TRUNC */
 	} __attribute__ ((packed)) open;
 	struct {
 		__le32 flags;
+		__le32 osdmap_epoch; 	    /* use for set file/dir layout */
 	} __attribute__ ((packed)) setxattr;
 	struct {
 		struct ceph_file_layout layout;
@@ -476,27 +510,6 @@ struct ceph_mds_reply_cap {
 
 #define CEPH_CAP_FLAG_AUTH	(1 << 0)	/* cap is issued by auth mds */
 #define CEPH_CAP_FLAG_RELEASE	(1 << 1)        /* ask client to release the cap */
-
-/* inode record, for bundling with mds reply */
-struct ceph_mds_reply_inode {
-	__le64 ino;
-	__le64 snapid;
-	__le32 rdev;
-	__le64 version;                /* inode version */
-	__le64 xattr_version;          /* version for xattr blob */
-	struct ceph_mds_reply_cap cap; /* caps issued for this inode */
-	struct ceph_file_layout layout;
-	struct ceph_timespec ctime, mtime, atime;
-	__le32 time_warp_seq;
-	__le64 size, max_size, truncate_size;
-	__le32 truncate_seq;
-	__le32 mode, uid, gid;
-	__le32 nlink;
-	__le64 files, subdirs, rbytes, rfiles, rsubdirs;  /* dir stats */
-	struct ceph_timespec rctime;
-	struct ceph_frag_tree_head fragtree;  /* (must be at end of struct) */
-} __attribute__ ((packed));
-/* followed by frag array, symlink string, dir layout, xattr blob */
 
 /* reply_lease follows dname, and reply_inode */
 struct ceph_mds_reply_lease {
@@ -664,7 +677,7 @@ struct ceph_mds_cap_peer {
 /*
  * caps message, used for capability callbacks, acks, requests, etc.
  */
-struct ceph_mds_caps {
+struct ceph_mds_caps_head {
 	__le32 op;                  /* CEPH_CAP_OP_* */
 	__le64 ino, realm;
 	__le64 cap_id;
@@ -683,7 +696,9 @@ struct ceph_mds_caps {
 	/* xattrlock */
 	__le32 xattr_len;
 	__le64 xattr_version;
+} __attribute__ ((packed));
 
+struct ceph_mds_caps_body_legacy {
 	union {
 		/* all except export */
 		struct {

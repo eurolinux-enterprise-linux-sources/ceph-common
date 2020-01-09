@@ -16,6 +16,7 @@
 #ifndef CEPH_SIMPLELOCK_H
 #define CEPH_SIMPLELOCK_H
 
+#include "mdstypes.h"
 #include "MDSContext.h"
 
 // -- lock types --
@@ -57,7 +58,7 @@ struct LockType {
   int type;
   const sm_t *sm;
 
-  LockType(int t) : type(t) {
+  explicit LockType(int t) : type(t) {
     switch (type) {
     case CEPH_LOCK_DN:
     case CEPH_LOCK_IAUTH:
@@ -305,7 +306,7 @@ public:
     parent->take_waiting(mask << get_wait_shift(), ls);
   }
   void add_waiter(uint64_t mask, MDSInternalContextBase *c) {
-    parent->add_waiter(mask << get_wait_shift(), c);
+    parent->add_waiter((mask << get_wait_shift()) | MDSCacheObject::WAIT_ORDERED, c);
   }
   bool is_waiter_for(uint64_t mask) const {
     return parent->is_waiter_for(mask << get_wait_shift());
@@ -367,8 +368,8 @@ public:
   }
 
   void init_gather() {
-    for (map<mds_rank_t,unsigned>::const_iterator p = parent->replicas_begin();
-	 p != parent->replicas_end(); 
+    for (compact_map<mds_rank_t,unsigned>::iterator p = parent->replicas_begin();
+	 p != parent->replicas_end();
 	 ++p)
       more()->gather_set.insert(p->first);
   }
@@ -668,6 +669,12 @@ public:
       out << " unstable";
     */
   }
+
+  /**
+   * Write bare values (caller must be in an object section)
+   * to formatter, or nothing if is_sync_and_unlocked.
+   */
+  void dump(Formatter *f) const;
 
   virtual void print(ostream& out) const {
     out << "(";

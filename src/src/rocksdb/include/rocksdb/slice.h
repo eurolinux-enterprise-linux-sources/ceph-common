@@ -20,6 +20,7 @@
 #define STORAGE_ROCKSDB_INCLUDE_SLICE_H_
 
 #include <assert.h>
+#include <cstdio>
 #include <stddef.h>
 #include <string.h>
 #include <string>
@@ -41,6 +42,10 @@ class Slice {
   // Create a slice that refers to s[0,strlen(s)-1]
   /* implicit */
   Slice(const char* s) : data_(s), size_(strlen(s)) { }
+
+  // Create a single slice from SliceParts using buf as storage.
+  // buf must exist as long as the returned Slice exists.
+  Slice(const struct SliceParts& parts, std::string* buf);
 
   // Return a pointer to the beginning of the referenced data
   const char* data() const { return data_; }
@@ -68,20 +73,13 @@ class Slice {
     size_ -= n;
   }
 
-  // Return a string that contains the copy of the referenced data.
-  std::string ToString(bool hex = false) const {
-    if (hex) {
-      std::string result;
-      char buf[10];
-      for (size_t i = 0; i < size_; i++) {
-        snprintf(buf, 10, "%02X", (unsigned char)data_[i]);
-        result += buf;
-      }
-      return result;
-    } else {
-      return std::string(data_, size_);
-    }
+  void remove_suffix(size_t n) {
+    assert(n <= size());
+    size_ -= n;
   }
+
+  // Return a string that contains the copy of the referenced data.
+  std::string ToString(bool hex = false) const;
 
   // Three-way comparison.  Returns value:
   //   <  0 iff "*this" <  "b",
@@ -95,6 +93,14 @@ class Slice {
             (memcmp(data_, x.data_, x.size_) == 0));
   }
 
+  bool ends_with(const Slice& x) const {
+    return ((size_ >= x.size_) &&
+            (memcmp(data_ + size_ - x.size_, x.data_, x.size_) == 0));
+  }
+
+  // Compare two slices and returns the first byte where they differ
+  size_t difference_offset(const Slice& b) const;
+
  // private: make these public for rocksdbjni access
   const char* data_;
   size_t size_;
@@ -107,6 +113,7 @@ class Slice {
 struct SliceParts {
   SliceParts(const Slice* _parts, int _num_parts) :
       parts(_parts), num_parts(_num_parts) { }
+  SliceParts() : parts(nullptr), num_parts(0) {}
 
   const Slice* parts;
   int num_parts;
@@ -122,13 +129,22 @@ inline bool operator!=(const Slice& x, const Slice& y) {
 }
 
 inline int Slice::compare(const Slice& b) const {
-  const int min_len = (size_ < b.size_) ? size_ : b.size_;
+  const size_t min_len = (size_ < b.size_) ? size_ : b.size_;
   int r = memcmp(data_, b.data_, min_len);
   if (r == 0) {
     if (size_ < b.size_) r = -1;
     else if (size_ > b.size_) r = +1;
   }
   return r;
+}
+
+inline size_t Slice::difference_offset(const Slice& b) const {
+  size_t off = 0;
+  const size_t len = (size_ < b.size_) ? size_ : b.size_;
+  for (; off < len; off++) {
+    if (data_[off] != b.data_[off]) break;
+  }
+  return off;
 }
 
 }  // namespace rocksdb

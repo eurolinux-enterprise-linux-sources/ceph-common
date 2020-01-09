@@ -14,41 +14,86 @@
 
 namespace rocksdb {
 
-Status PlainTableFactory::NewTableReader(const Options& options,
-                                         const EnvOptions& soptions,
-                                         const InternalKeyComparator& icomp,
-                                         unique_ptr<RandomAccessFile>&& file,
-                                         uint64_t file_size,
-                                         unique_ptr<TableReader>* table) const {
-  return PlainTableReader::Open(options, soptions, icomp, std::move(file),
-                                file_size, table, bloom_bits_per_key_,
-                                hash_table_ratio_, index_sparseness_,
-                                huge_page_tlb_size_);
+Status PlainTableFactory::NewTableReader(
+    const TableReaderOptions& table_reader_options,
+    unique_ptr<RandomAccessFileReader>&& file, uint64_t file_size,
+    unique_ptr<TableReader>* table) const {
+  return PlainTableReader::Open(
+      table_reader_options.ioptions, table_reader_options.env_options,
+      table_reader_options.internal_comparator, std::move(file), file_size,
+      table, table_options_.bloom_bits_per_key, table_options_.hash_table_ratio,
+      table_options_.index_sparseness, table_options_.huge_page_tlb_size,
+      table_options_.full_scan_mode);
 }
 
 TableBuilder* PlainTableFactory::NewTableBuilder(
-    const Options& options, const InternalKeyComparator& internal_comparator,
-    WritableFile* file, CompressionType compression_type) const {
-  return new PlainTableBuilder(options, file, user_key_len_);
+    const TableBuilderOptions& table_builder_options, uint32_t column_family_id,
+    WritableFileWriter* file) const {
+  // Ignore the skip_filters flag. PlainTable format is optimized for small
+  // in-memory dbs. The skip_filters optimization is not useful for plain
+  // tables
+  //
+  return new PlainTableBuilder(
+      table_builder_options.ioptions,
+      table_builder_options.int_tbl_prop_collector_factories, column_family_id,
+      file, table_options_.user_key_len, table_options_.encoding_type,
+      table_options_.index_sparseness, table_options_.bloom_bits_per_key, 6,
+      table_options_.huge_page_tlb_size, table_options_.hash_table_ratio,
+      table_options_.store_index_in_file);
 }
 
-extern TableFactory* NewPlainTableFactory(uint32_t user_key_len,
-                                          int bloom_bits_per_key,
-                                          double hash_table_ratio,
-                                          size_t index_sparseness,
-                                          size_t huge_page_tlb_size) {
-  return new PlainTableFactory(user_key_len, bloom_bits_per_key,
-                               hash_table_ratio, index_sparseness,
-                               huge_page_tlb_size);
+std::string PlainTableFactory::GetPrintableTableOptions() const {
+  std::string ret;
+  ret.reserve(20000);
+  const int kBufferSize = 200;
+  char buffer[kBufferSize];
+
+  snprintf(buffer, kBufferSize, "  user_key_len: %u\n",
+           table_options_.user_key_len);
+  ret.append(buffer);
+  snprintf(buffer, kBufferSize, "  bloom_bits_per_key: %d\n",
+           table_options_.bloom_bits_per_key);
+  ret.append(buffer);
+  snprintf(buffer, kBufferSize, "  hash_table_ratio: %lf\n",
+           table_options_.hash_table_ratio);
+  ret.append(buffer);
+  snprintf(buffer, kBufferSize, "  index_sparseness: %" ROCKSDB_PRIszt "\n",
+           table_options_.index_sparseness);
+  ret.append(buffer);
+  snprintf(buffer, kBufferSize, "  huge_page_tlb_size: %" ROCKSDB_PRIszt "\n",
+           table_options_.huge_page_tlb_size);
+  ret.append(buffer);
+  snprintf(buffer, kBufferSize, "  encoding_type: %d\n",
+           table_options_.encoding_type);
+  ret.append(buffer);
+  snprintf(buffer, kBufferSize, "  full_scan_mode: %d\n",
+           table_options_.full_scan_mode);
+  ret.append(buffer);
+  snprintf(buffer, kBufferSize, "  store_index_in_file: %d\n",
+           table_options_.store_index_in_file);
+  ret.append(buffer);
+  return ret;
 }
 
-extern TableFactory* NewTotalOrderPlainTableFactory(uint32_t user_key_len,
-                                                    int bloom_bits_per_key,
-                                                    size_t index_sparseness,
-                                                    size_t huge_page_tlb_size) {
-  return new PlainTableFactory(user_key_len, bloom_bits_per_key, 0,
-                               index_sparseness, huge_page_tlb_size);
+const PlainTableOptions& PlainTableFactory::table_options() const {
+  return table_options_;
 }
+
+extern TableFactory* NewPlainTableFactory(const PlainTableOptions& options) {
+  return new PlainTableFactory(options);
+}
+
+const std::string PlainTablePropertyNames::kPrefixExtractorName =
+    "rocksdb.prefix.extractor.name";
+
+const std::string PlainTablePropertyNames::kEncodingType =
+    "rocksdb.plain.table.encoding.type";
+
+const std::string PlainTablePropertyNames::kBloomVersion =
+    "rocksdb.plain.table.bloom.version";
+
+const std::string PlainTablePropertyNames::kNumBloomBlocks =
+    "rocksdb.plain.table.bloom.numblocks";
 
 }  // namespace rocksdb
 #endif  // ROCKSDB_LITE

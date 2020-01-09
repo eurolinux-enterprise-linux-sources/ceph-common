@@ -25,24 +25,30 @@
 #ifndef STORAGE_ROCKSDB_INCLUDE_WRITE_BATCH_H_
 #define STORAGE_ROCKSDB_INCLUDE_WRITE_BATCH_H_
 
+#include <atomic>
+#include <stack>
 #include <string>
+#include <stdint.h>
 #include "rocksdb/status.h"
+#include "rocksdb/write_batch_base.h"
 
 namespace rocksdb {
 
 class Slice;
 class ColumnFamilyHandle;
+struct SavePoints;
 struct SliceParts;
 
-class WriteBatch {
+class WriteBatch : public WriteBatchBase {
  public:
   explicit WriteBatch(size_t reserved_bytes = 0);
   ~WriteBatch();
 
+  using WriteBatchBase::Put;
   // Store the mapping "key->value" in the database.
   void Put(ColumnFamilyHandle* column_family, const Slice& key,
-           const Slice& value);
-  void Put(const Slice& key, const Slice& value) {
+           const Slice& value) override;
+  void Put(const Slice& key, const Slice& value) override {
     Put(nullptr, key, value);
   }
 
@@ -50,23 +56,51 @@ class WriteBatch {
   // that will be written to the database are concatentations of arrays of
   // slices.
   void Put(ColumnFamilyHandle* column_family, const SliceParts& key,
-           const SliceParts& value);
-  void Put(const SliceParts& key, const SliceParts& value) {
+           const SliceParts& value) override;
+  void Put(const SliceParts& key, const SliceParts& value) override {
     Put(nullptr, key, value);
   }
 
+  using WriteBatchBase::Delete;
+  // If the database contains a mapping for "key", erase it.  Else do nothing.
+  void Delete(ColumnFamilyHandle* column_family, const Slice& key) override;
+  void Delete(const Slice& key) override { Delete(nullptr, key); }
+
+  // variant that takes SliceParts
+  void Delete(ColumnFamilyHandle* column_family,
+              const SliceParts& key) override;
+  void Delete(const SliceParts& key) override { Delete(nullptr, key); }
+
+  using WriteBatchBase::SingleDelete;
+  // WriteBatch implementation of DB::SingleDelete().  See db.h.
+  void SingleDelete(ColumnFamilyHandle* column_family,
+                    const Slice& key) override;
+  void SingleDelete(const Slice& key) override { SingleDelete(nullptr, key); }
+
+  // variant that takes SliceParts
+  void SingleDelete(ColumnFamilyHandle* column_family,
+                    const SliceParts& key) override;
+  void SingleDelete(const SliceParts& key) override {
+    SingleDelete(nullptr, key);
+  }
+
+  using WriteBatchBase::Merge;
   // Merge "value" with the existing value of "key" in the database.
   // "key->merge(existing, value)"
   void Merge(ColumnFamilyHandle* column_family, const Slice& key,
-             const Slice& value);
-  void Merge(const Slice& key, const Slice& value) {
+             const Slice& value) override;
+  void Merge(const Slice& key, const Slice& value) override {
     Merge(nullptr, key, value);
   }
 
-  // If the database contains a mapping for "key", erase it.  Else do nothing.
-  void Delete(ColumnFamilyHandle* column_family, const Slice& key);
-  void Delete(const Slice& key) { Delete(nullptr, key); }
+  // variant that takes SliceParts
+  void Merge(ColumnFamilyHandle* column_family, const SliceParts& key,
+             const SliceParts& value) override;
+  void Merge(const SliceParts& key, const SliceParts& value) override {
+    Merge(nullptr, key, value);
+  }
 
+  using WriteBatchBase::PutLogData;
   // Append a blob of arbitrary size to the records in this batch. The blob will
   // be stored in the transaction log but not in any other file. In particular,
   // it will not be persisted to the SST files. When iterating over this
@@ -77,10 +111,22 @@ class WriteBatch {
   //
   // Example application: add timestamps to the transaction log for use in
   // replication.
-  void PutLogData(const Slice& blob);
+  void PutLogData(const Slice& blob) override;
 
+  using WriteBatchBase::Clear;
   // Clear all updates buffered in this batch.
-  void Clear();
+  void Clear() override;
+
+  // Records the state of the batch for future calls to RollbackToSavePoint().
+  // May be called multiple times to set multiple save points.
+  void SetSavePoint() override;
+
+  // Remove all entries in this batch (Put, Merge, Delete, PutLogData) since the
+  // most recent call to SetSavePoint() and removes the most recent save point.
+  // If there is no previous call to SetSavePoint(), Status::NotFound()
+  // will be returned.
+  // Oterwise returns Status::OK().
+  Status RollbackToSavePoint() override;
 
   // Support for iterating over the contents of a batch.
   class Handler {
@@ -101,10 +147,31 @@ class WriteBatch {
       return Status::InvalidArgument(
           "non-default column family and PutCF not implemented");
     }
-    virtual void Put(const Slice& key, const Slice& value);
+    virtual void Put(const Slice& /*key*/, const Slice& /*value*/) {}
+
+    virtual Status DeleteCF(uint32_t column_family_id, const Slice& key) {
+      if (column_family_id == 0) {
+        Delete(key);
+        return Status::OK();
+      }
+      return Status::InvalidArgument(
+          "non-default column family and DeleteCF not implemented");
+    }
+    virtual void Delete(const Slice& /*key*/) {}
+
+    virtual Status SingleDeleteCF(uint32_t column_family_id, const Slice& key) {
+      if (column_family_id == 0) {
+        SingleDelete(key);
+        return Status::OK();
+      }
+      return Status::InvalidArgument(
+          "non-default column family and SingleDeleteCF not implemented");
+    }
+    virtual void SingleDelete(const Slice& /*key*/) {}
+
     // Merge and LogData are not pure virtual. Otherwise, we would break
     // existing clients of Handler on a source code level. The default
-    // implementation of Merge simply throws a runtime exception.
+    // implementation of Merge does nothing.
     virtual Status MergeCF(uint32_t column_family_id, const Slice& key,
                            const Slice& value) {
       if (column_family_id == 0) {
@@ -114,18 +181,11 @@ class WriteBatch {
       return Status::InvalidArgument(
           "non-default column family and MergeCF not implemented");
     }
-    virtual void Merge(const Slice& key, const Slice& value);
+    virtual void Merge(const Slice& /*key*/, const Slice& /*value*/) {}
+
     // The default implementation of LogData does nothing.
     virtual void LogData(const Slice& blob);
-    virtual Status DeleteCF(uint32_t column_family_id, const Slice& key) {
-      if (column_family_id == 0) {
-        Delete(key);
-        return Status::OK();
-      }
-      return Status::InvalidArgument(
-          "non-default column family and DeleteCF not implemented");
-    }
-    virtual void Delete(const Slice& key);
+
     // Continue is called by WriteBatch::Iterate. If it returns false,
     // iteration is halted. Otherwise, it continues iterating. The default
     // implementation always returns true.
@@ -142,12 +202,40 @@ class WriteBatch {
   // Returns the number of updates in the batch
   int Count() const;
 
+  // Returns true if PutCF will be called during Iterate
+  bool HasPut() const;
+
+  // Returns true if DeleteCF will be called during Iterate
+  bool HasDelete() const;
+
+  // Returns true if SingleDeleteCF will be called during Iterate
+  bool HasSingleDelete() const;
+
+  // Returns trie if MergeCF will be called during Iterate
+  bool HasMerge() const;
+
+  using WriteBatchBase::GetWriteBatch;
+  WriteBatch* GetWriteBatch() override { return this; }
+
   // Constructor with a serialized string object
-  explicit WriteBatch(std::string rep): rep_(rep) {}
+  explicit WriteBatch(const std::string& rep);
+
+  WriteBatch(const WriteBatch& src);
+  WriteBatch(WriteBatch&& src);
+  WriteBatch& operator=(const WriteBatch& src);
+  WriteBatch& operator=(WriteBatch&& src);
 
  private:
   friend class WriteBatchInternal;
+  SavePoints* save_points_;
 
+  // For HasXYZ.  Mutable to allow lazy computation of results
+  mutable std::atomic<uint32_t> content_flags_;
+
+  // Performs deferred computation of content_flags if necessary
+  uint32_t ComputeContentFlags() const;
+
+ protected:
   std::string rep_;  // See comment in write_batch.cc for the format of rep_
 
   // Intentionally copyable

@@ -6,7 +6,7 @@
 #include <atomic>
 
 #include "rocksdb/env.h"
-#include "port/port_posix.h"
+#include "port/port.h"
 #include "util/autovector.h"
 #include "util/thread_local.h"
 #include "util/testharness.h"
@@ -14,7 +14,7 @@
 
 namespace rocksdb {
 
-class ThreadLocalTest {
+class ThreadLocalTest : public testing::Test {
  public:
   ThreadLocalTest() : env_(Env::Default()) {}
 
@@ -24,11 +24,11 @@ class ThreadLocalTest {
 namespace {
 
 struct Params {
-  Params(port::Mutex* m, port::CondVar* c, int* unref, int n,
+  Params(port::Mutex* m, port::CondVar* c, int* u, int n,
          UnrefHandler handler = nullptr)
       : mu(m),
         cv(c),
-        unref(unref),
+        unref(u),
         total(n),
         started(0),
         completed(0),
@@ -54,7 +54,7 @@ class IDChecker : public ThreadLocalPtr {
 
 }  // anonymous namespace
 
-TEST(ThreadLocalTest, UniqueIdTest) {
+TEST_F(ThreadLocalTest, UniqueIdTest) {
   port::Mutex mu;
   port::CondVar cv(&mu);
 
@@ -101,7 +101,7 @@ TEST(ThreadLocalTest, UniqueIdTest) {
   // 3, 1, 2, 0
 }
 
-TEST(ThreadLocalTest, SequentialReadWriteTest) {
+TEST_F(ThreadLocalTest, SequentialReadWriteTest) {
   // global id list carries over 3, 1, 2, 0
   ASSERT_EQ(IDChecker::PeekId(), 0u);
 
@@ -112,24 +112,24 @@ TEST(ThreadLocalTest, SequentialReadWriteTest) {
   p.tls2 = &tls2;
 
   auto func = [](void* ptr) {
-    auto& p = *static_cast<Params*>(ptr);
+    auto& params = *static_cast<Params*>(ptr);
 
-    ASSERT_TRUE(p.tls1.Get() == nullptr);
-    p.tls1.Reset(reinterpret_cast<int*>(1));
-    ASSERT_TRUE(p.tls1.Get() == reinterpret_cast<int*>(1));
-    p.tls1.Reset(reinterpret_cast<int*>(2));
-    ASSERT_TRUE(p.tls1.Get() == reinterpret_cast<int*>(2));
+    ASSERT_TRUE(params.tls1.Get() == nullptr);
+    params.tls1.Reset(reinterpret_cast<int*>(1));
+    ASSERT_TRUE(params.tls1.Get() == reinterpret_cast<int*>(1));
+    params.tls1.Reset(reinterpret_cast<int*>(2));
+    ASSERT_TRUE(params.tls1.Get() == reinterpret_cast<int*>(2));
 
-    ASSERT_TRUE(p.tls2->Get() == nullptr);
-    p.tls2->Reset(reinterpret_cast<int*>(1));
-    ASSERT_TRUE(p.tls2->Get() == reinterpret_cast<int*>(1));
-    p.tls2->Reset(reinterpret_cast<int*>(2));
-    ASSERT_TRUE(p.tls2->Get() == reinterpret_cast<int*>(2));
+    ASSERT_TRUE(params.tls2->Get() == nullptr);
+    params.tls2->Reset(reinterpret_cast<int*>(1));
+    ASSERT_TRUE(params.tls2->Get() == reinterpret_cast<int*>(1));
+    params.tls2->Reset(reinterpret_cast<int*>(2));
+    ASSERT_TRUE(params.tls2->Get() == reinterpret_cast<int*>(2));
 
-    p.mu->Lock();
-    ++(p.completed);
-    p.cv->SignalAll();
-    p.mu->Unlock();
+    params.mu->Lock();
+    ++(params.completed);
+    params.cv->SignalAll();
+    params.mu->Unlock();
   };
 
   for (int iter = 0; iter < 1024; ++iter) {
@@ -145,7 +145,7 @@ TEST(ThreadLocalTest, SequentialReadWriteTest) {
   }
 }
 
-TEST(ThreadLocalTest, ConcurrentReadWriteTest) {
+TEST_F(ThreadLocalTest, ConcurrentReadWriteTest) {
   // global id list carries over 3, 1, 2, 0
   ASSERT_EQ(IDChecker::PeekId(), 0u);
 
@@ -165,7 +165,9 @@ TEST(ThreadLocalTest, ConcurrentReadWriteTest) {
     auto& p = *static_cast<Params*>(ptr);
 
     p.mu->Lock();
-    int own = ++(p.started);
+    // Size_T switches size along with the ptr size
+    // we want to cast to.
+    size_t own = ++(p.started);
     p.cv->SignalAll();
     while (p.started != p.total) {
       p.cv->Wait();
@@ -183,16 +185,16 @@ TEST(ThreadLocalTest, ConcurrentReadWriteTest) {
     auto* env = Env::Default();
     auto start = env->NowMicros();
 
-    p.tls1.Reset(reinterpret_cast<int*>(own));
-    p.tls2->Reset(reinterpret_cast<int*>(own + 1));
+    p.tls1.Reset(reinterpret_cast<size_t*>(own));
+    p.tls2->Reset(reinterpret_cast<size_t*>(own + 1));
     // Loop for 1 second
     while (env->NowMicros() - start < 1000 * 1000) {
       for (int iter = 0; iter < 100000; ++iter) {
-        ASSERT_TRUE(p.tls1.Get() == reinterpret_cast<int*>(own));
-        ASSERT_TRUE(p.tls2->Get() == reinterpret_cast<int*>(own + 1));
+        ASSERT_TRUE(p.tls1.Get() == reinterpret_cast<size_t*>(own));
+        ASSERT_TRUE(p.tls2->Get() == reinterpret_cast<size_t*>(own + 1));
         if (p.doWrite) {
-          p.tls1.Reset(reinterpret_cast<int*>(own));
-          p.tls2->Reset(reinterpret_cast<int*>(own + 1));
+          p.tls1.Reset(reinterpret_cast<size_t*>(own));
+          p.tls2->Reset(reinterpret_cast<size_t*>(own + 1));
         }
       }
     }
@@ -229,7 +231,7 @@ TEST(ThreadLocalTest, ConcurrentReadWriteTest) {
   ASSERT_EQ(IDChecker::PeekId(), 3u);
 }
 
-TEST(ThreadLocalTest, Unref) {
+TEST_F(ThreadLocalTest, Unref) {
   ASSERT_EQ(IDChecker::PeekId(), 0u);
 
   auto unref = [](void* ptr) {
@@ -372,7 +374,7 @@ TEST(ThreadLocalTest, Unref) {
   }
 }
 
-TEST(ThreadLocalTest, Swap) {
+TEST_F(ThreadLocalTest, Swap) {
   ThreadLocalPtr tls;
   tls.Reset(reinterpret_cast<void*>(1));
   ASSERT_EQ(reinterpret_cast<int64_t>(tls.Swap(nullptr)), 1);
@@ -381,7 +383,7 @@ TEST(ThreadLocalTest, Swap) {
   ASSERT_EQ(reinterpret_cast<int64_t>(tls.Swap(reinterpret_cast<void*>(3))), 2);
 }
 
-TEST(ThreadLocalTest, Scrape) {
+TEST_F(ThreadLocalTest, Scrape) {
   auto unref = [](void* ptr) {
     auto& p = *static_cast<Params*>(ptr);
     p.mu->Lock();
@@ -449,7 +451,7 @@ TEST(ThreadLocalTest, Scrape) {
   }
 }
 
-TEST(ThreadLocalTest, CompareAndSwap) {
+TEST_F(ThreadLocalTest, CompareAndSwap) {
   ThreadLocalPtr tls;
   ASSERT_TRUE(tls.Swap(reinterpret_cast<void*>(1)) == nullptr);
   void* expected = reinterpret_cast<void*>(1);
@@ -468,5 +470,6 @@ TEST(ThreadLocalTest, CompareAndSwap) {
 }  // namespace rocksdb
 
 int main(int argc, char** argv) {
-  return rocksdb::test::RunAllTests();
+  ::testing::InitGoogleTest(&argc, argv);
+  return RUN_ALL_TESTS();
 }

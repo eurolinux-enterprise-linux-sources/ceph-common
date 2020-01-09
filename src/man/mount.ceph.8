@@ -1,35 +1,8 @@
 .\" Man page generated from reStructuredText.
 .
-.TH "MOUNT.CEPH" "8" "January 12, 2014" "dev" "Ceph"
+.TH "MOUNT.CEPH" "8" "December 09, 2016" "dev" "Ceph"
 .SH NAME
 mount.ceph \- mount a ceph file system
-.
-.nr rst2man-indent-level 0
-.
-.de1 rstReportMargin
-\\$1 \\n[an-margin]
-level \\n[rst2man-indent-level]
-level margin: \\n[rst2man-indent\\n[rst2man-indent-level]]
--
-\\n[rst2man-indent0]
-\\n[rst2man-indent1]
-\\n[rst2man-indent2]
-..
-.de1 INDENT
-.\" .rstReportMargin pre:
-. RS \\$1
-. nr rst2man-indent\\n[rst2man-indent-level] \\n[an-margin]
-. nr rst2man-indent-level +1
-.\" .rstReportMargin post:
-..
-.de UNINDENT
-. RE
-.\" indent \\n[an-margin]
-.\" old: \\n[rst2man-indent\\n[rst2man-indent-level]]
-.nr rst2man-indent-level -1
-.\" new: \\n[rst2man-indent\\n[rst2man-indent-level]]
-.in \\n[rst2man-indent\\n[rst2man-indent-level]]u
-..
 .
 .nr rst2man-indent-level 0
 .
@@ -101,12 +74,15 @@ passed only after these fixed arguments.
 .INDENT 0.0
 .TP
 .B \fBwsize\fP
-int, max write size. Default: none (writeback uses smaller of wsize
+int (bytes), max write size. Default: none (writeback uses smaller of wsize
 and stripe unit)
 .TP
 .B \fBrsize\fP
-int (bytes), max readahead, multiple of 1024, Default: 524288
-(512*1024)
+int (bytes), max read size. Default: none
+.TP
+.B \fBrasize\fP
+int (bytes), max readahead, multiple of 1024, Default: 8388608
+(8192*1024)
 .TP
 .B \fBosdtimeout\fP
 int (seconds), Default: 60
@@ -244,7 +220,7 @@ mount \-t ceph monhost:/ /mnt/foo
 .UNINDENT
 .SH AVAILABILITY
 .sp
-\fBmount.ceph\fP is part of Ceph, a massively scalable, open-source, distributed storage system. Please
+\fBmount.ceph\fP is part of Ceph, a massively scalable, open\-source, distributed storage system. Please
 refer to the Ceph documentation at \fI\%http://ceph.com/docs\fP for more
 information.
 .SH SEE ALSO

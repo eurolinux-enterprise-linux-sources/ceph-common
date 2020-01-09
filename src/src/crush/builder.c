@@ -176,7 +176,7 @@ int crush_add_bucket(struct crush_map *map,
 int crush_remove_bucket(struct crush_map *map, struct crush_bucket *bucket)
 {
 	int pos = -1 - bucket->id;
-
+       assert(pos < map->max_buckets);
 	map->buckets[pos] = NULL;
 	crush_destroy_bucket(bucket);
 	return 0;
@@ -1015,7 +1015,8 @@ int crush_remove_tree_bucket_item(struct crush_bucket_tree *bucket, int item)
 
 		if (bucket->h.items[i] != item)
 			continue;
-		
+
+		bucket->h.items[i] = 0;
 		node = crush_calc_tree_node(i);
 		weight = bucket->node_weights[node];
 		bucket->node_weights[node] = 0;
@@ -1465,3 +1466,23 @@ int crush_reweight_bucket(struct crush_map *crush, struct crush_bucket *b)
 
 /***************************/
 
+/* methods to check for safe arithmetic operations */
+
+int crush_addition_is_unsafe(__u32 a, __u32 b)
+{
+	if ((((__u32)(-1)) - b) < a)
+		return 1;
+	else
+		return 0;
+}
+
+int crush_multiplication_is_unsafe(__u32  a, __u32 b)
+{
+	/* prevent division by zero */
+	if (!b)
+		return 1;
+	if ((((__u32)(-1)) / b) < a)
+		return 1;
+	else
+		return 0;
+}

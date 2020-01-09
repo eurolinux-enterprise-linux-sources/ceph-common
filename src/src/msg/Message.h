@@ -116,6 +116,8 @@
 
 #define MSG_OSD_REPOP         112
 #define MSG_OSD_REPOPREPLY    113
+#define MSG_OSD_PG_UPDATE_LOG_MISSING  114
+#define MSG_OSD_PG_UPDATE_LOG_MISSING_REPLY  115
 
 
 // *** MDS ***
@@ -231,7 +233,7 @@ public:
     Message *m;
     friend class Message;
   public:
-    CompletionHook(Message *_m) : m(_m) {}
+    explicit CompletionHook(Message *_m) : m(_m) {}
     virtual void set_message(Message *_m) { m = _m; }
   };
 
@@ -294,14 +296,13 @@ protected:
   virtual ~Message() {
     if (byte_throttler)
       byte_throttler->put(payload.length() + middle.length() + data.length());
-    if (msg_throttler)
-      msg_throttler->put();
+    release_message_throttle();
     /* call completion hooks (if any) */
     if (completion_hook)
       completion_hook->complete(0);
   }
 public:
-  inline const ConnectionRef& get_connection() const { return connection; }
+  const ConnectionRef& get_connection() const { return connection; }
   void set_connection(const ConnectionRef& c) {
     connection = c;
   }
@@ -313,15 +314,17 @@ public:
   Throttle *get_message_throttler() { return msg_throttler; }
 
   void set_dispatch_throttle_size(uint64_t s) { dispatch_throttle_size = s; }
-  uint64_t get_dispatch_throttle_size() { return dispatch_throttle_size; }
+  uint64_t get_dispatch_throttle_size() const { return dispatch_throttle_size; }
 
+  const ceph_msg_header &get_header() const { return header; }
   ceph_msg_header &get_header() { return header; }
   void set_header(const ceph_msg_header &e) { header = e; }
   void set_footer(const ceph_msg_footer &e) { footer = e; }
+  const ceph_msg_footer &get_footer() const { return footer; }
   ceph_msg_footer &get_footer() { return footer; }
   void set_src(const entity_name_t& src) { header.src = src; }
 
-  uint32_t get_magic() { return magic; }
+  uint32_t get_magic() const { return magic; }
   void set_magic(int _magic) { magic = _magic; }
 
   /*
@@ -332,8 +335,9 @@ public:
    */
 
   void clear_payload() {
-    if (byte_throttler)
+    if (byte_throttler) {
       byte_throttler->put(payload.length() + middle.length());
+    }
     payload.clear();
     middle.clear();
   }
@@ -345,8 +349,13 @@ public:
     data.clear();
     clear_buffers(); // let subclass drop buffers as well
   }
+  void release_message_throttle() {
+    if (msg_throttler)
+      msg_throttler->put();
+    msg_throttler = nullptr;
+  }
 
-  bool empty_payload() { return payload.length() == 0; }
+  bool empty_payload() const { return payload.length() == 0; }
   bufferlist& get_payload() { return payload; }
   void set_payload(bufferlist& bl) {
     if (byte_throttler)
@@ -358,10 +367,10 @@ public:
 
   void set_middle(bufferlist& bl) {
     if (byte_throttler)
-      byte_throttler->put(payload.length());
+      byte_throttler->put(middle.length());
     middle.claim(bl, buffer::list::CLAIM_ALLOW_NONSHAREABLE);
     if (byte_throttler)
-      byte_throttler->take(payload.length());
+      byte_throttler->take(middle.length());
   }
   bufferlist& get_middle() { return middle; }
 
@@ -462,7 +471,7 @@ extern Message *decode_message(CephContext *cct, int crcflags,
 			       ceph_msg_header &header,
 			       ceph_msg_footer& footer, bufferlist& front,
 			       bufferlist& middle, bufferlist& data);
-inline ostream& operator<<(ostream& out, Message& m) {
+inline ostream& operator<<(ostream &out, const Message &m) {
   m.print(out);
   if (m.get_header().version)
     out << " v" << m.get_header().version;

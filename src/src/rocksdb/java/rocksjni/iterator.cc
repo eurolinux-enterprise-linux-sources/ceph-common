@@ -10,100 +10,77 @@
 #include <stdlib.h>
 #include <jni.h>
 
-#include "include/org_rocksdb_Iterator.h"
+#include "include/org_rocksdb_RocksIterator.h"
 #include "rocksjni/portal.h"
 #include "rocksdb/iterator.h"
 
 /*
- * Class:     org_rocksdb_Iterator
+ * Class:     org_rocksdb_RocksIterator
+ * Method:    disposeInternal
+ * Signature: (J)V
+ */
+void Java_org_rocksdb_RocksIterator_disposeInternal(
+    JNIEnv* env, jobject jobj, jlong handle) {
+  auto it = reinterpret_cast<rocksdb::Iterator*>(handle);
+  delete it;
+}
+
+/*
+ * Class:     org_rocksdb_RocksIterator
  * Method:    isValid0
  * Signature: (J)Z
  */
-jboolean Java_org_rocksdb_Iterator_isValid0(
+jboolean Java_org_rocksdb_RocksIterator_isValid0(
     JNIEnv* env, jobject jobj, jlong handle) {
   return reinterpret_cast<rocksdb::Iterator*>(handle)->Valid();
 }
 
 /*
- * Class:     org_rocksdb_Iterator
+ * Class:     org_rocksdb_RocksIterator
  * Method:    seekToFirst0
  * Signature: (J)V
  */
-void Java_org_rocksdb_Iterator_seekToFirst0(
+void Java_org_rocksdb_RocksIterator_seekToFirst0(
     JNIEnv* env, jobject jobj, jlong handle) {
   reinterpret_cast<rocksdb::Iterator*>(handle)->SeekToFirst();
 }
 
 /*
- * Class:     org_rocksdb_Iterator
- * Method:    seekToFirst0
+ * Class:     org_rocksdb_RocksIterator
+ * Method:    seekToLast0
  * Signature: (J)V
  */
-void Java_org_rocksdb_Iterator_seekToLast0(
+void Java_org_rocksdb_RocksIterator_seekToLast0(
     JNIEnv* env, jobject jobj, jlong handle) {
   reinterpret_cast<rocksdb::Iterator*>(handle)->SeekToLast();
 }
 
 /*
- * Class:     org_rocksdb_Iterator
- * Method:    seekToLast0
+ * Class:     org_rocksdb_RocksIterator
+ * Method:    next0
  * Signature: (J)V
  */
-void Java_org_rocksdb_Iterator_next0(
+void Java_org_rocksdb_RocksIterator_next0(
     JNIEnv* env, jobject jobj, jlong handle) {
   reinterpret_cast<rocksdb::Iterator*>(handle)->Next();
 }
 
 /*
- * Class:     org_rocksdb_Iterator
- * Method:    next0
+ * Class:     org_rocksdb_RocksIterator
+ * Method:    prev0
  * Signature: (J)V
  */
-void Java_org_rocksdb_Iterator_prev0(
+void Java_org_rocksdb_RocksIterator_prev0(
     JNIEnv* env, jobject jobj, jlong handle) {
   reinterpret_cast<rocksdb::Iterator*>(handle)->Prev();
 }
 
 /*
- * Class:     org_rocksdb_Iterator
- * Method:    prev0
- * Signature: (J)V
+ * Class:     org_rocksdb_RocksIterator
+ * Method:    seek0
+ * Signature: (J[BI)V
  */
-jbyteArray Java_org_rocksdb_Iterator_key0(
-    JNIEnv* env, jobject jobj, jlong handle) {
-  auto it = reinterpret_cast<rocksdb::Iterator*>(handle);
-  rocksdb::Slice key_slice = it->key();
-
-  jbyteArray jkey = env->NewByteArray(key_slice.size());
-  env->SetByteArrayRegion(
-      jkey, 0, key_slice.size(),
-      reinterpret_cast<const jbyte*>(key_slice.data()));
-  return jkey;
-}
-
-/*
- * Class:     org_rocksdb_Iterator
- * Method:    key0
- * Signature: (J)[B
- */
-jbyteArray Java_org_rocksdb_Iterator_value0(
-    JNIEnv* env, jobject jobj, jlong handle) {
-  auto it = reinterpret_cast<rocksdb::Iterator*>(handle);
-  rocksdb::Slice value_slice = it->value();
-
-  jbyteArray jvalue = env->NewByteArray(value_slice.size());
-  env->SetByteArrayRegion(
-      jvalue, 0, value_slice.size(),
-      reinterpret_cast<const jbyte*>(value_slice.data()));
-  return jvalue;
-}
-
-/*
- * Class:     org_rocksdb_Iterator
- * Method:    value0
- * Signature: (J)[B
- */
-void Java_org_rocksdb_Iterator_seek0(
+void Java_org_rocksdb_RocksIterator_seek0(
     JNIEnv* env, jobject jobj, jlong handle,
     jbyteArray jtarget, jint jtarget_len) {
   auto it = reinterpret_cast<rocksdb::Iterator*>(handle);
@@ -117,11 +94,11 @@ void Java_org_rocksdb_Iterator_seek0(
 }
 
 /*
- * Class:     org_rocksdb_Iterator
- * Method:    seek0
- * Signature: (J[BI)V
+ * Class:     org_rocksdb_RocksIterator
+ * Method:    status0
+ * Signature: (J)V
  */
-void Java_org_rocksdb_Iterator_status0(
+void Java_org_rocksdb_RocksIterator_status0(
     JNIEnv* env, jobject jobj, jlong handle) {
   auto it = reinterpret_cast<rocksdb::Iterator*>(handle);
   rocksdb::Status s = it->status();
@@ -134,12 +111,34 @@ void Java_org_rocksdb_Iterator_status0(
 }
 
 /*
- * Class:     org_rocksdb_Iterator
- * Method:    dispose
- * Signature: (J)V
+ * Class:     org_rocksdb_RocksIterator
+ * Method:    key0
+ * Signature: (J)[B
  */
-void Java_org_rocksdb_Iterator_dispose(
+jbyteArray Java_org_rocksdb_RocksIterator_key0(
     JNIEnv* env, jobject jobj, jlong handle) {
   auto it = reinterpret_cast<rocksdb::Iterator*>(handle);
-  delete it;
+  rocksdb::Slice key_slice = it->key();
+
+  jbyteArray jkey = env->NewByteArray(static_cast<jsize>(key_slice.size()));
+  env->SetByteArrayRegion(jkey, 0, static_cast<jsize>(key_slice.size()),
+                          reinterpret_cast<const jbyte*>(key_slice.data()));
+  return jkey;
+}
+
+/*
+ * Class:     org_rocksdb_RocksIterator
+ * Method:    value0
+ * Signature: (J)[B
+ */
+jbyteArray Java_org_rocksdb_RocksIterator_value0(
+    JNIEnv* env, jobject jobj, jlong handle) {
+  auto it = reinterpret_cast<rocksdb::Iterator*>(handle);
+  rocksdb::Slice value_slice = it->value();
+
+  jbyteArray jkeyValue =
+      env->NewByteArray(static_cast<jsize>(value_slice.size()));
+  env->SetByteArrayRegion(jkeyValue, 0, static_cast<jsize>(value_slice.size()),
+                          reinterpret_cast<const jbyte*>(value_slice.data()));
+  return jkeyValue;
 }

@@ -12,14 +12,17 @@ namespace librados {
 class TestMemIoCtxImpl : public TestIoCtxImpl {
 public:
   TestMemIoCtxImpl();
-  explicit TestMemIoCtxImpl(TestMemRadosClient &client, int64_t m_pool_id,
-                            const std::string& pool_name,
-                            TestMemRadosClient::Pool *pool);
+  TestMemIoCtxImpl(TestMemRadosClient *client, int64_t m_pool_id,
+                   const std::string& pool_name,
+                   TestMemRadosClient::Pool *pool);
+  virtual ~TestMemIoCtxImpl();
 
   virtual TestIoCtxImpl *clone();
 
   virtual int aio_remove(const std::string& oid, AioCompletionImpl *c);
 
+  virtual int append(const std::string& oid, const bufferlist &bl,
+                     const SnapContext &snapc);
   virtual int assert_exists(const std::string &oid);
 
   virtual int create(const std::string& oid, bool exclusive);
@@ -35,7 +38,7 @@ public:
                        bufferlist> &map);
   virtual int read(const std::string& oid, size_t len, uint64_t off,
                    bufferlist *bl);
-  virtual int remove(const std::string& oid);
+  virtual int remove(const std::string& oid, const SnapContext &snapc);
   virtual int selfmanaged_snap_create(uint64_t *snapid);
   virtual int selfmanaged_snap_remove(uint64_t snapid);
   virtual int selfmanaged_snap_rollback(const std::string& oid,
@@ -43,15 +46,22 @@ public:
   virtual int sparse_read(const std::string& oid, uint64_t off, uint64_t len,
                           std::map<uint64_t,uint64_t> *m, bufferlist *data_bl);
   virtual int stat(const std::string& oid, uint64_t *psize, time_t *pmtime);
-  virtual int truncate(const std::string& oid, uint64_t size);
+  virtual int truncate(const std::string& oid, uint64_t size,
+                       const SnapContext &snapc);
   virtual int write(const std::string& oid, bufferlist& bl, size_t len,
-                    uint64_t off);
-  virtual int write_full(const std::string& oid, bufferlist& bl);
+                    uint64_t off, const SnapContext &snapc);
+  virtual int write_full(const std::string& oid, bufferlist& bl,
+                         const SnapContext &snapc);
   virtual int xattr_get(const std::string& oid,
                         std::map<std::string, bufferlist>* attrset);
   virtual int xattr_set(const std::string& oid, const std::string &name,
                         bufferlist& bl);
   virtual int zero(const std::string& oid, uint64_t off, uint64_t len);
+
+protected:
+  TestMemRadosClient::Pool *get_pool() {
+    return m_pool;
+  }
 
 private:
   TestMemIoCtxImpl(const TestMemIoCtxImpl&);
@@ -63,7 +73,8 @@ private:
   size_t clip_io(size_t off, size_t len, size_t bl_len);
   void ensure_minimum_length(size_t len, bufferlist *bl);
 
-  TestMemRadosClient::SharedFile get_file(const std::string &oid, bool write);
+  TestMemRadosClient::SharedFile get_file(const std::string &oid, bool write,
+                                          const SnapContext &snapc);
 
 };
 

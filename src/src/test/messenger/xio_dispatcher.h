@@ -24,7 +24,7 @@ private:
   Messenger *messenger;
   uint64_t dcount;
 public:
-  XioDispatcher(Messenger *msgr);
+  explicit XioDispatcher(Messenger *msgr);
   virtual ~XioDispatcher();
 
   uint64_t get_dcount() { return dcount; }
@@ -76,7 +76,7 @@ public:
   virtual void ms_handle_remote_reset(Connection *con);
 
   /**
-   * @defgroup Authentication
+   * @defgroup test_xio_dispatcher_h_auth Authentication
    * @{
    */
   /**

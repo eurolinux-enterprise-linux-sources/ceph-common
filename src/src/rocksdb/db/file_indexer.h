@@ -12,18 +12,23 @@
 #include <functional>
 #include <limits>
 #include <vector>
+#include "port/port.h"
+#include "util/arena.h"
+#include "util/autovector.h"
 
 namespace rocksdb {
 
 class Comparator;
 struct FileMetaData;
+struct FdWithKeyRange;
+struct FileLevel;
 
 // The file tree structure in Version is prebuilt and the range of each file
 // is known. On Version::Get(), it uses binary search to find a potential file
 // and then check if a target key can be found in the file by comparing the key
-// to each file's smallest and largest key. The results of these comparisions
+// to each file's smallest and largest key. The results of these comparisons
 // can be reused beyond checking if a key falls into a file's range.
-// With some pre-calculated knowledge, each key comparision that has been done
+// With some pre-calculated knowledge, each key comparison that has been done
 // can serve as a hint to narrow down further searches: if a key compared to
 // be smaller than a file's smallest or largest, that comparison can be used
 // to find out the right bound of next binary search. Similarly, if a key
@@ -36,30 +41,30 @@ struct FileMetaData;
 // naive approach.
 class FileIndexer {
  public:
-  FileIndexer(const uint32_t num_levels, const Comparator* ucmp);
+  explicit FileIndexer(const Comparator* ucmp);
 
-  uint32_t NumLevelIndex();
+  size_t NumLevelIndex() const;
 
-  uint32_t LevelIndexSize(uint32_t level);
+  size_t LevelIndexSize(size_t level) const;
 
   // Return a file index range in the next level to search for a key based on
-  // smallest and largest key comparision for the current file specified by
+  // smallest and largest key comparison for the current file specified by
   // level and file_index. When *left_index < *right_index, both index should
   // be valid and fit in the vector size.
-  void GetNextLevelIndex(
-    const uint32_t level, const uint32_t file_index, const int cmp_smallest,
-    const int cmp_largest, int32_t* left_bound, int32_t* right_bound);
+  void GetNextLevelIndex(const size_t level, const size_t file_index,
+                         const int cmp_smallest, const int cmp_largest,
+                         int32_t* left_bound, int32_t* right_bound) const;
 
-  void ClearIndex();
-
-  void UpdateIndex(std::vector<FileMetaData*>* const files);
+  void UpdateIndex(Arena* arena, const size_t num_levels,
+                   std::vector<FileMetaData*>* const files);
 
   enum {
-    kLevelMaxIndex = std::numeric_limits<int32_t>::max()
+    // MSVC version 1800 still does not have constexpr for ::max()
+    kLevelMaxIndex = rocksdb::port::kMaxInt32
   };
 
  private:
-  const uint32_t num_levels_;
+  size_t num_levels_;
   const Comparator* ucmp_;
 
   struct IndexUnit {
@@ -110,20 +115,28 @@ class FileIndexer {
     int32_t largest_rb;
   };
 
-  void CalculateLB(const std::vector<FileMetaData*>& upper_files,
-    const std::vector<FileMetaData*>& lower_files,
-    std::vector<IndexUnit>* index,
-    std::function<int(const FileMetaData*, const FileMetaData*)> cmp_op,
-    std::function<void(IndexUnit*, int32_t)> set_index);
+  // Data structure to store IndexUnits in a whole level
+  struct IndexLevel {
+    size_t num_index;
+    IndexUnit* index_units;
 
-  void CalculateRB(const std::vector<FileMetaData*>& upper_files,
-    const std::vector<FileMetaData*>& lower_files,
-    std::vector<IndexUnit>* index,
-    std::function<int(const FileMetaData*, const FileMetaData*)> cmp_op,
-    std::function<void(IndexUnit*, int32_t)> set_index);
+    IndexLevel() : num_index(0), index_units(nullptr) {}
+  };
 
-  std::vector<std::vector<IndexUnit>> next_level_index_;
-  std::vector<int32_t> level_rb_;
+  void CalculateLB(
+      const std::vector<FileMetaData*>& upper_files,
+      const std::vector<FileMetaData*>& lower_files, IndexLevel* index_level,
+      std::function<int(const FileMetaData*, const FileMetaData*)> cmp_op,
+      std::function<void(IndexUnit*, int32_t)> set_index);
+
+  void CalculateRB(
+      const std::vector<FileMetaData*>& upper_files,
+      const std::vector<FileMetaData*>& lower_files, IndexLevel* index_level,
+      std::function<int(const FileMetaData*, const FileMetaData*)> cmp_op,
+      std::function<void(IndexUnit*, int32_t)> set_index);
+
+  autovector<IndexLevel> next_level_index_;
+  int32_t* level_rb_;
 };
 
 }  // namespace rocksdb

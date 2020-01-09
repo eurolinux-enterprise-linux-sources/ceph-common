@@ -16,13 +16,14 @@ namespace rocksdb {
 
 struct ReadOptions;
 class InternalKeyComparator;
+class Arena;
 
 struct TwoLevelIteratorState {
-  explicit TwoLevelIteratorState(bool check_prefix_may_match)
-    : check_prefix_may_match(check_prefix_may_match) {}
+  explicit TwoLevelIteratorState(bool _check_prefix_may_match)
+      : check_prefix_may_match(_check_prefix_may_match) {}
 
   virtual ~TwoLevelIteratorState() {}
-  virtual Iterator* NewSecondaryIterator(const Slice& handle) = 0;
+  virtual InternalIterator* NewSecondaryIterator(const Slice& handle) = 0;
   virtual bool PrefixMayMatch(const Slice& internal_key) = 0;
 
   // If call PrefixMayMatch()
@@ -39,7 +40,13 @@ struct TwoLevelIteratorState {
 //
 // Uses a supplied function to convert an index_iter value into
 // an iterator over the contents of the corresponding block.
-extern Iterator* NewTwoLevelIterator(TwoLevelIteratorState* state,
-      Iterator* first_level_iter);
+// arena: If not null, the arena is used to allocate the Iterator.
+//        When destroying the iterator, the destructor will destroy
+//        all the states but those allocated in arena.
+// need_free_iter_and_state: free `state` and `first_level_iter` if
+//                           true. Otherwise, just call destructor.
+extern InternalIterator* NewTwoLevelIterator(
+    TwoLevelIteratorState* state, InternalIterator* first_level_iter,
+    Arena* arena = nullptr, bool need_free_iter_and_state = true);
 
 }  // namespace rocksdb

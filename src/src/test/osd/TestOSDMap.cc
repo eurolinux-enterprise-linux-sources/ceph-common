@@ -38,7 +38,7 @@ public:
     entity_addr_t sample_addr;
     uuid_d sample_uuid;
     for (int i = 0; i < num_osds; ++i) {
-      sample_uuid.uuid[i] = i;
+      sample_uuid.generate_random();
       sample_addr.nonce = i;
       pending_inc.new_state[i] = CEPH_OSD_EXISTS | CEPH_OSD_NEW;
       pending_inc.new_up_client[i] = sample_addr;
@@ -103,21 +103,21 @@ TEST_F(OSDMapTest, Features) {
   uint64_t features = osdmap.get_features(CEPH_ENTITY_TYPE_OSD, NULL);
   ASSERT_TRUE(features & CEPH_FEATURE_CRUSH_TUNABLES);
   ASSERT_TRUE(features & CEPH_FEATURE_CRUSH_TUNABLES2);
-  ASSERT_FALSE(features & CEPH_FEATURE_CRUSH_TUNABLES3);
+  ASSERT_TRUE(features & CEPH_FEATURE_CRUSH_TUNABLES3);
   ASSERT_TRUE(features & CEPH_FEATURE_CRUSH_V2);
   ASSERT_TRUE(features & CEPH_FEATURE_OSD_ERASURE_CODES);
   ASSERT_TRUE(features & CEPH_FEATURE_OSDHASHPSPOOL);
-  ASSERT_FALSE(features & CEPH_FEATURE_OSD_PRIMARY_AFFINITY);
+  ASSERT_TRUE(features & CEPH_FEATURE_OSD_PRIMARY_AFFINITY);
 
   // clients have a slightly different view
   features = osdmap.get_features(CEPH_ENTITY_TYPE_CLIENT, NULL);
   ASSERT_TRUE(features & CEPH_FEATURE_CRUSH_TUNABLES);
   ASSERT_TRUE(features & CEPH_FEATURE_CRUSH_TUNABLES2);
-  ASSERT_FALSE(features & CEPH_FEATURE_CRUSH_TUNABLES3);
+  ASSERT_TRUE(features & CEPH_FEATURE_CRUSH_TUNABLES3);
   ASSERT_TRUE(features & CEPH_FEATURE_CRUSH_V2);
   ASSERT_FALSE(features & CEPH_FEATURE_OSD_ERASURE_CODES);  // dont' need this
   ASSERT_TRUE(features & CEPH_FEATURE_OSDHASHPSPOOL);
-  ASSERT_FALSE(features & CEPH_FEATURE_OSD_PRIMARY_AFFINITY);
+  ASSERT_TRUE(features & CEPH_FEATURE_OSD_PRIMARY_AFFINITY);
 
   // remove teh EC pool, but leave the rule.  add primary affinity.
   {

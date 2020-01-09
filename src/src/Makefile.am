@@ -1,20 +1,47 @@
 include Makefile-env.am
 
-SUBDIRS += ocf java tracing
-DIST_SUBDIRS += gmock ocf libs3 java tracing
+# a workaround for http://debbugs.gnu.org/cgi/bugreport.cgi?bug=18744, this
+# bug was fixed in automake 1.15, but automake 1.13 is supported by us.  so
+# we can not just require 1.15 using `AM_INIT_AUTOMAKE`
+am__is_gnu_make = { \
+  if test -z '$(MAKELEVEL)'; then \
+    false; \
+  elif test -n '$(MAKE_HOST)'; then \
+    true; \
+  elif test -n '$(MAKE_VERSION)' && test -n '$(CURDIR)'; then \
+    true; \
+  else \
+    false; \
+  fi; \
+}
 
+SUBDIRS += ocf java
+DIST_SUBDIRS += gmock ocf java
+
+LOCAL_ALL =
+LOCAL_CLEAN =
+LOCAL_INSTALLDATA =
+LOCAL_INSTALLEXEC =
+
+if NO_GIT_VERSION
+export NO_VERSION="yes"
+endif
 
 # subdirs
 
 include arch/Makefile.am
 include auth/Makefile.am
 include brag/Makefile.am
+include ceph-detect-init/Makefile.am
+include ceph-disk/Makefile.am
 include crush/Makefile.am
+include kv/Makefile.am
 include mon/Makefile.am
 include mds/Makefile.am
 include os/Makefile.am
 include osd/Makefile.am
 include erasure-code/Makefile.am
+include compressor/Makefile.am
 include osdc/Makefile.am
 include client/Makefile.am
 include global/Makefile.am
@@ -27,6 +54,7 @@ include messages/Makefile.am
 include include/Makefile.am
 include librados/Makefile.am
 include libradosstriper/Makefile.am
+include journal/Makefile.am
 include librbd/Makefile.am
 include rgw/Makefile.am
 include cls/Makefile.am
@@ -35,6 +63,9 @@ include rbd_replay/Makefile.am
 include test/Makefile.am
 include tools/Makefile.am
 include Makefile-rocksdb.am
+include Makefile-spdk.am
+include tracing/Makefile.am
+include pybind/Makefile.am
 
 
 # shell scripts
@@ -46,6 +77,7 @@ editpaths = sed \
 	-e 's|@sysconfdir[@]|$(sysconfdir)|g' \
 	-e 's|@datadir[@]|$(pkgdatadir)|g' \
 	-e 's|@prefix[@]|$(prefix)|g' \
+	-e 's|@libexecdir[@]|$(libexecdir)|g' \
 	-e 's|@@GCOV_PREFIX_STRIP[@][@]|$(GCOV_PREFIX_STRIP)|g'
 shell_scripts = ceph-debugpack ceph-post-file ceph-crush-location
 $(shell_scripts): Makefile
@@ -63,7 +95,6 @@ CLEANFILES += $(shell_scripts)
 # extra bits
 
 EXTRA_DIST += \
-	$(srcdir)/verify-mds-journal.sh \
 	$(srcdir)/vstart.sh \
 	$(srcdir)/stop.sh \
 	ceph-run \
@@ -73,11 +104,12 @@ EXTRA_DIST += \
 	$(srcdir)/init-rbdmap \
 	$(srcdir)/ceph-clsinfo \
 	$(srcdir)/make_version \
-	$(srcdir)/check_version \
 	$(srcdir)/.git_version \
 	$(srcdir)/ceph-rbdnamer \
-	$(srcdir)/test/encoding/readable.sh \
+	$(srcdir)/tools/ceph-monstore-update-crush.sh \
+	$(srcdir)/script/subman \
 	$(srcdir)/upstart/ceph-all.conf \
+	$(srcdir)/upstart/ceph-disk.conf \
 	$(srcdir)/upstart/ceph-mon.conf \
 	$(srcdir)/upstart/ceph-mon-all.conf \
 	$(srcdir)/upstart/ceph-mon-all-starter.conf \
@@ -88,14 +120,14 @@ EXTRA_DIST += \
 	$(srcdir)/upstart/ceph-mds.conf \
 	$(srcdir)/upstart/ceph-mds-all.conf \
 	$(srcdir)/upstart/ceph-mds-all-starter.conf \
+	$(srcdir)/upstart/ceph-rbd-mirror.conf \
+	$(srcdir)/upstart/ceph-rbd-mirror-all.conf \
+	$(srcdir)/upstart/ceph-rbd-mirror-all-starter.conf \
 	$(srcdir)/upstart/radosgw.conf \
 	$(srcdir)/upstart/radosgw-all.conf \
 	$(srcdir)/upstart/radosgw-all-starter.conf \
 	$(srcdir)/upstart/rbdmap.conf \
 	ceph.in \
-	ceph-disk \
-	ceph-disk-prepare \
-	ceph-disk-activate \
 	ceph-disk-udev \
 	ceph-create-keys \
 	ceph-rest-api \
@@ -103,26 +135,11 @@ EXTRA_DIST += \
 	mount.fuse.ceph \
 	rbd-replay-many \
 	rbdmap \
+	etc-rbdmap \
 	yasm-wrapper
 
 EXTRA_DIST += \
-	libs3/COPYING \
-	libs3/ChangeLog \
-	libs3/GNUmakefile \
-	libs3/GNUmakefile.mingw \
-	libs3/GNUmakefile.osx \
-	libs3/INSTALL \
-	libs3/LICENSE \
-	libs3/README \
-	libs3/TODO \
-	libs3/archlinux \
-	libs3/debian \
-	libs3/doxyfile \
-	libs3/inc \
-	libs3/libs3.spec \
-	libs3/mswin \
-	libs3/src \
-	libs3/test \
+	CMakeLists.txt \
 	unittest_bufferlist.sh
 
 
@@ -132,26 +149,27 @@ docdir ?= ${datadir}/doc/ceph
 doc_DATA = $(srcdir)/sample.ceph.conf sample.fetch_config
 
 
-# various scripts
-
-shell_commondir = $(libdir)/ceph
-shell_common_SCRIPTS = ceph_common.sh
+# various scripts in $(libexecdir)
 
 ceph_libexecdir = $(libexecdir)/ceph
-ceph_libexec_SCRIPTS = ceph-osd-prestart.sh
+ceph_libexec_SCRIPTS = ceph_common.sh ceph-osd-prestart.sh
 
+if ENABLE_SUBMAN
+submandir = /etc/cron.hourly
+subman_DATA = script/subman
+endif
 
 # tests to actually run on "make check"; if you need extra, non-test,
 # executables built, you need to replace this with manual assignments
 # target by target
 
 TESTS = \
-	$(check_PROGRAMS) \
+	$(check_TESTPROGRAMS) \
 	$(check_SCRIPTS)
 
-check-local:
-	$(top_srcdir)/qa/workunits/erasure-code/encode-decode-non-regression.sh 
-	$(srcdir)/test/encoding/readable.sh ../ceph-object-corpus
+check_SCRIPTS += \
+	../qa/workunits/erasure-code/encode-decode-non-regression.sh \
+	test/encoding/readable.sh
 
 if WITH_LTTNG
 # TODO: If we're running the parallel test harness (the preferred harness), this should be AM_TESTS_ENVIRONMENT instead.
@@ -160,12 +178,18 @@ if WITH_LTTNG
 TESTS_ENVIRONMENT = LD_PRELOAD=liblttng-ust-fork.so; export LD_PRELOAD; echo "LD_PRELOAD=$${LD_PRELOAD}";
 endif
 
+AM_TESTS_ENVIRONMENT = export CEPH_ROOT="$(abs_top_srcdir)";
+AM_TESTS_ENVIRONMENT += export CEPH_BUILD_DIR="$(abs_srcdir)";
+AM_TESTS_ENVIRONMENT += export CEPH_BIN="$(abs_srcdir)";
+AM_TESTS_ENVIRONMENT += export CEPH_LIB="$(abs_srcdir)/.libs";
+AM_TESTS_ENVIRONMENT += export PATH="$(abs_srcdir):$$PATH";
+
 # base targets
 
 core-daemons: ceph-mon ceph-osd ceph-mds radosgw
 admin-tools: monmaptool osdmaptool crushtool ceph-authtool
 base: core-daemons admin-tools \
-	cephfs ceph-syn ceph-conf \
+	cephfs ceph-fuse ceph-syn ceph-conf \
 	rados radosgw-admin librados-config \
 	init-ceph ceph-post-file \
 	ceph
@@ -175,19 +199,17 @@ base: core-daemons admin-tools \
 
 FORCE:
 .git_version: FORCE
-	$(srcdir)/check_version $(srcdir)/.git_version
+	$(srcdir)/make_version -g $(srcdir)/.git_version
 
 # if NO_VERSION is set, only generate a new ceph_ver.h if there currently 
 # is none, and call "make_version -n" to fill it with a fixed string.
 # Otherwise, set it from the contents of .git_version.
 
-ceph_ver.h: .git_version
+ceph_ver.h: .git_version FORCE
 	if [ -n "$$NO_VERSION" ] ; then \
-	    if [ ! -f ./ceph_ver.h ] ; then \
-	        $(srcdir)/make_version -n ./ceph_ver.h ; \
-	    fi; \
-        else \
-	    $(srcdir)/make_version $(srcdir)/.git_version ./ceph_ver.h ; \
+		$(srcdir)/make_version -g $(srcdir)/.git_version -c $(srcdir)/ceph_ver.h -n ; \
+	else \
+		$(srcdir)/make_version -g $(srcdir)/.git_version -c $(srcdir)/ceph_ver.h ; \
 	fi
 
 ceph_ver.c: ./ceph_ver.h
@@ -198,18 +220,19 @@ sample.fetch_config: fetch_config
 	cp -f $(srcdir)/fetch_config ./sample.fetch_config
 
 dist-hook:
-	$(srcdir)/check_version $(srcdir)/.git_version
+	$(srcdir)/make_version -g $(srcdir)/.git_version
 
 CLEANFILES += ceph_ver.h sample.fetch_config
 
 
 # cleaning
 
-clean-local:
+base-clean-local::
 	rm -f *.so 
 	find . -name '*.gcno' -o -name '*.gcda' -o -name '*.lcov' -o -name "*.o" -o -name "*.lo" | xargs rm -f
 	rm -f ceph java/java/com/ceph/crush/Bucket.class
 
+LOCAL_CLEAN += base-clean-local
 
 # pybind
 
@@ -255,12 +278,14 @@ if ENABLE_COVERAGE
 	-test/coverage.sh -d $(srcdir) -o check-coverage make check
 endif
 
-install-data-local: install-coverage
+base-install-data-local:: install-coverage
 	-mkdir -p $(DESTDIR)$(sysconfdir)/ceph
 	-mkdir -p $(DESTDIR)$(localstatedir)/log/ceph
 	-mkdir -p $(DESTDIR)$(localstatedir)/lib/ceph/tmp
 
-uninstall-local: uninstall-coverage
+LOCAL_INSTALLDATA += base-install-data-local
+
+uninstall-local:: uninstall-coverage
 	-rmdir -p $(DESTDIR)$(sysconfdir)/ceph/
 	-rmdir -p $(DESTDIR)$(localstatedir)/log/ceph
 	-rmdir -p $(DESTDIR)$(localstatedir)/lib/ceph/tmp
@@ -290,3 +315,9 @@ if ENABLE_SERVER
 include Makefile-server.am
 endif
 
+# local targets
+
+all-local: $(LOCAL_ALL)
+clean-local: $(LOCAL_CLEAN)
+install-exec-local: $(LOCAL_INSTALLEXEC)
+install-data-local: $(LOCAL_INSTALLDATA)

@@ -1,0 +1,38 @@
+From f616bc4eae5f28946a1730bbcdf543a4996730d9 Mon Sep 17 00:00:00 2001
+From: Boris Ranto <branto@redhat.com>
+Date: Tue, 21 Feb 2017 15:11:13 +0100
+Subject: [PATCH] libradosstripper: Build libradostripper for rados as noinst
+
+---
+ src/libradosstriper/Makefile.am | 4 +---
+ 1 file changed, 1 insertion(+), 3 deletions(-)
+
+diff --git a/src/libradosstriper/Makefile.am b/src/libradosstriper/Makefile.am
+index 293c8a5..9ec1e83 100644
+--- a/src/libradosstriper/Makefile.am
++++ b/src/libradosstriper/Makefile.am
+@@ -1,6 +1,5 @@
+ if ENABLE_CLIENT
+ if WITH_RADOS
+-if WITH_RADOSSTRIPER
+ 
+ libradosstriper_la_SOURCES = \
+ 	libradosstriper/libradosstriper.cc \
+@@ -16,13 +15,12 @@ libradosstriper_la_LDFLAGS = ${AM_LDFLAGS} -version-info 1:0:0
+ if LINUX
+ libradosstriper_la_LDFLAGS += -export-symbols-regex '^radosstriper_.*'
+ endif
+-lib_LTLIBRARIES += libradosstriper.la
++noinst_LTLIBRARIES += libradosstriper.la
+ 
+ noinst_HEADERS += \
+ 	libradosstriper/RadosStriperImpl.h \
+ 	libradosstriper/MultiAioCompletionImpl.h
+ 
+-endif # WITH_RADOSSTRIPER
+ endif # WITH_RADOS
+ endif # ENABLE_CLIENT
+ 
+-- 
+2.9.3
+

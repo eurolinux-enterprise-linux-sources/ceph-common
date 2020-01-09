@@ -20,7 +20,6 @@
 #include "include/types.h"
 #include "include/blobhash.h"
 #include "include/encoding.h"
-#include "include/hash_namespace.h"
 
 namespace ceph {
   class Formatter;
@@ -39,19 +38,19 @@ public:
   static const int TYPE_OSD = CEPH_ENTITY_TYPE_OSD;
   static const int TYPE_CLIENT = CEPH_ENTITY_TYPE_CLIENT;
 
-  static const int NEW = -1;
+  static const int64_t NEW = -1;
 
   // cons
   entity_name_t() : _type(0), _num(0) { }
   entity_name_t(int t, int64_t n) : _type(t), _num(n) { }
-  entity_name_t(const ceph_entity_name &n) : 
+  explicit entity_name_t(const ceph_entity_name &n) : 
     _type(n.type), _num(n.num) { }
 
   // static cons
-  static entity_name_t MON(int i=NEW) { return entity_name_t(TYPE_MON, i); }
-  static entity_name_t MDS(int i=NEW) { return entity_name_t(TYPE_MDS, i); }
-  static entity_name_t OSD(int i=NEW) { return entity_name_t(TYPE_OSD, i); }
-  static entity_name_t CLIENT(int i=NEW) { return entity_name_t(TYPE_CLIENT, i); }
+  static entity_name_t MON(int64_t i=NEW) { return entity_name_t(TYPE_MON, i); }
+  static entity_name_t MDS(int64_t i=NEW) { return entity_name_t(TYPE_MDS, i); }
+  static entity_name_t OSD(int64_t i=NEW) { return entity_name_t(TYPE_OSD, i); }
+  static entity_name_t CLIENT(int64_t i=NEW) { return entity_name_t(TYPE_CLIENT, i); }
   
   int64_t num() const { return _num; }
   int type() const { return _type; }
@@ -133,7 +132,7 @@ inline std::ostream& operator<<(std::ostream& out, const ceph_entity_name& addr)
   return out << *(const entity_name_t*)&addr;
 }
 
-CEPH_HASH_NAMESPACE_START
+namespace std {
   template<> struct hash< entity_name_t >
   {
     size_t operator()( const entity_name_t &m ) const
@@ -141,7 +140,7 @@ CEPH_HASH_NAMESPACE_START
       return rjhash32(m.type() ^ m.num());
     }
   };
-CEPH_HASH_NAMESPACE_END
+} // namespace std
 
 
 
@@ -152,22 +151,52 @@ CEPH_HASH_NAMESPACE_END
  * ipv4 for now.
  */
 
+#if defined(__linux__) || defined(DARWIN) || defined(__FreeBSD__)
 /*
- * encode sockaddr.ss_family in big endian
+ * encode sockaddr.ss_family as network byte order 
  */
 static inline void encode(const sockaddr_storage& a, bufferlist& bl) {
   struct sockaddr_storage ss = a;
-#if !defined(__FreeBSD__)
+#if defined(DARWIN) || defined(__FreeBSD__)
+  unsigned short *ss_family = reinterpret_cast<unsigned short*>(&ss);
+  *ss_family = htons(a.ss_family);
+#else
   ss.ss_family = htons(ss.ss_family);
 #endif
   ::encode_raw(ss, bl);
 }
 static inline void decode(sockaddr_storage& a, bufferlist::iterator& bl) {
   ::decode_raw(a, bl);
-#if !defined(__FreeBSD__)
+#if defined(DARWIN) || defined(__FreeBSD__)
+  unsigned short *ss_family = reinterpret_cast<unsigned short *>(&a);
+  a.ss_family = ntohs(*ss_family);
+  a.ss_len = 0;
+#else
   a.ss_family = ntohs(a.ss_family);
 #endif
 }
+#endif
+
+// define a wire format for sockaddr that matches Linux's.
+struct ceph_sockaddr_storage {
+  __le16 ss_family;
+  __u8 __ss_padding[128 - sizeof(__le16)];
+
+  void encode(bufferlist& bl) const {
+    struct ceph_sockaddr_storage ss = *this;
+    ss.ss_family = htons(ss.ss_family);
+    ::encode_raw(ss, bl);
+  }
+
+  void decode(bufferlist::iterator& bl) {
+    struct ceph_sockaddr_storage ss;
+    ::decode_raw(ss, bl);
+    ss.ss_family = ntohs(ss.ss_family);
+    *this = ss;
+  }
+} __attribute__ ((__packed__));
+
+WRITE_CLASS_ENCODER(ceph_sockaddr_storage)
 
 struct entity_addr_t {
   __u32 type;
@@ -193,7 +222,7 @@ struct entity_addr_t {
   entity_addr_t() : type(0), nonce(0) { 
     memset(&addr, 0, sizeof(addr));
   }
-  entity_addr_t(const ceph_entity_addr &o) {
+  explicit entity_addr_t(const ceph_entity_addr &o) {
     type = o.type;
     nonce = o.nonce;
     addr = o.in_addr;
@@ -222,7 +251,21 @@ struct entity_addr_t {
     return addr6;
   }
 
-  bool set_sockaddr(struct sockaddr *sa)
+  const sockaddr *get_sockaddr() const {
+    return (const sockaddr *)&addr4;
+  }
+  size_t get_sockaddr_len() const {
+    switch (addr.ss_family) {
+    case AF_INET:
+      return sizeof(addr4);
+      break;
+    case AF_INET6:
+      return sizeof(addr6);
+      break;
+    }
+    return sizeof(addr);
+  }
+  bool set_sockaddr(const struct sockaddr *sa)
   {
     switch (sa->sa_family) {
     case AF_INET:
@@ -235,6 +278,10 @@ struct entity_addr_t {
       return false;
     }
     return true;
+  }
+
+  sockaddr_storage get_sockaddr_storage() const {
+    return addr;
   }
 
   void set_in4_quad(int pos, int val) {
@@ -324,15 +371,37 @@ struct entity_addr_t {
 
   bool parse(const char *s, const char **end = 0);
 
+  // Right now, these only deal with sockaddr_storage that have only family and content.
+  // Apparently on BSD there is also an ss_len that we need to handle; this requires
+  // broader study
+
+
   void encode(bufferlist& bl) const {
     ::encode(type, bl);
     ::encode(nonce, bl);
+#if defined(__linux__) || defined(DARWIN) || defined(__FreeBSD__)
     ::encode(addr, bl);
+#else
+    ceph_sockaddr_storage wireaddr;
+    ::memset(&wireaddr, '\0', sizeof(wireaddr));
+    unsigned copysize = MIN(sizeof(wireaddr), sizeof(addr));
+    // ceph_sockaddr_storage is in host byte order
+    ::memcpy(&wireaddr, &addr, copysize);
+    ::encode(wireaddr, bl);
+#endif
   }
   void decode(bufferlist::iterator& bl) {
     ::decode(type, bl);
     ::decode(nonce, bl);
+#if defined(__linux__) || defined(DARWIN) || defined(__FreeBSD__)
     ::decode(addr, bl);
+#else
+    ceph_sockaddr_storage wireaddr;
+    ::memset(&wireaddr, '\0', sizeof(wireaddr));
+    ::decode(wireaddr, bl);
+    unsigned copysize = MIN(sizeof(wireaddr), sizeof(addr));
+    ::memcpy(&addr, &wireaddr, copysize);
+#endif
   }
 
   void dump(Formatter *f) const;
@@ -353,7 +422,7 @@ inline bool operator<=(const entity_addr_t& a, const entity_addr_t& b) { return 
 inline bool operator>(const entity_addr_t& a, const entity_addr_t& b) { return memcmp(&a, &b, sizeof(a)) > 0; }
 inline bool operator>=(const entity_addr_t& a, const entity_addr_t& b) { return memcmp(&a, &b, sizeof(a)) >= 0; }
 
-CEPH_HASH_NAMESPACE_START
+namespace std {
   template<> struct hash< entity_addr_t >
   {
     size_t operator()( const entity_addr_t& x ) const
@@ -362,7 +431,7 @@ CEPH_HASH_NAMESPACE_START
       return H((const char*)&x, sizeof(x));
     }
   };
-CEPH_HASH_NAMESPACE_END
+} // namespace std
 
 
 /*
@@ -373,6 +442,7 @@ struct entity_inst_t {
   entity_addr_t addr;
   entity_inst_t() {}
   entity_inst_t(entity_name_t n, const entity_addr_t& a) : name(n), addr(a) {}
+  // cppcheck-suppress noExplicitConstructor
   entity_inst_t(const ceph_entity_inst& i) : name(i.name), addr(i.addr) { }
   entity_inst_t(const ceph_entity_name& n, const ceph_entity_addr &a) : name(n), addr(a) {}
   operator ceph_entity_inst() {
@@ -407,7 +477,7 @@ inline bool operator<=(const entity_inst_t& a, const entity_inst_t& b) {
 inline bool operator>(const entity_inst_t& a, const entity_inst_t& b) { return b < a; }
 inline bool operator>=(const entity_inst_t& a, const entity_inst_t& b) { return b <= a; }
 
-CEPH_HASH_NAMESPACE_START
+namespace std {
   template<> struct hash< entity_inst_t >
   {
     size_t operator()( const entity_inst_t& x ) const
@@ -417,7 +487,7 @@ CEPH_HASH_NAMESPACE_START
       return H(x.name) ^ I(x.addr);
     }
   };
-CEPH_HASH_NAMESPACE_END
+} // namespace std
 
 
 inline ostream& operator<<(ostream& out, const entity_inst_t &i)

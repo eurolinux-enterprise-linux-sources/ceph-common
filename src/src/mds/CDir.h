@@ -18,12 +18,12 @@
 #define CEPH_CDIR_H
 
 #include "include/types.h"
-#include "include/buffer.h"
+#include "include/buffer_fwd.h"
 #include "mdstypes.h"
 #include "common/config.h"
 #include "common/DecayCounter.h"
 
-#include <iostream>
+#include <iosfwd>
 
 #include <list>
 #include <set>
@@ -42,6 +42,8 @@ struct ObjectOperation;
 
 ostream& operator<<(ostream& out, const class CDir& dir);
 class CDir : public MDSCacheObject {
+  friend ostream& operator<<(ostream& out, const class CDir& dir);
+
   /*
    * This class uses a boost::pool to handle allocation. This is *not*
    * thread-safe, so don't do allocations from multiple threads!
@@ -170,7 +172,7 @@ public:
 
   fnode_t fnode;
   snapid_t first;
-  std::map<snapid_t,old_rstat_t> dirty_old_rstat;  // [value.first,key]
+  compact_map<snapid_t,old_rstat_t> dirty_old_rstat;  // [value.first,key]
 
   // my inodes with dirty rstat data
   elist<CInode*> dirty_rstat_inodes;     
@@ -222,17 +224,122 @@ public:
     }
   }
   void mark_dirty(version_t pv, LogSegment *ls);
-  void log_mark_dirty();
   void mark_clean();
 
   bool is_new() { return item_new.is_on_list(); }
   void mark_new(LogSegment *ls);
 
   bool is_bad() { return state_test(STATE_BADFRAG); }
+private:
+  void log_mark_dirty();
 
 public:
   typedef std::map<dentry_key_t, CDentry*> map_t;
+
+  class scrub_info_t {
+  public:
+    /// inodes we contain with dirty scrub stamps
+    map<dentry_key_t,CInode*> dirty_scrub_stamps; // TODO: make use of this!
+    struct scrub_stamps {
+      version_t version;
+      utime_t time;
+      scrub_stamps() : version(0) {}
+      void operator=(const scrub_stamps &o) {
+        version = o.version;
+        time = o.time;
+      }
+    };
+
+    scrub_stamps recursive_start; // when we last started a recursive scrub
+    scrub_stamps last_recursive; // when we last finished a recursive scrub
+    scrub_stamps last_local; // when we last did a local scrub
+
+    bool directory_scrubbing; /// safety check
+    bool need_scrub_local;
+    bool last_scrub_dirty; /// is scrub info dirty or is it flushed to fnode?
+    bool pending_scrub_error;
+
+    /// these are lists of children in each stage of scrubbing
+    set<dentry_key_t> directories_to_scrub;
+    set<dentry_key_t> directories_scrubbing;
+    set<dentry_key_t> directories_scrubbed;
+    set<dentry_key_t> others_to_scrub;
+    set<dentry_key_t> others_scrubbing;
+    set<dentry_key_t> others_scrubbed;
+
+    ScrubHeaderRefConst header;
+
+    scrub_info_t() :
+      directory_scrubbing(false),
+      need_scrub_local(false),
+      last_scrub_dirty(false),
+      pending_scrub_error(false) {}
+  };
+  /**
+   * Call to start this CDir on a new scrub.
+   * @pre It is not currently scrubbing
+   * @pre The CDir is marked complete.
+   * @post It has set up its internal scrubbing state.
+   */
+  void scrub_initialize(const ScrubHeaderRefConst& header);
+  /**
+   * Get the next dentry to scrub. Gives you a CDentry* and its meaning. This
+   * function will give you all directory-representing dentries before any
+   * others.
+   * 0: success, you should scrub this CDentry right now
+   * EAGAIN: is currently fetching the next CDentry into memory for you.
+   *   It will activate your callback when done; try again when it does!
+   * ENOENT: there are no remaining dentries to scrub
+   * <0: There was an unexpected error
+   *
+   * @param cb An MDSInternalContext which will be activated only if
+   *   we return EAGAIN via rcode, or else ignored
+   * @param dnout CDentry * which you should next scrub, or NULL
+   * @returns a value as described above
+   */
+  int scrub_dentry_next(MDSInternalContext *cb, CDentry **dnout);
+  /**
+   * Get the currently scrubbing dentries. When returned, the passed-in
+   * list will be filled with all CDentry * which have been returned
+   * from scrub_dentry_next() but not sent back via scrub_dentry_finished().
+   */
+  void scrub_dentries_scrubbing(list<CDentry*> *out_dentries);
+  /**
+   * Report to the CDir that a CDentry has been scrubbed. Call this
+   * for every CDentry returned from scrub_dentry_next().
+   * @param dn The CDentry which has been scrubbed.
+   */
+  void scrub_dentry_finished(CDentry *dn);
+  /**
+   * Call this once all CDentries have been scrubbed, according to
+   * scrub_dentry_next's listing. It finalizes the scrub statistics.
+   */
+  void scrub_finished();
+  /**
+   * Tell the CDir to do a local scrub of itself.
+   * @pre The CDir is_complete().
+   * @returns true if the rstats and directory contents match, false otherwise.
+   */
+  bool scrub_local();
+private:
+  /**
+   * Create a scrub_info_t struct for the scrub_infop pointer.
+   */
+  void scrub_info_create() const;
+  /**
+   * Delete the scrub_infop if it's not got any useful data.
+   */
+  void scrub_maybe_delete_info();
+  /**
+   * Check the given set (presumably one of those in scrub_info_t) for the
+   * next key to scrub and look it up (or fail!).
+   */
+  int _next_dentry_on_set(set<dentry_key_t>& dns, bool missing_okay,
+                          MDSInternalContext *cb, CDentry **dnout);
+
+
 protected:
+  scrub_info_t *scrub_infop;
 
   // contents of this directory
   map_t items;       // non-null AND null
@@ -247,18 +354,18 @@ protected:
   version_t committing_version;
   version_t committed_version;
 
+  compact_set<string> stale_items;
 
   // lock nesting, freeze
-  int auth_pins;
-#ifdef MDS_AUTHPIN_SET
-  multiset<void*> auth_pin_set;
-#endif
-  int nested_auth_pins, dir_auth_pins;
+  static int num_frozen_trees;
+  static int num_freezing_trees;
+
+  int dir_auth_pins;
   int request_pins;
 
   // cache control  (defined for authority; hints for replicas)
   __s32      dir_rep;
-  std::set<__s32> dir_rep_by;      // if dir_rep == REP_LIST
+  compact_set<__s32> dir_rep_by;      // if dir_rep == REP_LIST
 
   // popularity
   dirfrag_load_vec_t pop_me;
@@ -296,11 +403,18 @@ protected:
  public:
   CDir(CInode *in, frag_t fg, MDCache *mdcache, bool auth);
   ~CDir() {
+    delete scrub_infop;
     remove_bloom();
     g_num_dir--;
     g_num_dirs++;
   }
 
+  const scrub_info_t *scrub_info() const {
+    if (!scrub_infop) {
+      scrub_info_create();
+    }
+    return scrub_infop;
+  }
 
 
   // -- accessors --
@@ -321,7 +435,7 @@ protected:
   unsigned get_num_snap_null() const { return num_snap_null; }
   unsigned get_num_any() const { return num_head_items + num_head_null + num_snap_items + num_snap_null; }
   
-  bool check_rstats();
+  bool check_rstats(bool scrub=false);
 
   void inc_num_dirty() { num_dirty++; }
   void dec_num_dirty() { 
@@ -336,16 +450,11 @@ protected:
 
   // -- dentries and inodes --
  public:
-  CDentry* lookup_exact_snap(const std::string& dname, snapid_t last) {
-    map_t::iterator p = items.find(dentry_key_t(last, dname.c_str()));
-    if (p == items.end())
-      return NULL;
-    return p->second;
+  CDentry* lookup_exact_snap(const std::string& dname, snapid_t last);
+  CDentry* lookup(const std::string& n, snapid_t snap=CEPH_NOSNAP);
+  CDentry* lookup(const char *n, snapid_t snap=CEPH_NOSNAP) {
+    return lookup(std::string(n), snap);
   }
-  CDentry* lookup(const std::string& n, snapid_t snap=CEPH_NOSNAP) {
-    return lookup(n.c_str(), snap);
-  }
-  CDentry* lookup(const char *n, snapid_t snap=CEPH_NOSNAP);
 
   CDentry* add_null_dentry(const std::string& dname, 
 			   snapid_t first=2, snapid_t last=CEPH_NOSNAP);
@@ -403,6 +512,8 @@ private:
    */
   mds_authority_t dir_auth;
 
+  std::string get_path() const;
+
  public:
   mds_authority_t authority() const;
   mds_authority_t get_dir_auth() const { return dir_auth; }
@@ -428,10 +539,7 @@ private:
   // for giving to clients
   void get_dist_spec(std::set<mds_rank_t>& ls, mds_rank_t auth) {
     if (is_rep()) {
-      for (std::map<mds_rank_t,unsigned>::iterator p = replicas_begin();
-	   p != replicas_end(); 
-	   ++p)
-	ls.insert(p->first);
+      list_replicas(ls);
       if (!ls.empty()) 
 	ls.insert(auth);
     }
@@ -499,13 +607,38 @@ private:
   void fetch(MDSInternalContextBase *c, const std::string& want_dn, bool ignore_authpinnability=false);
 protected:
   void _omap_fetch(const std::string& want_dn);
+  CDentry *_load_dentry(
+      const std::string &key,
+      const std::string &dname,
+      snapid_t last,
+      bufferlist &bl,
+      int pos,
+      const std::set<snapid_t> *snaps,
+      bool *force_dirty,
+      list<CInode*> *undef_inodes);
+
+  /**
+   * Mark this fragment as BADFRAG (common part of go_bad and go_bad_dentry)
+   */
+  void _go_bad();
+
+  /**
+   * Go bad due to a damaged dentry (register with damagetable and go BADFRAG)
+   */
+  void go_bad_dentry(snapid_t last, const std::string &dname);
+
+  /**
+   * Go bad due to a damaged header (register with damagetable and go BADFRAG)
+   */
+  void go_bad();
+
   void _omap_fetched(bufferlist& hdrbl, std::map<std::string, bufferlist>& omap,
 		     const std::string& want_dn, int r);
   void _tmap_fetch(const std::string& want_dn);
   void _tmap_fetched(bufferlist &bl, const std::string& want_dn, int r);
 
   // -- commit --
-  std::map<version_t, std::list<MDSInternalContextBase*> > waiting_for_commit;
+  compact_map<version_t, std::list<MDSInternalContextBase*> > waiting_for_commit;
   void _commit(version_t want, int op_prio);
   void _omap_commit(int op_prio);
   void _encode_dentry(CDentry *dn, bufferlist& bl, const std::set<snapid_t> *snaps);
@@ -539,10 +672,9 @@ public:
     if (request_pins == 0) put(PIN_REQUEST);
   }
 
-    
   // -- waiters --
 protected:
-  std::map< string_snap_t, std::list<MDSInternalContextBase*> > waiting_on_dentry;
+  compact_map< string_snap_t, std::list<MDSInternalContextBase*> > waiting_on_dentry;
 
 public:
   bool is_waiting_for_dentry(const std::string& dname, snapid_t snap) {
@@ -564,7 +696,6 @@ public:
     put(PIN_TEMPEXPORTING);
   }
   void decode_import(bufferlist::iterator& blp, utime_t now, LogSegment *ls);
-
 
   // -- auth pins --
   bool can_auth_pin() const { return is_auth() && !(is_frozen() || is_freezing()); }

@@ -110,8 +110,8 @@ public:
     assert(remote_wrlocks.empty());
   }
 
-  bool is_master() { return slave_to_mds == MDS_RANK_NONE; }
-  bool is_slave() { return slave_to_mds != MDS_RANK_NONE; }
+  bool is_master() const { return slave_to_mds == MDS_RANK_NONE; }
+  bool is_slave() const { return slave_to_mds != MDS_RANK_NONE; }
 
   client_t get_client() {
     if (reqid.name.is_client())
@@ -158,12 +158,14 @@ public:
   void apply();
   void cleanup();
 
-  virtual void print(ostream &out) {
+  virtual void print(ostream &out) const {
     out << "mutation(" << this << ")";
   }
+
+  virtual void dump(Formatter *f) const {}
 };
 
-inline ostream& operator<<(ostream& out, MutationImpl &mut)
+inline ostream& operator<<(ostream &out, const MutationImpl &mut)
 {
   mut.print(out);
   return out;
@@ -336,6 +338,7 @@ struct MDRequestImpl : public MutationImpl, public TrackedOp {
   void set_filepath2(const filepath& fp);
 
   void print(ostream &out);
+  void dump(Formatter *f) const;
 
   // TrackedOp stuff
   typedef ceph::shared_ptr<MDRequestImpl> Ref;

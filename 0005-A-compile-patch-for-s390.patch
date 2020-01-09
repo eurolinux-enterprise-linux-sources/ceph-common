@@ -1,0 +1,28 @@
+From 14b0f450b47c8dac895d49f3cda4ebb7a798fbb1 Mon Sep 17 00:00:00 2001
+From: Boris Ranto <branto@redhat.com>
+Date: Mon, 24 Apr 2017 16:01:17 -0700
+Subject: [PATCH] A compile patch for s390
+
+Signed-off-by: Boris Ranto <branto@redhat.com>
+---
+ src/include/encoding.h | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/src/include/encoding.h b/src/include/encoding.h
+index 2657c62..0d4a54f 100644
+--- a/src/include/encoding.h
++++ b/src/include/encoding.h
+@@ -106,6 +106,10 @@ WRITE_INTTYPE_ENCODER(uint32_t, le32)
+ WRITE_INTTYPE_ENCODER(int32_t, le32)
+ WRITE_INTTYPE_ENCODER(uint16_t, le16)
+ WRITE_INTTYPE_ENCODER(int16_t, le16)
++#if defined(__s390__) && !defined(__s390x__)
++WRITE_INTTYPE_ENCODER(size_t, le32)
++#endif
++
+ 
+ #ifdef ENCODE_DUMP
+ # include <stdio.h>
+-- 
+2.9.3
+
