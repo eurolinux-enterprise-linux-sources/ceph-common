@@ -1,0 +1,28 @@
+From d1510d9d33fe4091fc8cdf364683fc832e698b30 Mon Sep 17 00:00:00 2001
+From: Jason Dillaman <dillaman@redhat.com>
+Date: Mon, 11 May 2015 17:05:49 -0400
+Subject: [PATCH 13/22] WorkQueue: added virtual destructor
+
+Signed-off-by: Jason Dillaman <dillaman@redhat.com>
+(cherry picked from commit b3f5a75332c058816dc39b71e9d2b36e752159f4)
+(cherry picked from commit 78afe97c87f3b4edda762a7a3c93ad79c437fc5d)
+---
+ src/common/WorkQueue.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/src/common/WorkQueue.h b/src/common/WorkQueue.h
+index 07aea2d..53bed77 100644
+--- a/src/common/WorkQueue.h
++++ b/src/common/WorkQueue.h
+@@ -330,7 +330,7 @@ private:
+ 
+ public:
+   ThreadPool(CephContext *cct_, string nm, int n, const char *option = NULL);
+-  ~ThreadPool();
++  virtual ~ThreadPool();
+ 
+   /// return number of threads currently running
+   int get_num_threads() {
+-- 
+2.1.0
+

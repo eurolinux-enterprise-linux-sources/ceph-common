@@ -1,0 +1,103 @@
+From d4b0d7fbed1f1f321e05b8c6fe2d392294f49875 Mon Sep 17 00:00:00 2001
+From: Haomai Wang <haomaiwang@gmail.com>
+Date: Mon, 1 Dec 2014 23:54:16 +0800
+Subject: [PATCH 10/22] CephContext: Add AssociatedSingletonObject to allow
+ CephContext's singleton
+
+If some objects associated to CephContext want to create a singleton object,
+it can inherit AssociatedSingletonObject and implement destruction to get notified.
+
+Signed-off-by: Haomai Wang <haomaiwang@gmail.com>
+(cherry picked from commit 7fed5dee4f96a83d1d6914f6fc0895bba2d15b99)
+(cherry picked from commit 3fea27c7f6b1b1403bce4d7736367975798a8634)
+---
+ src/common/ceph_context.cc |  6 ++++++
+ src/common/ceph_context.h  | 20 ++++++++++++++++++++
+ 2 files changed, 26 insertions(+)
+
+diff --git a/src/common/ceph_context.cc b/src/common/ceph_context.cc
+index 4ebf79e..77488b6 100644
+--- a/src/common/ceph_context.cc
++++ b/src/common/ceph_context.cc
+@@ -265,6 +265,7 @@ CephContext::CephContext(uint32_t module_type_)
+     _crypto_aes(NULL)
+ {
+   ceph_spin_init(&_service_thread_lock);
++  ceph_spin_init(&_associated_objs_lock);
+ 
+   _log = new ceph::log::Log(&_conf->subsys);
+   _log->start();
+@@ -298,6 +299,10 @@ CephContext::~CephContext()
+ {
+   join_service_thread();
+ 
++  for (map<string, AssociatedSingletonObject*>::iterator it = _associated_objs.begin();
++       it != _associated_objs.end(); it++)
++    delete it->second;
++
+   if (_conf->lockdep) {
+     lockdep_unregister_ceph_context(this);
+   }
+@@ -335,6 +340,7 @@ CephContext::~CephContext()
+ 
+   delete _conf;
+   ceph_spin_destroy(&_service_thread_lock);
++  ceph_spin_destroy(&_associated_objs_lock);
+ 
+   delete _crypto_none;
+   delete _crypto_aes;
+diff --git a/src/common/ceph_context.h b/src/common/ceph_context.h
+index ba60620..e7b8b6c 100644
+--- a/src/common/ceph_context.h
++++ b/src/common/ceph_context.h
+@@ -17,6 +17,8 @@
+ 
+ #include <iostream>
+ #include <stdint.h>
++#include <string>
++using namespace std;
+ 
+ #include "include/buffer.h"
+ #include "include/atomic.h"
+@@ -58,6 +60,10 @@ private:
+   ~CephContext();
+   atomic_t nref;
+ public:
++  class AssociatedSingletonObject {
++   public:
++    virtual ~AssociatedSingletonObject() {}
++  };
+   CephContext *get() {
+     nref.inc();
+     return this;
+@@ -102,6 +108,17 @@ public:
+   void do_command(std::string command, cmdmap_t& cmdmap, std::string format,
+ 		  bufferlist *out);
+ 
++  template<typename T>
++  void lookup_or_create_singleton_object(T*& p, const string &name) {
++    ceph_spin_lock(&_associated_objs_lock);
++    if (!_associated_objs.count(name)) {
++      p = new T(this);
++      _associated_objs[name] = reinterpret_cast<AssociatedSingletonObject*>(p);
++    } else {
++      p = reinterpret_cast<T*>(_associated_objs[name]);
++    }
++    ceph_spin_unlock(&_associated_objs_lock);
++  }
+   /**
+    * get a crypto handler
+    */
+@@ -138,6 +155,9 @@ private:
+ 
+   ceph::HeartbeatMap *_heartbeat_map;
+ 
++  ceph_spinlock_t _associated_objs_lock;
++  map<string, AssociatedSingletonObject*> _associated_objs;
++
+   // crypto
+   CryptoNone *_crypto_none;
+   CryptoAES *_crypto_aes;
+-- 
+2.1.0
+

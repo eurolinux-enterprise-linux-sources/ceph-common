@@ -1,0 +1,148 @@
+From 5f7f6c3c6aa3640162e5dc91d4e648b2c17e74d2 Mon Sep 17 00:00:00 2001
+From: Jason Dillaman <dillaman@redhat.com>
+Date: Wed, 8 Apr 2015 17:24:08 -0400
+Subject: [PATCH 14/22] librbd: add task pool / work queue for AIO requests
+
+Signed-off-by: Jason Dillaman <dillaman@redhat.com>
+(cherry picked from commit afb896d91f886b647baf38f7ec94cc3739f6d2a9)
+(cherry picked from commit 9faaeae4c181944636b4119c0a797181ded0651f)
+
+Conflicts:
+	src/librbd/ImageCtx.cc: removed refs to pending AIO
+	src/librbd/ImageCtx.h: removed refs to pending AIO
+	src/librbd/internal.cc: removed refs to pending AIO
+---
+ src/common/config_opts.h |  2 ++
+ src/librbd/ImageCtx.cc   | 30 +++++++++++++++++++++++++++++-
+ src/librbd/ImageCtx.h    |  3 +++
+ src/librbd/internal.cc   |  4 ++++
+ 4 files changed, 38 insertions(+), 1 deletion(-)
+
+diff --git a/src/common/config_opts.h b/src/common/config_opts.h
+index da9bcdf..f024011 100644
+--- a/src/common/config_opts.h
++++ b/src/common/config_opts.h
+@@ -719,6 +719,8 @@ OPTION(journal_ignore_corruption, OPT_BOOL, false) // assume journal is not corr
+ OPTION(rados_mon_op_timeout, OPT_DOUBLE, 0) // how many seconds to wait for a response from the monitor before returning an error from a rados operation. 0 means on limit.
+ OPTION(rados_osd_op_timeout, OPT_DOUBLE, 0) // how many seconds to wait for a response from osds before returning an error from a rados operation. 0 means no limit.
+ 
++OPTION(rbd_op_threads, OPT_INT, 1)
++OPTION(rbd_op_thread_timeout, OPT_INT, 60)
+ OPTION(rbd_cache, OPT_BOOL, false) // whether to enable caching (writeback unless rbd_cache_max_dirty is 0)
+ OPTION(rbd_cache_writethrough_until_flush, OPT_BOOL, false) // whether to make writeback caching writethrough until flush is called, to be sure the user of librbd will send flushs so that writeback is safe
+ OPTION(rbd_cache_size, OPT_LONGLONG, 32<<20)         // cache size in bytes
+diff --git a/src/librbd/ImageCtx.cc b/src/librbd/ImageCtx.cc
+index b5c2db6..4850b9a 100644
+--- a/src/librbd/ImageCtx.cc
++++ b/src/librbd/ImageCtx.cc
+@@ -6,6 +6,7 @@
+ #include "common/dout.h"
+ #include "common/errno.h"
+ #include "common/perf_counters.h"
++#include "common/WorkQueue.h"
+ 
+ #include "librbd/internal.h"
+ #include "librbd/WatchCtx.h"
+@@ -27,6 +28,23 @@ using librados::snap_t;
+ using librados::IoCtx;
+ 
+ namespace librbd {
++
++namespace {
++
++class ThreadPoolSingleton : public ThreadPool {
++public:
++  ThreadPoolSingleton(CephContext *cct)
++    : ThreadPool(cct, "librbd::thread_pool", cct->_conf->rbd_op_threads,
++                 "rbd_op_threads") {
++    start();
++  }
++  virtual ~ThreadPoolSingleton() {
++    stop();
++  }
++};
++
++} // anonymous namespace
++
+   ImageCtx::ImageCtx(const string &image_name, const string &image_id,
+ 		     const char *snap, IoCtx& p, bool ro)
+     : cct((CephContext*)p.cct()),
+@@ -51,7 +69,8 @@ namespace librbd {
+       format_string(NULL),
+       id(image_id), parent(NULL),
+       stripe_unit(0), stripe_count(0),
+-      object_cacher(NULL), writeback_handler(NULL), object_set(NULL)
++      object_cacher(NULL), writeback_handler(NULL), object_set(NULL),
++      aio_work_queue(NULL)
+   {
+     md_ctx.dup(p);
+     data_ctx.dup(p);
+@@ -96,6 +115,13 @@ namespace librbd {
+       object_set->return_enoent = true;
+       object_cacher->start();
+     }
++
++    ThreadPoolSingleton *thread_pool_singleton;
++    cct->lookup_or_create_singleton_object<ThreadPoolSingleton>(
++      thread_pool_singleton, "librbd::thread_pool");
++    aio_work_queue = new ContextWQ("librbd::aio_work_queue",
++                                   cct->_conf->rbd_op_thread_timeout,
++                                   thread_pool_singleton);
+   }
+ 
+   ImageCtx::~ImageCtx() {
+@@ -113,6 +139,8 @@ namespace librbd {
+       object_set = NULL;
+     }
+     delete[] format_string;
++
++    delete aio_work_queue;
+   }
+ 
+   int ImageCtx::init() {
+diff --git a/src/librbd/ImageCtx.h b/src/librbd/ImageCtx.h
+index 83ed044..218527a 100644
+--- a/src/librbd/ImageCtx.h
++++ b/src/librbd/ImageCtx.h
+@@ -25,6 +25,7 @@
+ #include "librbd/parent_types.h"
+ 
+ class CephContext;
++class ContextWQ;
+ class PerfCounters;
+ 
+ namespace librbd {
+@@ -89,6 +90,8 @@ namespace librbd {
+     LibrbdWriteback *writeback_handler;
+     ObjectCacher::ObjectSet *object_set;
+ 
++    ContextWQ *aio_work_queue;
++
+     /**
+      * Either image_name or image_id must be set.
+      * If id is not known, pass the empty std::string,
+diff --git a/src/librbd/internal.cc b/src/librbd/internal.cc
+index afa4660..b0c8ebc 100644
+--- a/src/librbd/internal.cc
++++ b/src/librbd/internal.cc
+@@ -9,6 +9,7 @@
+ #include "common/dout.h"
+ #include "common/errno.h"
+ #include "common/Throttle.h"
++#include "common/WorkQueue.h"
+ #include "cls/lock/cls_lock_client.h"
+ #include "include/stringify.h"
+ 
+@@ -2118,6 +2119,9 @@ reprotect_and_return_err:
+   void close_image(ImageCtx *ictx)
+   {
+     ldout(ictx->cct, 20) << "close_image " << ictx << dendl;
++
++    ictx->aio_work_queue->drain();
++
+     if (ictx->object_cacher)
+       ictx->shutdown_cache(); // implicitly flushes
+     else
+-- 
+2.1.0
+

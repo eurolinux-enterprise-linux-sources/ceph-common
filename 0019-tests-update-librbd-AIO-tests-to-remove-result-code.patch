@@ -1,0 +1,38 @@
+From af41826151c652b60ad3258a4bdcf18f38ffcbca Mon Sep 17 00:00:00 2001
+From: Jason Dillaman <dillaman@redhat.com>
+Date: Wed, 8 Apr 2015 21:55:36 -0400
+Subject: [PATCH 19/22] tests: update librbd AIO tests to remove result code
+
+Signed-off-by: Jason Dillaman <dillaman@redhat.com>
+(cherry picked from commit 948b15eb52fd5d9ce842fa12ee0cecda17353b01)
+(cherry picked from commit 37bb3000d3eff640a34a3ac48be470ce58627f87)
+---
+ src/test/librbd/test_librbd.cc | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
+
+diff --git a/src/test/librbd/test_librbd.cc b/src/test/librbd/test_librbd.cc
+index 7f35418..a903dd2 100644
+--- a/src/test/librbd/test_librbd.cc
++++ b/src/test/librbd/test_librbd.cc
+@@ -745,8 +745,16 @@ TEST(LibRBD, TestIO)
+   ASSERT_EQ(10, rbd_write(image, info.size - 10, 100, test_data));
+ 
+   rbd_aio_create_completion(NULL, (rbd_callback_t) simple_read_cb, &comp);
+-  ASSERT_EQ(-EINVAL, rbd_aio_write(image, info.size, 1, test_data, comp));
+-  ASSERT_EQ(-EINVAL, rbd_aio_read(image, info.size, 1, test_data, comp));
++  ASSERT_EQ(0, rbd_aio_write(image, info.size, 1, test_data, comp));
++  ASSERT_EQ(0, rbd_aio_wait_for_complete(comp));
++  ASSERT_EQ(-EINVAL, rbd_aio_get_return_value(comp));
++  rbd_aio_release(comp);
++
++  rbd_aio_create_completion(NULL, (rbd_callback_t) simple_read_cb, &comp);
++  ASSERT_EQ(0, rbd_aio_read(image, info.size, 1, test_data, comp));
++  ASSERT_EQ(0, rbd_aio_wait_for_complete(comp));
++  ASSERT_EQ(-EINVAL, rbd_aio_get_return_value(comp));
++  rbd_aio_release(comp);
+ 
+   ASSERT_EQ(0, rbd_close(image));
+ 
+-- 
+2.1.0
+

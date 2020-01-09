@@ -8,7 +8,7 @@
 #################################################################################
 Name:		ceph-common
 Version:	0.80.7
-Release:	2%{?dist}
+Release:	3%{?dist}
 Epoch:		1
 Summary:	Ceph Common
 License:	GPLv2
@@ -26,6 +26,19 @@ Patch6:		0006-os-KeyValueDB-make-compaction-interface-generic.patch
 Patch7:		0007-mon-MonitorDBStore-uninline-init_options.patch
 Patch8:		0008-mon-MonitorDBStore-use-generic-KeyValueDB-create.patch
 Patch9:		0009-config-allow-unsafe-setting-of-config-values.patch
+Patch10:	0010-CephContext-Add-AssociatedSingletonObject-to-allow-C.patch
+Patch11:	0011-common-ceph_context-don-t-import-std-namespace.patch
+Patch12:	0012-WorkQueue-add-new-ContextWQ-work-queue.patch
+Patch13:	0013-WorkQueue-added-virtual-destructor.patch
+Patch14:	0014-librbd-add-task-pool-work-queue-for-AIO-requests.patch
+Patch15:	0015-librbd-avoid-blocking-AIO-API-methods.patch
+Patch16:	0016-librbd-add-new-fail-method-to-AioCompletion.patch
+Patch17:	0017-Throttle-added-pending_error-method-to-SimpleThrottl.patch
+Patch18:	0018-librbd-internal-AIO-methods-no-longer-return-result.patch
+Patch19:	0019-tests-update-librbd-AIO-tests-to-remove-result-code.patch
+Patch20:	0020-librbd-AioRequest-send-no-longer-returns-a-result.patch
+Patch21:	0021-librbd-new-rbd_non_blocking_aio-config-option.patch
+Patch22:	0022-tests-verify-librbd-blocking-aio-code-path.patch
 Requires:	librbd1 = %{epoch}:%{version}-%{release}
 Requires:	librados2 = %{epoch}:%{version}-%{release}
 Requires:	python-rbd = %{epoch}:%{version}-%{release}
@@ -180,6 +193,19 @@ block device.
 %patch7 -p1
 %patch8 -p1
 %patch9 -p1
+%patch10 -p1
+%patch11 -p1
+%patch12 -p1
+%patch13 -p1
+%patch14 -p1
+%patch15 -p1
+%patch16 -p1
+%patch17 -p1
+%patch18 -p1
+%patch19 -p1
+%patch20 -p1
+%patch21 -p1
+%patch22 -p1
 
 %build
 ./autogen.sh
@@ -336,6 +362,9 @@ fi
 %{python_sitelib}/rbd.py*
 
 %changelog
+* Wed Jun 17 2015 Boris Ranto <branto@redhat.com> - 1:0.80.7-3
+- Fix librbd: aio calls may block (1225188)
+
 * Fri Nov 21 2014 Boris Ranto <branto@redhat.com> - 1:0.80.7-2
 - We need to obsolete and provide python-ceph by ceph-common
 

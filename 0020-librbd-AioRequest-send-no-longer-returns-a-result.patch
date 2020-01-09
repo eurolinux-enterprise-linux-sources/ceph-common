@@ -1,0 +1,175 @@
+From 7ccb4ae63d3ae885e1c7e6652f4d935f7ac02844 Mon Sep 17 00:00:00 2001
+From: Jason Dillaman <dillaman@redhat.com>
+Date: Thu, 9 Apr 2015 13:33:09 -0400
+Subject: [PATCH 20/22] librbd: AioRequest::send no longer returns a result
+
+The librados calls used by AioRequest::send should always return
+zero unless there is a bug.
+
+Signed-off-by: Jason Dillaman <dillaman@redhat.com>
+(cherry picked from commit c77bce3311ab62892eb8c1d883263ba7ed663b20)
+
+Conflicts:
+	src/librbd/AioRequest.cc
+	src/librbd/AioRequest.h
+	src/librbd/internal.cc
+
+(cherry picked from commit 7fea9b6954c7e8b913c7ab561f8b28432ecb19fa)
+---
+ src/librbd/AioRequest.cc | 15 +++++++++------
+ src/librbd/AioRequest.h  |  6 +++---
+ src/librbd/internal.cc   | 23 ++++++++++-------------
+ 3 files changed, 22 insertions(+), 22 deletions(-)
+
+diff --git a/src/librbd/AioRequest.cc b/src/librbd/AioRequest.cc
+index 5cf9a11..dee6eba 100644
+--- a/src/librbd/AioRequest.cc
++++ b/src/librbd/AioRequest.cc
+@@ -85,8 +85,9 @@ namespace librbd {
+     return true;
+   }
+ 
+-  int AioRead::send() {
+-    ldout(m_ictx->cct, 20) << "send " << this << " " << m_oid << " " << m_object_off << "~" << m_object_len << dendl;
++  void AioRead::send() {
++    ldout(m_ictx->cct, 20) << "send " << this << " " << m_oid << " "
++                           << m_object_off << "~" << m_object_len << dendl;
+ 
+     librados::AioCompletion *rados_completion =
+       librados::Rados::aio_create_completion(this, rados_req_cb, NULL);
+@@ -99,10 +100,11 @@ namespace librbd {
+     } else {
+       op.read(m_object_off, m_object_len, &m_read_data, NULL);
+     }
++
+     r = m_ioctx->aio_operate(m_oid, rados_completion, &op, flags, NULL);
++    assert(r == 0);
+ 
+     rados_completion->release();
+-    return r;
+   }
+ 
+   /** write **/
+@@ -224,16 +226,17 @@ namespace librbd {
+     return finished;
+   }
+ 
+-  int AbstractWrite::send() {
+-    ldout(m_ictx->cct, 20) << "send " << this << " " << m_oid << " " << m_object_off << "~" << m_object_len << dendl;
++  void AbstractWrite::send() {
++    ldout(m_ictx->cct, 20) << "send " << this << " " << m_oid << " "
++                           << m_object_off << "~" << m_object_len << dendl;
+     librados::AioCompletion *rados_completion =
+       librados::Rados::aio_create_completion(this, NULL, rados_req_cb);
+     int r;
+     assert(m_write.size());
+     r = m_ioctx->aio_operate(m_oid, rados_completion, &m_write,
+ 			     m_snap_seq, m_snaps);
++    assert(r == 0);
+     rados_completion->release();
+-    return r;
+   }
+ 
+   void AbstractWrite::send_copyup() {
+diff --git a/src/librbd/AioRequest.h b/src/librbd/AioRequest.h
+index d6103f9..882b535 100644
+--- a/src/librbd/AioRequest.h
++++ b/src/librbd/AioRequest.h
+@@ -43,7 +43,7 @@ namespace librbd {
+     }
+ 
+     virtual bool should_complete(int r) = 0;
+-    virtual int send() = 0;
++    virtual void send() = 0;
+ 
+   protected:
+     void read_from_parent(vector<pair<uint64_t,uint64_t> >& image_extents);
+@@ -73,7 +73,7 @@ namespace librbd {
+     }
+     virtual ~AioRead() {}
+     virtual bool should_complete(int r);
+-    virtual int send();
++    virtual void send();
+ 
+     ceph::bufferlist &data() {
+       return m_read_data;
+@@ -100,7 +100,7 @@ namespace librbd {
+ 		  bool hide_enoent);
+     virtual ~AbstractWrite() {}
+     virtual bool should_complete(int r);
+-    virtual int send();
++    virtual void send();
+     void guard_write();
+ 
+     bool has_parent() const {
+diff --git a/src/librbd/internal.cc b/src/librbd/internal.cc
+index 477d936..0a51da2 100644
+--- a/src/librbd/internal.cc
++++ b/src/librbd/internal.cc
+@@ -2179,6 +2179,10 @@ reprotect_and_return_err:
+     SimpleThrottle throttle(cct->_conf->rbd_concurrent_management_ops, false);
+ 
+     for (uint64_t ono = 0; ono < overlap_objects; ono++) {
++      if (throttle.pending_error()) {
++        return throttle.wait_for_ret();
++      }
++
+       {
+ 	RWLock::RLocker l(ictx->parent_lock);
+ 	// stop early if the parent went away - it just means
+@@ -2202,12 +2206,7 @@ reprotect_and_return_err:
+       Context *comp = new C_SimpleThrottle(&throttle);
+       AioWrite *req = new AioWrite(ictx, oid, ono, 0, objectx, object_overlap,
+ 				   bl, snapc, CEPH_NOSNAP, comp);
+-      r = req->send();
+-      if (r < 0) {
+-	lderr(cct) << "failed to flatten object " << oid << dendl;
+-	goto err;
+-      }
+-
++      req->send();
+       prog_ctx.update_progress(ono, overlap_objects);
+     }
+ 
+@@ -2952,8 +2951,7 @@ reprotect_and_return_err:
+ 				     objectx, object_overlap,
+ 				     bl, snapc, snap_id, req_comp);
+ 	c->add_request();
+-	r = req->send();
+-        assert(r == 0);
++	req->send();
+       }
+     }
+ 
+@@ -3035,10 +3033,10 @@ reprotect_and_return_err:
+ 			  snapc, snap_id, req_comp);
+       }
+ 
+-      r = req->send();
+-      assert(r == 0);
++      req->send();
+     }
+ 
++    r = 0;
+     if (ictx->object_cacher) {
+       Mutex::Locker l(ictx->cache_lock);
+       ictx->object_cacher->discard_set(ictx->object_set, extents);
+@@ -3129,13 +3127,12 @@ reprotect_and_return_err:
+ 				    q->length, q->offset,
+ 				    cache_comp);
+ 	} else {
+-	  r = req->send();
+-          assert(r == 0);
++	  req->send();
+ 	}
+       }
+     }
+ 
+-    c->finish_adding_requests(cct);
++    c->finish_adding_requests(ictx->cct);
+     c->put();
+ 
+     ictx->perfcounter->inc(l_librbd_aio_rd);
+-- 
+2.1.0
+
