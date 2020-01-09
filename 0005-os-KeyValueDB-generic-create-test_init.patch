@@ -1,0 +1,122 @@
+From 041e760440682af7640d75ed6de3365307dcb062 Mon Sep 17 00:00:00 2001
+From: xinxinsh <xinxin.shu@intel.com>
+Date: Mon, 31 Mar 2014 17:55:16 -0700
+Subject: [PATCH] os/KeyValueDB: generic create(), test_init()
+
+Let us create an implemenetation by name.  Include a test_init() method
+that will instantiate an instance and verify it could start up.
+
+Signed-off-by: Sage Weil <sage@inktank.com>
+(cherry picked from commit 4bf929ef21b6710f60f01cb8f7095ad0a440709f)
+---
+ src/os/KeyValueDB.cc   | 32 ++++++++++++++++++++++++++++++++
+ src/os/KeyValueDB.h    |  6 ++++++
+ src/os/LevelDBStore.cc | 10 ++++++++++
+ src/os/LevelDBStore.h  |  1 +
+ src/os/Makefile.am     |  1 +
+ 5 files changed, 50 insertions(+)
+ create mode 100644 src/os/KeyValueDB.cc
+
+diff --git a/src/os/KeyValueDB.cc b/src/os/KeyValueDB.cc
+new file mode 100644
+index 0000000..8e590e2
+--- /dev/null
++++ b/src/os/KeyValueDB.cc
+@@ -0,0 +1,32 @@
++// -*- mode:C++; tab-width:8; c-basic-offset:2; indent-tabs-mode:t -*-
++// vim: ts=8 sw=2 smarttab
++
++#include "KeyValueDB.h"
++#include "LevelDBStore.h"
++
++KeyValueDB *KeyValueDB::create(CephContext *cct, const string& type,
++			       const string& dir)
++{
++  if (type == "leveldb") {
++    return new LevelDBStore(cct, dir);
++  }
++#ifdef HAVE_KINETIC
++  if (kv_type == KV_TYPE_KINETIC) {
++    store = new KineticStore(g_ceph_context);
++  }
++#endif
++  return NULL;
++}
++
++int KeyValueDB::test_init(const string& type, const string& dir)
++{
++  if (type == "leveldb"){
++    return LevelDBStore::_test_init(dir);
++  }
++#ifdef HAVE_KINETIC
++  if (kv_type == KV_TYPE_KINETIC) {
++    return 0;
++  }
++#endif
++  return -EINVAL;
++}
+diff --git a/src/os/KeyValueDB.h b/src/os/KeyValueDB.h
+index c581aa5..f8e0b68 100644
+--- a/src/os/KeyValueDB.h
++++ b/src/os/KeyValueDB.h
+@@ -64,6 +64,12 @@ public:
+   };
+   typedef ceph::shared_ptr< TransactionImpl > Transaction;
+ 
++  /// create a new instance
++  static KeyValueDB *create(CephContext *cct, const string& type,
++			    const string& dir);
++
++  /// test whether we can successfully initialize; may have side effects (e.g., create)
++  static int test_init(const string& type, const string& dir);
+   virtual int init() = 0;
+   virtual int open(ostream &out) = 0;
+   virtual int create_and_open(ostream &out) = 0;
+diff --git a/src/os/LevelDBStore.cc b/src/os/LevelDBStore.cc
+index 326862f..818396a 100644
+--- a/src/os/LevelDBStore.cc
++++ b/src/os/LevelDBStore.cc
+@@ -92,6 +92,16 @@ int LevelDBStore::do_open(ostream &out, bool create_if_missing)
+   return 0;
+ }
+ 
++int LevelDBStore::_test_init(const string& dir)
++{
++  leveldb::Options options;
++  options.create_if_missing = true;
++  leveldb::DB *db;
++  leveldb::Status status = leveldb::DB::Open(options, dir, &db);
++  delete db;
++  return status.ok() ? 0 : -EIO;
++}
++
+ LevelDBStore::~LevelDBStore()
+ {
+   close();
+diff --git a/src/os/LevelDBStore.h b/src/os/LevelDBStore.h
+index 26e7bbe..1c072da 100644
+--- a/src/os/LevelDBStore.h
++++ b/src/os/LevelDBStore.h
+@@ -154,6 +154,7 @@ public:
+ 
+   ~LevelDBStore();
+ 
++  static int _test_init(const string& dir);
+   int init();
+ 
+   /// Opens underlying db
+diff --git a/src/os/Makefile.am b/src/os/Makefile.am
+index 39bbdb2..f2303fb 100644
+--- a/src/os/Makefile.am
++++ b/src/os/Makefile.am
+@@ -18,6 +18,7 @@ libos_la_SOURCES = \
+ 	os/LevelDBStore.cc \
+ 	os/LFNIndex.cc \
+ 	os/MemStore.cc \
++	os/KeyValueDB.cc \
+ 	os/KeyValueStore.cc \
+ 	os/ObjectStore.cc \
+ 	os/WBThrottle.cc \
+-- 
+1.9.3
+

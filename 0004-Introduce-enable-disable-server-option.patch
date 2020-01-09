@@ -1,0 +1,460 @@
+From 3b780ba9feab2557add8cc76022a58a76b89daf1 Mon Sep 17 00:00:00 2001
+From: Boris Ranto <branto@redhat.com>
+Date: Tue, 30 Sep 2014 11:49:01 +0200
+Subject: [PATCH] Introduce enable/disable server option
+
+---
+ configure.ac                          | 22 ++++++++++++++---
+ man/Makefile.am                       | 46 ++++++++++++++++++++++-------------
+ src/Makefile.am                       | 42 ++++++++++++++++++++++----------
+ src/cls/Makefile.am                   |  2 ++
+ src/erasure-code/jerasure/Makefile.am |  2 ++
+ src/key_value_store/Makefile.am       |  4 ++-
+ src/mon/Makefile.am                   |  2 ++
+ src/os/Makefile.am                    | 16 +++++++-----
+ src/osd/Makefile.am                   |  2 ++
+ src/test/Makefile.am                  |  2 ++
+ src/test/erasure-code/Makefile.am     |  2 ++
+ src/tools/Makefile.am                 |  5 +++-
+ 12 files changed, 105 insertions(+), 42 deletions(-)
+
+diff --git a/configure.ac b/configure.ac
+index fb54df1..3b5cc78 100644
+--- a/configure.ac
++++ b/configure.ac
+@@ -489,10 +489,24 @@ AC_ARG_WITH([ocf],
+             [with_ocf=no])
+ AM_CONDITIONAL(WITH_OCF, [ test "$with_ocf" = "yes" ])
+ 
+-# check is snappy-devel is installed, needed by leveldb
+-AC_CHECK_LIB([snappy], [snappy_compress], [true], [AC_MSG_FAILURE([libsnappy not found])])
+-# use system leveldb
+-AC_CHECK_LIB([leveldb], [leveldb_open], [true], [AC_MSG_FAILURE([libleveldb not found])], [-lsnappy -lpthread])
++# server?
++AC_ARG_ENABLE([server],
++            [AS_HELP_STRING([--enable-server], [enable server binaries build])],
++            [],
++            [enable_server=yes])
++AM_CONDITIONAL(ENABLE_SERVER, test "$enable_server" = "yes")
++if test "$enable_server" = "yes"; then
++   AC_DEFINE([ENABLE_SERVER], [1], [Define if you want to build server-side binaries])
++fi
++
++# cond-check if snappy-devel is installed, needed by leveldb that is need by server parts of the project
++AS_IF([test "$enable_server" = "yes"],
++            [AC_CHECK_LIB([snappy], [snappy_compress], [true], [AC_MSG_FAILURE([libsnappy not found])])])
++
++# cond-check leveldb, necessary if server enabled
++AS_IF([test "$enable_server" = "yes"],
++            [AC_CHECK_LIB([leveldb], [leveldb_open], [true], [AC_MSG_FAILURE([libleveldb not found])], [-lsnappy -lpthread])])
++
+ # see if we can use bloom filters with leveldb
+ AC_LANG_PUSH([C++])
+ AC_CHECK_HEADER([leveldb/filter_policy.h], [AC_DEFINE([HAVE_LEVELDB_FILTER_POLICY], [1], [Defined if LevelDB supports bloom filters ])])
+diff --git a/man/Makefile.am b/man/Makefile.am
+index be071b1..0b6564f 100644
+--- a/man/Makefile.am
++++ b/man/Makefile.am
+@@ -1,30 +1,42 @@
+ AUTOMAKE_OPTIONS = gnu
+ 
+ dist_man_MANS = \
+-	ceph-osd.8 \
+-	ceph-mds.8 \
+-	ceph-mon.8 \
+-	mkcephfs.8 \
+-	ceph-fuse.8 \
+ 	ceph-syn.8 \
+-	crushtool.8 \
+-	osdmaptool.8 \
+-	monmaptool.8 \
+ 	ceph-conf.8 \
+-	ceph-run.8 \
+ 	ceph.8 \
+-	mount.ceph.8 \
+-	radosgw.8 \
+-	radosgw-admin.8 \
+ 	ceph-authtool.8 \
+ 	rados.8 \
+-	librados-config.8 \
+ 	rbd.8 \
+-	ceph-clsinfo.8 \
+-	ceph-debugpack.8 \
+-	cephfs.8 \
+ 	ceph-dencoder.8 \
++	ceph-post-file.8
++
++if ENABLE_SERVER
++dist_man_MANS += \
++	ceph-mds.8 \
++	ceph-mon.8 \
++	ceph-osd.8 \
++	mkcephfs.8 \
++	ceph-run.8 \
+ 	ceph-rest-api.8 \
++	crushtool.8 \
++	osdmaptool.8 \
++	monmaptool.8 \
++	cephfs.8 \
++	mount.ceph.8 \
+ 	ceph-rbdnamer.8 \
+-	ceph-post-file.8 \
++	ceph-debugpack.8 \
++	ceph-clsinfo.8 \
++	librados-config.8
++endif
++
++if WITH_RADOSGW
++dist_man_MANS += \
++	radosgw.8 \
++	radosgw-admin.8
++endif
++
++if WITH_FUSE
++dist_man_MANS += \
++	ceph-fuse.8 \
+ 	rbd-fuse.8
++endif
+diff --git a/src/Makefile.am b/src/Makefile.am
+index edec05e..a9299d5 100644
+--- a/src/Makefile.am
++++ b/src/Makefile.am
+@@ -36,6 +36,7 @@ include tools/Makefile.am
+ 
+ # core daemons
+ 
++if ENABLE_SERVER
+ ceph_mon_SOURCES = ceph_mon.cc
+ ceph_mon_LDADD = $(LIBMON) $(LIBOS) $(CEPH_GLOBAL) $(LIBCOMMON)
+ bin_PROGRAMS += ceph-mon
+@@ -47,13 +48,14 @@ bin_PROGRAMS += ceph-osd
+ ceph_mds_SOURCES = ceph_mds.cc
+ ceph_mds_LDADD = $(LIBMDS) $(LIBOSDC) $(CEPH_GLOBAL) $(LIBCOMMON)
+ bin_PROGRAMS += ceph-mds
+-
++endif # ENABLE_SERVER
+ 
+ # admin tools
+ 
+ 
+ # user tools
+ 
++if ENABLE_SERVER
+ mount_ceph_SOURCES = mount/mount.ceph.c common/secret.c
+ mount_ceph_LDADD = $(LIBCOMMON) $(KEYUTILS_LIB)
+ if LINUX
+@@ -68,6 +70,7 @@ bin_PROGRAMS += cephfs
+ librados_config_SOURCES = librados-config.cc
+ librados_config_LDADD = $(LIBRADOS) $(CEPH_GLOBAL)
+ bin_PROGRAMS += librados-config
++endif # ENABLE_SERVER
+ 
+ ceph_syn_SOURCES = ceph_syn.cc
+ ceph_syn_SOURCES += client/SyntheticClient.cc # uses g_conf.. needs cleanup
+@@ -127,7 +130,7 @@ editpaths = sed \
+ 	-e 's|@datadir[@]|$(pkgdatadir)|g' \
+ 	-e 's|@prefix[@]|$(prefix)|g' \
+ 	-e 's|@@GCOV_PREFIX_STRIP[@][@]|$(GCOV_PREFIX_STRIP)|g'
+-shell_scripts = ceph-debugpack ceph-post-file ceph-crush-location
++shell_scripts = ceph-post-file ceph-crush-location
+ $(shell_scripts): Makefile
+ $(shell_scripts): %: %.in
+ 	rm -f $@ $@.tmp
+@@ -206,6 +209,7 @@ EXTRA_DIST += \
+ 	libs3/test \
+ 	unittest_bufferlist.sh
+ 
++if ENABLE_SERVER
+ # work around old versions of automake that don't define $docdir
+ # NOTE: this won't work on suse, where docdir is /usr/share/doc/packages/$package.
+ docdir ?= ${datadir}/doc/ceph
+@@ -216,34 +220,43 @@ doc_DATA = $(srcdir)/sample.ceph.conf sample.fetch_config
+ 
+ shell_commondir = $(libdir)/ceph
+ shell_common_SCRIPTS = ceph_common.sh
++endif # ENABLE_SERVER
+ 
+ bash_completiondir = $(sysconfdir)/bash_completion.d
+ bash_completion_DATA = $(srcdir)/bash_completion/ceph \
+                $(srcdir)/bash_completion/rados \
+-               $(srcdir)/bash_completion/rbd \
+-               $(srcdir)/bash_completion/radosgw-admin
++               $(srcdir)/bash_completion/rbd
++if WITH_RADOSGW
++bash_completion_DATA += $(srcdir)/bash_completion/radosgw-admin
++endif
+ 
++if ENABLE_SERVER
+ ceph_sbin_SCRIPTS = \
+ 	ceph-disk \
+ 	ceph-disk-prepare \
+ 	ceph-disk-activate \
+ 	ceph-disk-udev \
+ 	ceph-create-keys
++endif # ENABLE_SERVER
+ 
+ bin_SCRIPTS += \
+ 	ceph \
++	ceph-post-file \
++	ceph-crush-location
++
++if ENABLE_SERVER
++bin_SCRIPTS += \
+ 	ceph-run \
+ 	ceph-rest-api \
+ 	ceph-clsinfo \
+ 	ceph-debugpack \
+ 	ceph-rbdnamer \
+-	ceph-post-file \
+-	ceph-crush-location
+-
+-BUILT_SOURCES += init-ceph
+ su_sbin_SCRIPTS += mkcephfs
++BUILT_SOURCES += init-ceph
++shell_scripts += init-ceph mkcephfs ceph-debugpack
++endif # ENABLE_SERVER
++
+ 
+-shell_scripts += init-ceph mkcephfs
+ 
+ 
+ 
+@@ -269,6 +282,7 @@ base: core-daemons admin-tools \
+ 	cephfs ceph-syn ceph-conf \
+ 	rados librados-config \
+ 	init-ceph mkcephfs ceph_mon_store_converter ceph-post-file
++client: ceph ceph-authtool ceph-conf ceph-syn ceph-crush-location rados rbd ceph-post-file brag librbd librados pybind libcephfs
+ 
+ 
+ # version stuff
+@@ -331,8 +345,12 @@ clean-local:
+ python_PYTHON = pybind/rados.py \
+ 		pybind/rbd.py \
+ 		pybind/cephfs.py \
+-		pybind/ceph_argparse.py \
++		pybind/ceph_argparse.py
++
++if ENABLE_SERVER
++python_PYTHON += \
+ 		pybind/ceph_rest_api.py
++endif
+ 
+ 
+ # everything else we want to include in a 'make dist'
+@@ -354,11 +372,9 @@ noinst_HEADERS += \
+ 
+ # coverage
+ 
++if ENABLE_COVERAGE
+ shell_scripts += ceph-coverage
+ bin_SCRIPTS += ceph-coverage
+-
+-
+-if ENABLE_COVERAGE
+ COV_DIR = $(DESTDIR)$(libdir)/ceph/coverage
+ COV_FILES = $(srcdir)/*.gcno
+ COV_LIB_FILES = $(srcdir)/.libs/*.gcno
+diff --git a/src/cls/Makefile.am b/src/cls/Makefile.am
+index ea44fe7..81ebdbc 100644
+--- a/src/cls/Makefile.am
++++ b/src/cls/Makefile.am
+@@ -1,5 +1,6 @@
+ ## Rados object classes
+ 
++if ENABLE_SERVER
+ libcls_hello_la_SOURCES = cls/hello/cls_hello.cc
+ libcls_hello_la_LIBADD = $(PTHREAD_LIBS) $(EXTRALIBS)
+ libcls_hello_la_LDFLAGS = ${AM_LDFLAGS} -module -avoid-version -shared -export-symbols-regex '.*__cls_.*'
+@@ -56,6 +57,7 @@ libcls_rgw_la_SOURCES = \
+ libcls_rgw_la_LIBADD = libjson_spirit.la $(PTHREAD_LIBS) $(EXTRALIBS)
+ libcls_rgw_la_LDFLAGS = ${AM_LDFLAGS} -module -avoid-version -shared -export-symbols-regex '.*__cls_.*'
+ radoslib_LTLIBRARIES += libcls_rgw.la
++endif # ENABLE_SERVER
+ 
+ ## Rados object client classes
+ 
+diff --git a/src/erasure-code/jerasure/Makefile.am b/src/erasure-code/jerasure/Makefile.am
+index e16fe07..e70c8f1 100644
+--- a/src/erasure-code/jerasure/Makefile.am
++++ b/src/erasure-code/jerasure/Makefile.am
+@@ -12,6 +12,7 @@ noinst_HEADERS += \
+   erasure-code/jerasure/gf-complete/include/gf_general.h \
+   erasure-code/jerasure/ErasureCodeJerasure.h
+ 
++if ENABLE_SERVER
+ jerasure_sources = \
+   erasure-code/jerasure/jerasure/src/cauchy.c \
+   erasure-code/jerasure/jerasure/src/galois.c \
+@@ -108,3 +109,4 @@ libec_jerasure_la_LDFLAGS += -export-symbols-regex '.*__erasure_code_.*'
+ endif
+ 
+ erasure_codelib_LTLIBRARIES += libec_jerasure.la
++endif # ENABLE_SERVER
+diff --git a/src/key_value_store/Makefile.am b/src/key_value_store/Makefile.am
+index c4b854f..e69af82 100644
+--- a/src/key_value_store/Makefile.am
++++ b/src/key_value_store/Makefile.am
+@@ -1,9 +1,11 @@
++if ENABLE_SERVER
+ if LINUX
+ libcls_kvs_la_SOURCES = key_value_store/cls_kvs.cc
+ libcls_kvs_la_LIBADD = $(PTHREAD_LIBS) $(EXTRALIBS)
+ libcls_kvs_la_LDFLAGS = ${AM_LDFLAGS} -module -avoid-version -shared -export-symbols-regex '.*__cls_.*'
+ radoslib_LTLIBRARIES += libcls_kvs.la
+-endif
++endif # LINUX
++endif # ENABLE_SERVER
+ 
+ noinst_HEADERS += \
+ 	key_value_store/key_value_structure.h \
+diff --git a/src/mon/Makefile.am b/src/mon/Makefile.am
+index 6016355..d979eea 100644
+--- a/src/mon/Makefile.am
++++ b/src/mon/Makefile.am
+@@ -2,6 +2,7 @@ libmon_types_la_SOURCES = \
+ 	mon/PGMap.cc
+ noinst_LTLIBRARIES += libmon_types.la
+ 
++if ENABLE_SERVER
+ libmon_la_SOURCES = \
+ 	mon/Monitor.cc \
+ 	mon/Paxos.cc \
+@@ -19,6 +20,7 @@ libmon_la_SOURCES = \
+ 	mon/ConfigKeyService.cc
+ libmon_la_LIBADD = $(LIBAUTH) $(LIBCOMMON) $(LIBOS) $(LIBMON_TYPES)
+ noinst_LTLIBRARIES += libmon.la
++endif
+ 
+ noinst_HEADERS += \
+ 	mon/AuthMonitor.h \
+diff --git a/src/os/Makefile.am b/src/os/Makefile.am
+index 63a1846..9065aa0 100644
+--- a/src/os/Makefile.am
++++ b/src/os/Makefile.am
+@@ -3,6 +3,7 @@ libos_types_la_SOURCES = \
+ libos_types_la_CXXFLAGS = ${AM_CXXFLAGS}
+ noinst_LTLIBRARIES += libos_types.la
+ 
++if ENABLE_SERVER
+ libos_la_SOURCES = \
+ 	os/chain_xattr.cc \
+ 	os/DBObjectMap.cc \
+@@ -38,6 +39,15 @@ libos_la_CXXFLAGS = ${AM_CXXFLAGS}
+ libos_la_LIBADD = $(LIBOS_TYPES)
+ noinst_LTLIBRARIES += libos.la
+ 
++if WITH_LIBZFS
++libos_zfs_a_SOURCES = os/ZFS.cc
++libos_zfs_a_CXXFLAGS = ${AM_CXXFLAGS} ${LIBZFS_CFLAGS}
++noinst_LIBRARIES += libos_zfs.a
++noinst_HEADERS += os/ZFS.h
++endif # WITH_LIBZFS
++
++endif # ENABLE_SERVER
++
+ noinst_HEADERS += \
+ 	os/btrfs_ioctl.h \
+ 	os/chain_xattr.h \
+@@ -66,10 +76,4 @@ noinst_HEADERS += \
+ 	os/XfsFileStoreBackend.h \
+ 	os/ZFSFileStoreBackend.h
+ 
+-if WITH_LIBZFS
+-libos_zfs_a_SOURCES = os/ZFS.cc
+-libos_zfs_a_CXXFLAGS = ${AM_CXXFLAGS} ${LIBZFS_CFLAGS}
+-noinst_LIBRARIES += libos_zfs.a
+-noinst_HEADERS += os/ZFS.h
+-endif
+ 
+diff --git a/src/osd/Makefile.am b/src/osd/Makefile.am
+index 75e4877..0b55e84 100644
+--- a/src/osd/Makefile.am
++++ b/src/osd/Makefile.am
+@@ -5,6 +5,7 @@ libosd_types_la_SOURCES = \
+ libosd_types_la_CXXFLAGS = ${AM_CXXFLAGS}
+ noinst_LTLIBRARIES += libosd_types.la
+ 
++if ENABLE_SERVER
+ libosd_la_SOURCES = \
+ 	osd/PG.cc \
+ 	osd/ReplicatedPG.cc \
+@@ -26,6 +27,7 @@ libosd_la_SOURCES = \
+ libosd_la_CXXFLAGS = ${AM_CXXFLAGS}
+ libosd_la_LIBADD = $(LIBOSDC) $(LIBOS) $(LIBOSD_TYPES) $(LIBOS_TYPES)
+ noinst_LTLIBRARIES += libosd.la
++endif # ENABLE_SERVER
+ 
+ noinst_HEADERS += \
+ 	osd/Ager.h \
+diff --git a/src/test/Makefile.am b/src/test/Makefile.am
+index 718ab60..67bbf9b 100644
+--- a/src/test/Makefile.am
++++ b/src/test/Makefile.am
+@@ -71,9 +71,11 @@ endif
+ 
+ bin_PROGRAMS += ceph-dencoder
+ 
++if ENABLE_SERVER
+ get_command_descriptions_SOURCES = test/common/get_command_descriptions.cc
+ get_command_descriptions_LDADD = $(LIBMON) $(LIBCOMMON) $(CEPH_GLOBAL)
+ noinst_PROGRAMS += get_command_descriptions
++endif
+ 
+ 
+ ## Build tests
+diff --git a/src/test/erasure-code/Makefile.am b/src/test/erasure-code/Makefile.am
+index fdbe003..1732391 100644
+--- a/src/test/erasure-code/Makefile.am
++++ b/src/test/erasure-code/Makefile.am
+@@ -17,6 +17,7 @@ ceph_erasure_code_LDADD += -ldl
+ endif
+ bin_DEBUGPROGRAMS += ceph_erasure_code
+ 
++if ENABLE_SERVER
+ libec_example_la_SOURCES = test/erasure-code/ErasureCodePluginExample.cc
+ libec_example_la_CFLAGS = ${AM_CFLAGS}
+ libec_example_la_CXXFLAGS= ${AM_CXXFLAGS}
+@@ -110,6 +111,7 @@ noinst_HEADERS += test/erasure-code/ErasureCodeExample.h
+ unittest_erasure_code_example_CXXFLAGS = $(UNITTEST_CXXFLAGS)
+ unittest_erasure_code_example_LDADD = $(LIBOSD) $(LIBCOMMON) $(UNITTEST_LDADD) $(CEPH_GLOBAL)
+ check_PROGRAMS += unittest_erasure_code_example
++endif # ENABLE_SERVER
+ 
+ noinst_HEADERS += \
+ 	test/erasure-code/ceph_erasure_code_benchmark.h
+diff --git a/src/tools/Makefile.am b/src/tools/Makefile.am
+index 6078eb4..efa9ff5 100644
+--- a/src/tools/Makefile.am
++++ b/src/tools/Makefile.am
+@@ -11,7 +11,7 @@ ceph_kvstore_tool_LDADD = $(LIBOS) $(CEPH_GLOBAL)
+ ceph_kvstore_tool_CXXFLAGS = $(UNITTEST_CXXFLAGS)
+ bin_DEBUGPROGRAMS += ceph-kvstore-tool
+ 
+-
++if ENABLE_SERVER
+ ceph_filestore_tool_SOURCES = tools/ceph_filestore_tool.cc
+ ceph_filestore_tool_LDADD = $(LIBOSD) $(LIBOS) $(CEPH_GLOBAL) -lboost_program_options
+ if LINUX
+@@ -37,6 +37,7 @@ bin_PROGRAMS += crushtool
+ osdmaptool_SOURCES = tools/osdmaptool.cc
+ osdmaptool_LDADD = $(CEPH_GLOBAL)
+ bin_PROGRAMS += osdmaptool
++endif # ENABLE_SERVER
+ 
+ ceph_scratchtool_SOURCES = tools/scratchtool.c
+ ceph_scratchtool_LDADD = $(LIBRADOS) $(CEPH_GLOBAL)
+@@ -94,9 +95,11 @@ ceph_authtool_SOURCES = tools/ceph_authtool.cc
+ ceph_authtool_LDADD = $(CEPH_GLOBAL) $(LIBCOMMON)
+ bin_PROGRAMS += ceph-authtool
+ 
++if ENABLE_SERVER
+ ceph_mon_store_converter_SOURCES = tools/mon_store_converter.cc
+ ceph_mon_store_converter_LDADD = $(LIBMON) $(LIBOS) $(CEPH_GLOBAL)
+ bin_PROGRAMS += ceph_mon_store_converter
++endif
+ 
+ noinst_HEADERS += \
+ 	tools/rados/rados_sync.h \
+-- 
+1.9.3
+

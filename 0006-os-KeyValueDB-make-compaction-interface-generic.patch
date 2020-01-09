@@ -1,0 +1,72 @@
+From 38e4b6a19202ed0afa7700e37faaaea2903199ca Mon Sep 17 00:00:00 2001
+From: Sage Weil <sage@inktank.com>
+Date: Mon, 31 Mar 2014 18:05:13 -0700
+Subject: [PATCH] os/KeyValueDB: make compaction interface generic
+
+Signed-off-by: Sage Weil <sage@inktank.com>
+(cherry picked from commit 86a0b9dd9ad2f3b0996b3f72a79fd1b13726b4ad)
+---
+ src/os/KeyValueDB.h   | 12 ++++++++++++
+ src/os/LevelDBStore.h | 13 ++++++++-----
+ 2 files changed, 20 insertions(+), 5 deletions(-)
+
+diff --git a/src/os/KeyValueDB.h b/src/os/KeyValueDB.h
+index f8e0b68..3929ed4 100644
+--- a/src/os/KeyValueDB.h
++++ b/src/os/KeyValueDB.h
+@@ -179,6 +179,18 @@ public:
+ 
+   virtual ~KeyValueDB() {}
+ 
++  /// compact the underlying store
++  virtual void compact() {}
++
++  /// compact db for all keys with a given prefix
++  virtual void compact_prefix(const string& prefix) {}
++  /// compact db for all keys with a given prefix, async
++  virtual void compact_prefix_async(const string& prefix) {}
++  virtual void compact_range(const string& prefix,
++			     const string& start, const string& end) {}
++  virtual void compact_range_async(const string& prefix,
++				   const string& start, const string& end) {}
++
+ protected:
+   virtual WholeSpaceIterator _get_iterator() = 0;
+   virtual WholeSpaceIterator _get_snapshot_iterator() = 0;
+diff --git a/src/os/LevelDBStore.h b/src/os/LevelDBStore.h
+index 1c072da..3dbc0f9 100644
+--- a/src/os/LevelDBStore.h
++++ b/src/os/LevelDBStore.h
+@@ -85,21 +85,24 @@ public:
+   /// compact the underlying leveldb store
+   void compact();
+ 
+-  /// compact leveldb for all keys with a given prefix
++  /// compact db for all keys with a given prefix
+   void compact_prefix(const string& prefix) {
+     compact_range(prefix, past_prefix(prefix));
+   }
+   void compact_prefix_async(const string& prefix) {
+     compact_range_async(prefix, past_prefix(prefix));
+   }
+-
+-  void compact_range(const string& prefix, const string& start, const string& end) {
++  void compact_range(const string& prefix,
++		     const string& start, const string& end) {
+     compact_range(combine_strings(prefix, start), combine_strings(prefix, end));
+   }
+-  void compact_range_async(const string& prefix, const string& start, const string& end) {
+-    compact_range_async(combine_strings(prefix, start), combine_strings(prefix, end));
++  void compact_range_async(const string& prefix,
++			   const string& start, const string& end) {
++    compact_range_async(combine_strings(prefix, start),
++			combine_strings(prefix, end));
+   }
+ 
++
+   /**
+    * options_t: Holds options which are minimally interpreted
+    * on initialization and then passed through to LevelDB.
+-- 
+1.9.3
+

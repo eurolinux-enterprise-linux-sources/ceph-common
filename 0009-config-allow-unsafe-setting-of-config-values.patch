@@ -1,0 +1,55 @@
+From 6f77c4d846a7b1f798139fb92c9d385545c74a02 Mon Sep 17 00:00:00 2001
+From: Sage Weil <sage@inktank.com>
+Date: Mon, 31 Mar 2014 15:36:26 -0700
+Subject: [PATCH] config: allow unsafe setting of config values
+
+Allow callers to set config values even when there is no observer.
+
+Signed-off-by: Sage Weil <sage@inktank.com>
+(cherry picked from commit e1418724a0da3979b1e706ccb54112d35c18f1eb)
+---
+ src/common/config.cc | 4 ++--
+ src/common/config.h  | 5 ++++-
+ 2 files changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/src/common/config.cc b/src/common/config.cc
+index 23bfe35..7952aaf 100644
+--- a/src/common/config.cc
++++ b/src/common/config.cc
+@@ -659,7 +659,7 @@ void md_config_t::set_val_or_die(const char *key, const char *val)
+   assert(ret == 0);
+ }
+ 
+-int md_config_t::set_val(const char *key, const char *val, bool meta)
++int md_config_t::set_val(const char *key, const char *val, bool meta, bool safe)
+ {
+   Mutex::Locker l(lock);
+   if (!key)
+@@ -696,7 +696,7 @@ int md_config_t::set_val(const char *key, const char *val, bool meta)
+   for (int i = 0; i < NUM_CONFIG_OPTIONS; ++i) {
+     config_option *opt = &config_optionsp[i];
+     if (strcmp(opt->name, k.c_str()) == 0) {
+-      if (internal_safe_to_start_threads) {
++      if (safe && internal_safe_to_start_threads) {
+ 	// If threads have been started...
+ 	if ((opt->type == OPT_STR) || (opt->type == OPT_ADDR) ||
+ 	    (opt->type == OPT_UUID)) {
+diff --git a/src/common/config.h b/src/common/config.h
+index 242b467..9911543 100644
+--- a/src/common/config.h
++++ b/src/common/config.h
+@@ -130,7 +130,10 @@ public:
+ 
+   // Set a configuration value.
+   // Metavariables will be expanded.
+-  int set_val(const char *key, const char *val, bool meta=true);
++  int set_val(const char *key, const char *val, bool meta=true, bool safe=true);
++  int set_val(const char *key, const string& s, bool meta=true, bool safe=true) {
++    return set_val(key, s.c_str(), meta, safe);
++  }
+ 
+   // Get a configuration value.
+   // No metavariables will be returned (they will have already been expanded)
+-- 
+1.9.3
+
