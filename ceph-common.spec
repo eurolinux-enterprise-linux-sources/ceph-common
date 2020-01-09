@@ -8,14 +8,12 @@
 #################################################################################
 Name:		ceph-common
 Version:	0.94.5
-Release:	1%{?dist}
+Release:	2%{?dist}
 Epoch:		1
 Summary:	Ceph Common
 License:	GPLv2
 Group:		System Environment/Base
 URL:		http://ceph.com/
-# We are interested in x86_64 and aarch64 only
-ExclusiveArch:	x86_64 aarch64
 Source0:	http://ceph.com/download/ceph-%{version}.tar.bz2
 Requires:	librbd1 = %{epoch}:%{version}-%{release}
 Requires:	librados2 = %{epoch}:%{version}-%{release}
@@ -332,6 +330,24 @@ fi
 %{python_sitelib}/rbd.py*
 
 %changelog
+* Tue Jun 20 2017 Boris Ranto <branto@redhat.com> - 1:0.94.5-2
+- drop the rebase
+
+* Thu Jun 01 2017 Boris Ranto <branto@redhat.com> - 1:10.2.5-3
+- Strip away ceph user (errata complains after rebase)
+
+* Mon Apr 24 2017 Boris Ranto <branto@redhat.com> - 1:10.2.5-2
+- New release (1:10.2.5-2)
+- A compile patch for s390
+- Build on all the platforms
+
+* Wed Feb 22 2017 Boris Ranto <branto@redhat.com> - 1:10.2.5-1
+- New version (1:10.2.5-1)
+- Makefile: Fix dencoder build
+- Add fake fcgiapp.h for rgw
+- common: Build more files of libcommon in client
+- libradosstripper: Build libradostripper for rados as noinst
+
 * Wed Jun 22 2016 Boris Ranto <branto@redhat.com> - 1:0.94.5-1
 - New version (1:0.94.5-1)
 
